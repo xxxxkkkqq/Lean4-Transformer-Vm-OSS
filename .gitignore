@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+outputs/
+*.so
+*.egg-info/
+dist/
+build/
+.DS_Store
+.staging/
+
+# compiled weights & engine binaries (deterministic rebuild via
+# model/compile_vm.py and make -C engine)
+model/step_vm.pt
+model/step_vm.bin
+engine/vm_run
+tests/_engine_tmp/
+*.log
+
+# C++ build artifacts
+*.o
+
+# cross-session handoff artifacts (settings.json + hooks/ are tracked;
+# transcripts/snapshots are per-session)
+.claude/last-session.txt
+.claude/handoff-snapshot.md
