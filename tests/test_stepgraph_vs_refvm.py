@@ -14,22 +14,37 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from expr.tokens import Encoder, decode_closure
+from expr.model import App, Const, Lam, LitNat, Proj, BVar, BI_DEFAULT
 from lean_vm.ref_vm import RefVM
 from lean_vm.build_vm import build_step_graph
 from lean_vm.step_driver import StepDriver
-from reference.toy_env import TOY_CONSTS, TOY_CTORS, CORPUS
+from reference.toy_env import TOY_CONSTS, TOY_CTORS, TOY_STRUCTS, CORPUS, NAT
 
 # M3 complete: all ten nat ops implemented; no pinned divergences left
 M3_PENDING = set()
+
+# P7.5c-M5: a projection in FUNCTION position must apply its pending args after
+# reducing to the field (Nat.choose's `(P2.fst ih) k`).  These terms are
+# ill-typed on purpose (a P2 field is a Nat in the toy env), so they cannot go
+# through the Lean oracle — the RefVM comparison is the right gate.  Whnf is
+# still well-defined for the graph, which is what regressed and is pinned here.
+_PAIR_LAM = App(App(Const("P2.mk"), Lam("y", BI_DEFAULT, NAT, BVar(0))),
+               Const("T_two"))
+EXTRA_CASES = [
+    ("proj_plain", Proj("P2", 0, _PAIR_LAM)),
+    ("proj_app_lam", App(Proj("P2", 0, _PAIR_LAM), LitNat(3))),
+    ("proj_app_const", App(Proj("P2", 0, Const("T_pair")), LitNat(3))),
+]
 
 
 def main() -> int:
     n_pass = 0
     fails = []
-    for cid, src, term in CORPUS:
+    cases = list(CORPUS) + [(cid, "", t) for cid, t in EXTRA_CASES]
+    for cid, src, term in cases:
         # reference side: its own bundle (both sides mutate their streams)
         ref_enc = Encoder(TOY_CONSTS, is_ctor=TOY_CTORS)
-        ref_vm = RefVM(ref_enc.b, nat_enabled=True)
+        ref_vm = RefVM(ref_enc.b, nat_enabled=True, structures=TOY_STRUCTS)
         try:
             rp, renv = ref_vm.whnf(ref_enc.encode_term(term), 0)
             expected = decode_closure(ref_enc.b, rp, renv)
@@ -54,7 +69,7 @@ def main() -> int:
         else:
             fails.append((cid, f"\n         graph ={got!r}\n         ref   ={expected!r}"))
 
-    n_total = len(CORPUS)
+    n_total = len(cases)
     print(f"\n=== step graph vs RefVM(nat on): {n_pass}/{n_total} "
           f"({len(M3_PENDING)} pinned M3-pending) ===")
     for cid, msg in fails:

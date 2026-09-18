@@ -46,11 +46,22 @@ def strip_mdata(e):
     return e
 
 
+# Corpus cases with NO faithful real-Lean mirror: the P7.5c-2 brec SUM cases
+# model the below-arg as bh : Nat and read the recursive value via the P2-proj
+# bh.1 (the ↓/go-chain sidestep, VM_SPEC §11.16). Real Nat.brecOn binds
+# bh : Nat.below motive t, which is stuck (not defeq to Nat inside the casesOn
+# branch), so neither bh.1 nor bh elaborates against the real kernel. These are
+# graph-vs-RefVM only (and deq_brec_sum_stuck is additionally pinned there);
+# skip them in the lean oracle.
+LEAN_NO_MIRROR = {"deq_brec_sum", "deq_brec_sum_stuck"}
+
+
 def main() -> int:
     enc = Encoder(TOY_CONSTS, is_ctor=TOY_CTORS)
     vm = RefVM(enc.b, structures=TOY_STRUCTS)
 
-    entries = [("DEFEQ", lhs, rhs) for (_, lhs, rhs, _, _) in DEFEQ_CORPUS]
+    deq_cases = [c for c in DEFEQ_CORPUS if c[0] not in LEAN_NO_MIRROR]
+    entries = [("DEFEQ", lhs, rhs) for (_, lhs, rhs, _, _) in deq_cases]
     entries += [("INFER", src, None) for (_, src, _) in INFER_CORPUS]
     oracle = lean_ref.run_oracle_mixed(TOY_LEAN_DEFS, entries)
     assert len(oracle) == len(entries)
@@ -58,7 +69,7 @@ def main() -> int:
     n_pass = 0
     fails = []
 
-    for (cid, _, _, our_l, our_r), (_, verdict) in zip(DEFEQ_CORPUS, oracle):
+    for (cid, _, _, our_l, our_r), (_, verdict) in zip(deq_cases, oracle):
         try:
             lp = enc.encode_term(our_l)
             rp = enc.encode_term(our_r)
@@ -72,7 +83,7 @@ def main() -> int:
             fails.append((cid, f"defeq got {got}, lean says {verdict}"))
 
     for (cid, _, our_term), (_, oracle_json) in zip(INFER_CORPUS, oracle[
-            len(DEFEQ_CORPUS):]):
+            len(deq_cases):]):
         expected = strip_mdata(lean_ref.json_to_expr(oracle_json))
         try:
             term_pos = enc.encode_term(our_term)
@@ -86,8 +97,10 @@ def main() -> int:
         else:
             fails.append((cid, f"infer\n  vm:    {got}\n  lean:  {expected}"))
 
-    total = len(DEFEQ_CORPUS) + len(INFER_CORPUS)
-    print(f"M1 infer/defeq vs real lean: {n_pass}/{total}")
+    total = len(deq_cases) + len(INFER_CORPUS)
+    skipped = len(DEFEQ_CORPUS) - len(deq_cases)
+    print(f"M1 infer/defeq vs real lean: {n_pass}/{total}"
+          f"{f'  ({skipped} brec-sum cases skipped: no faithful lean mirror)' if skipped else ''}")
     for cid, msg in fails:
         print(f"  FAIL {cid}: {msg}")
     return 0 if not fails else 1

@@ -25,16 +25,22 @@ from expr.model import (
     LitNat, Const,
 )
 from expr.tokens import (
-    StreamBundle, T_LINK, T_LIT_DIG, T_PI_CLO,
+    StreamBundle, T_LINK, T_LIT_DIG, T_PI_CLO, T_ENV_UNIVPARAMS,
     NAT_OPS, NAT_OP_ARITY,
     TASK_WHNF,
 )
 
 
 class VMError(Exception):
-    def __init__(self, code: int, detail: str = ""):
+    def __init__(self, code: int, detail: str = "",
+                 focus: int = -1, env: int = -1):
         super().__init__(f"VM reject {code}: {detail}")
         self.code = code
+        # M4.3 error localization: the machine's focus closure (A, B) at the
+        # rejecting micro-step, when the driver can supply it. focus=-1 means
+        # "not a node focus" (e.g. a verdict-false reject, where A is 0/1).
+        self.focus = focus
+        self.env = env
 
 
 # VM_SPEC §7.4 error codes
@@ -51,12 +57,22 @@ class RefVM:
                  structures: Optional[dict] = None):
         self.nat_enabled = nat_enabled
         self.b = bundle
+        # WP2: checked declaration's lparams (nids) for infer_constant's
+        # check_level (K/type_checker.cpp:85-91,364-367). None = driver did
+        # not supply them (infer_type mode skips the check too,
+        # K/type_checker.cpp:360-362).
+        self._decl_lparams: Optional[set] = None
+        # delta value-instantiation cache (A28): (cid, level-form key) -> value
+        # root already specialized at that use-site level vector.
+        self._val_inst_cache: dict = {}
         self.cid_op = {}
         if nat_enabled:
             for name, cid in bundle.cids.items():
                 if name in NAT_OPS:
                     self.cid_op[cid] = NAT_OPS[name]
         self.cid_zero = bundle.cids.get("Nat.zero")
+        self.cid_succ = bundle.cids.get("Nat.succ")
+        self.cid_rec = bundle.cids.get("Nat.rec")
         self.cid_true = bundle.cids.get("Bool.true")
         self.cid_false = bundle.cids.get("Bool.false")
         # M3 non-rec structures: {ind_name: (ctor_name, nparams, nfields)}.
@@ -68,6 +84,25 @@ class RefVM:
             ci, cc = bundle.cids[ind], bundle.cids[ctor]
             self.struct_of_ctor[cc] = (ci, nparams, nfields)
             self.ctor_of_struct[ci] = (cc, nparams, nfields)
+        # P7.2 casesOn recursors: recursor_cid -> (major_idx,
+        # [(ctor_cid, nfields), ...] in minor order). Non-recursive case
+        # analysis (inductive.h L77): whnf the major to a constructor, apply
+        # the matching minor to the constructor's fields. No recursive calls.
+        self.caseson = {}
+        _cs_nat = bundle.cids.get("Nat.casesOn")
+        if _cs_nat is not None:
+            self.caseson[_cs_nat] = (0, [(self.cid_zero, 0), (self.cid_succ, 1)])
+        _cs_p2 = bundle.cids.get("P2.casesOn")
+        if _cs_p2 is not None:
+            self.caseson[_cs_p2] = (0, [(bundle.cids.get("P2.mk"), 2)])
+        _cs_bool = bundle.cids.get("Bool.casesOn")
+        if _cs_bool is not None:
+            # minors follow Lean's ctor declaration order: false before true
+            self.caseson[_cs_bool] = (0, [(self.cid_false, 0), (self.cid_true, 0)])
+        # P7.5c-2: NO brecOn dispatch — Nat.brecOn/Nat.below carry the faithful
+        # def-over-rec delta values (toy_env _brec_value/_below_value), so the
+        # K_CONST gate above deltas them and the existing rec-iota + proj
+        # machinery reduces them (iota = delta + beta + rec + P2-proj).
 
     # ── environment links (stream-resident, VM_SPEC §6) ─────────────────────
     def _link(self, value_pos: int, value_env: int, head: int,
@@ -103,11 +138,15 @@ class RefVM:
         (VM_SPEC §10.2, calibrated against real lean)."""
         pend: list[tuple[int, int]] = []   # (arg pos, env at push) — Krivine stack
         spine_root = 0                     # App that opened the current spine
+        spine_env = 0                      # env at that App (head resolution
+        #   reassigns env via value links / delta — the spine's args live in
+        #   the ORIGINAL env, so the stuck return must use this, not env)
         while True:
             K, V0, V1, V2, X = self.b.stream[pos][:5]
             if K == K_APP:
                 if not pend:
                     spine_root = pos
+                    spine_env = env
                 pend.append((V1, env))
                 pos = V0
                 continue
@@ -120,7 +159,12 @@ class RefVM:
                 return pos, env
             if K == K_CONST:
                 if self.b.const_has_value.get(V0):
-                    pos = self.b.const_value_pos[V0]   # delta
+                    # delta. Kernel unfold_definition_core instantiates the
+                    # value at the use-site levels (A28, VM_SPEC §12.3;
+                    # K/type_checker.cpp:555-565, instantiate_value_lparams
+                    # K/instantiate.cpp:256-264). Without this, an
+                    # uninstantiated LParam leaks out of the unfolded value.
+                    pos = self._instantiate_value(V0, V1)
                     env = 0                            # constants are closed
                     continue
                 op = self.cid_op.get(V0)
@@ -130,9 +174,88 @@ class RefVM:
                     args = [pend.pop() for _ in range(NAT_OP_ARITY[op])]
                     vals = [self.whnf(a, aenv) for (a, aenv) in args]
                     return self._nat(op, vals), 0
+                if V0 in self.caseson:
+                    # P7.2 casesOn reduce_recursor (inductive.h L77). Spine
+                    # (application order) = [major, motive, alt0, alt1, ...];
+                    # major_idx=0. whnf the major to a constructor, apply the
+                    # matching minor to its fields; extras stay on the stack.
+                    major_idx, ctors = self.caseson[V0]
+                    nargs = 2 + len(ctors)          # major + motive + minors
+                    if len(pend) >= nargs:
+                        args = list(reversed(pend))  # application order
+                        mp, menv = args[major_idx]
+                        wpos, wenv = self.whnf(mp, menv)
+                        m = self._match_ctor(wpos, wenv, ctors)
+                        if m is not None:
+                            ctor_idx, fields = m
+                            minor = args[2 + ctor_idx]
+                            extras = args[nargs:]
+                            pend[:] = (list(reversed(extras))
+                                       + list(reversed(fields)))
+                            pos, env = minor
+                            continue
+                        # major stuck (binder/other) → recursor spine stuck;
+                        # fall through to the §10.2 return below
+                if V0 == self.cid_rec and len(pend) >= 4:
+                    # iota (kernel inductive_reduce_rec, inductive.h L77):
+                    # Nat.rec has major_idx 3, nparams 0 → the major premise
+                    # is pend[-4] (pend order: [.., maj, s, z, m]).
+                    m, z, s, maj = pend[-1], pend[-2], pend[-3], pend[-4]
+                    wpos, wenv = self.whnf(maj[0], maj[1])
+                    wK, wV0, wV1, *_ = self.b.stream[wpos][:5]
+                    pred = None
+                    if wK == K_LIT and wV1 == LIT_NAT:
+                        v = sum(self.b.stream[wpos + 2 + 2 * i][1]
+                                * (10 ** i) for i in range(wV0))
+                        if v == 0:
+                            del pend[-4:]
+                            pos, env = z
+                            continue
+                        pred = (self._emit_chain(v - 1), 0)  # nat_lit_to_constructor peels ONE succ
+                    elif wK == K_CONST and wV0 == self.cid_zero:
+                        del pend[-4:]
+                        pos, env = z
+                        continue
+                    elif wK == K_APP:
+                        # stuck succ spine (only reachable with nat ops
+                        # disabled — the succ nat-op path otherwise never
+                        # leaves `succ x` stuck); defensive, mirrors kernel
+                        fn = self.b.stream[wpos][1]
+                        fK, fV0, *_ = self.b.stream[fn][:5]
+                        if fK == K_CONST and fV0 == self.cid_succ:
+                            pred = (self.b.stream[wpos][2], wenv)
+                    if pred is not None:
+                        # succ rule: rec m z s (succ n) ⇒ s n (rec m z s n).
+                        # The four closures ride a link chain e4
+                        # (BVar 0=n, 1=s, 2=z, 3=m) so the re-emitted spine
+                        # is closed under e4. Recursion is LAZY: the loop
+                        # continues on rhs; extra args (if any) stay on the
+                        # stack and apply to the result (kernel: extras
+                        # applied to rhs).
+                        e1 = self._link(m[0], m[1], 0)
+                        e2 = self._link(z[0], z[1], e1)
+                        e3 = self._link(s[0], s[1], e2)
+                        e4 = self._link(pred[0], pred[1], e3)
+                        b0 = self.b.push(K_BVAR, V0=0)
+                        b1 = self.b.push(K_BVAR, V0=1)
+                        b2 = self.b.push(K_BVAR, V0=2)
+                        b3 = self.b.push(K_BVAR, V0=3)
+                        rc = self._emit_const("Nat.rec")
+                        r4 = self.b.push(K_APP, V0=rc, V1=b3)
+                        r4 = self.b.push(K_APP, V0=r4, V1=b2)
+                        r4 = self.b.push(K_APP, V0=r4, V1=b1)
+                        r4 = self.b.push(K_APP, V0=r4, V1=b0)
+                        a1 = self.b.push(K_APP, V0=b1, V1=b0)
+                        rhs = self.b.push(K_APP, V0=a1, V1=r4)
+                        del pend[-4:]
+                        pos, env = rhs, e4
+                        continue
+                    # major premise stuck (binder/mvar/other) → the recursor
+                    # spine is stuck; fall through to the §10.2 return below
                 # stuck head: if args are pending, the result is the whole
-                # original spine
-                return (spine_root if pend and spine_root else pos), env
+                # original spine (in its ORIGINAL env — see spine_env)
+                return (spine_root if pend and spine_root else pos), \
+                    (spine_env if pend and spine_root else env)
             if K == K_LET:                        # zeta
                 env = self._link(V1, env, env)
                 pos = X                           # body (X field, §4)
@@ -141,8 +264,14 @@ class RefVM:
                 link = self._resolve(env, V0)
                 if link[5] == 1:
                     # binder marker (fvar analog): a variable is stuck in
-                    # whnf, exactly like a kernel fvar without a value
-                    return pos, env
+                    # whnf, exactly like a kernel fvar without a value —
+                    # with pending args the result is the whole original
+                    # spine (same §10.2 convention as the K_CONST stuck
+                    # head; the pre-P6 head-only return let defeq compare
+                    # two marker apps by head bid alone and accept `f 1`
+                    # vs `f 2` — caught by deq_fvar_args).
+                    return (spine_root if pend and spine_root else pos), \
+                        (spine_env if pend and spine_root else env)
                 pos, env = link[1], link[4]   # (value pos, captured env)
                 continue
             if K == K_MDATA:
@@ -152,12 +281,17 @@ class RefVM:
                 # kernel whnf reduces `ctor a_1 ... a_n .idx` to a_idx
                 # (reduce_proj_core subset: non-rec structure ctor directly;
                 # delta through a struct-valued const handled by the K_CONST
-                # case when we whnf the child here)
+                # case when we whnf the child here).  After selecting the
+                # field, KEEP WHNFING it — the kernel's whnf loops
+                # (reduceProj feeds back into whnf); the field of a real
+                # brecOn below-pair is an un-reduced application, and
+                # returning it raw would end whnf in a non-normal form.
                 cpos, cenv = self.whnf(X, env)
                 st = self._proj_core(cpos, V0, V1)   # (V0=struct nid, V1=idx)
                 if st is None:
                     return pos, env               # stuck proj
-                return st, cenv
+                pos, env = st, cenv
+                continue
             if K in (K_SORT, K_FVAR, K_MVAR, K_LIT, K_PI, T_PI_CLO):
                 return pos, env
             raise VMError(ERR_UNSUPPORTED, f"token kind {K} at {pos}")
@@ -278,6 +412,36 @@ class RefVM:
             return (V0, X), (V1, E2)
         raise VMError(ERR_TYPE, f"infer_app: not a function (kind {K})")
 
+    def _binder_marker(self, is_clo: bool, dom_pos: int, outer_env: int,
+                       body_env: Optional[int],
+                       body_pos: int) -> Optional[int]:
+        """The binder marker link used for a Pi comparison (kernel
+        mk_local_decl on a shared lctx, K/type_checker.cpp:785-791).
+        K_PI: always push a fresh marker over its outer env. T_PI_CLO: the
+        body closure is (V1, E2). Reuse E2 when it is a flag=1 marker over
+        outer_env. When E2 == outer_env the body is a self-contained closure
+        (infer returns env 0 for a lambda); its binder marker, if nested
+        structures refer to it, is the outer env stored in a T_PI_CLO body
+        node (X). Return None when no marker is represented."""
+        if not is_clo:
+            return self._link(dom_pos, outer_env, outer_env, flag=1)
+        if body_env is None:
+            return None
+        if body_env != outer_env:
+            row = self.b.stream[body_env]
+            if row[0] == T_LINK and row[5] == 1 and row[3] == outer_env:
+                return body_env
+            return None
+        # body_env == outer_env: self-contained body. A nested inferred Pi
+        # stores its outer env in X (T_PI_CLO.V0 root, field index 4).
+        if self.b.stream[body_pos][0] == T_PI_CLO:
+            cand = self.b.stream[body_pos][4]
+            if cand:
+                row = self.b.stream[cand]
+                if row[0] == T_LINK and row[5] == 1 and row[3] == outer_env:
+                    return cand
+        return None
+
     def _soft_whnf(self, pos: int, env: int) -> tuple[int, int]:
         """whnf for the DEFEQ loop: a nat-op arg that won't reduce to a
         literal (kernel: is_nat_expr fails) leaves the term stuck instead of
@@ -289,20 +453,396 @@ class RefVM:
                 return (pos, env)
             raise
 
-    def _level_int(self, lpos: int) -> int:
-        """Decode a level token tree to an int (toy env: numeric levels only;
-        LParam/LMVar → ERR_UNSUPPORTED)."""
-        K, V0, V1, V2, X = self.b.stream[lpos][:5]
+    # ── levels (WP2; VM_SPEC §12; kernel K/level.cpp) ───────────────────────
+    # Levels live in the stream as KL_* trees (VM_SPEC §12.1); a "level" here
+    # is the stream position of its root. The operations below mirror the
+    # kernel C++ semantics exactly, with citations. Only the subset needed by
+    # the checking path (decode, structural equality D3, smart max/imax
+    # D1/D2, equivalent D4, zero predicates D8, explicit/to_offset D9,
+    # instantiate D10, get_undef_param D11, expr substitution D13/D14) is
+    # implemented; D6/D7 cache ordering is not needed by is_def_eq.
+
+    def _lvl(self, lpos: int) -> tuple:
+        return self.b.stream[lpos]
+
+    def _level_kind(self, lpos: int) -> int:
+        return self.b.stream[lpos][0]
+
+    def _level_eq(self, p: int, q: int) -> bool:
+        """Kernel `operator==` (K/level.cpp:125-150) as pure structural
+        recursion: kind equal, then per-kind structural equality. Param/MVar
+        compare their name id (K/level.cpp:132-133); Succ compares its child
+        (K/level.cpp:134-140); Max/IMax compare both sides (K/level.cpp:141-
+        148). hash/depth are only fast paths (K/level.cpp:39-40,44-52)."""
+        if p == q:
+            return True
+        K, V0, V1, _, _ = self.b.stream[p][:5]
+        K2, W0, W1, _, _ = self.b.stream[q][:5]
+        if K != K2:
+            return False
+        if K == KL_ZERO:
+            return True
+        if K in (KL_PARAM, KL_MVAR):
+            return V0 == W0
+        if K == KL_SUCC:
+            return self._level_eq(V0, W0)
+        if K in (KL_MAX, KL_IMAX):
+            return self._level_eq(V0, W0) and self._level_eq(V1, W1)
+        raise VMError(ERR_UNSUPPORTED, f"level kind {K}")
+
+    def _level_is_zero(self, p: int) -> bool:
+        """Kernel is_zero: literal Zero (K/level.h zero constructor)."""
+        return self.b.stream[p][0] == KL_ZERO
+
+    def _level_depth(self, p: int) -> int:
+        """Kernel get_depth for explicit levels (D1; K/level.cpp:40):
+        zero=0, succ l=l+1. Callers guard with _level_is_explicit."""
+        K, V0, _, _, _ = self.b.stream[p][:5]
         if K == KL_ZERO:
             return 0
         if K == KL_SUCC:
-            return 1 + self._level_int(V0)
-        if K == KL_MAX:
-            return max(self._level_int(V0), self._level_int(V1))
-        if K == KL_IMAX:
-            a, bb = self._level_int(V0), self._level_int(V1)
-            return bb if a == 0 else max(a, bb)
+            return 1 + self._level_depth(V0)
+        raise VMError(ERR_UNSUPPORTED, f"get_depth: non-explicit level kind {K}")
+
+    def _level_is_explicit(self, p: int) -> bool:
+        """D9 is_explicit (K/level.cpp:54-64): Zero true, Param/MVar/Max/IMax
+        false, Succ recurses."""
+        K, V0, _, _, _ = self.b.stream[p][:5]
+        if K == KL_ZERO:
+            return True
+        if K in (KL_PARAM, KL_MVAR, KL_MAX, KL_IMAX):
+            return False
+        if K == KL_SUCC:
+            return self._level_is_explicit(V0)
         raise VMError(ERR_UNSUPPORTED, f"level kind {K}")
+
+    def _level_to_offset(self, p: int) -> tuple[int, int]:
+        """D9 to_offset (K/level.cpp:67-74): peel k outer succs, return
+        (base, k). Non-succ base gives (p, 0)."""
+        k = 0
+        while self.b.stream[p][0] == KL_SUCC:
+            p = self.b.stream[p][1]
+            k += 1
+        return p, k
+
+    def _level_is_one(self, p: int) -> bool:
+        """Kernel is_one (K/level.cpp:106-110): structurally `succ zero`."""
+        if self.b.stream[p][0] != KL_SUCC:
+            return False
+        c = self.b.stream[p][1]
+        return self.b.stream[c][0] == KL_ZERO
+
+    def _level_is_not_zero(self, p: int) -> bool:
+        """D8 is_not_zero (K/level.cpp:160-172): true for every assignment.
+        Zero/Param/MVar false, Succ true, Max lhs||rhs, IMax rhs only."""
+        K, V0, V1, _, _ = self.b.stream[p][:5]
+        if K in (KL_ZERO, KL_PARAM, KL_MVAR):
+            return False
+        if K == KL_SUCC:
+            return True
+        if K == KL_MAX:
+            return self._level_is_not_zero(V0) or self._level_is_not_zero(V1)
+        if K == KL_IMAX:
+            return self._level_is_not_zero(V1)
+        raise VMError(ERR_UNSUPPORTED, f"level kind {K}")
+
+    def _level_normalizes_to_zero(self, p: int) -> bool:
+        """D8 normalizes_to_zero (K/level.cpp:174-187): Zero true,
+        Param/MVar/Succ false, Max lhs&&rhs, IMax rhs only. is_prop uses this
+        (K/type_checker.cpp:383-389)."""
+        K, V0, V1, _, _ = self.b.stream[p][:5]
+        if K == KL_ZERO:
+            return True
+        if K in (KL_PARAM, KL_MVAR, KL_SUCC):
+            return False
+        if K == KL_MAX:
+            return (self._level_normalizes_to_zero(V0)
+                    and self._level_normalizes_to_zero(V1))
+        if K == KL_IMAX:
+            return self._level_normalizes_to_zero(V1)
+        raise VMError(ERR_UNSUPPORTED, f"level kind {K}")
+
+    def _level_is_side_of(self, side: int, whole: int) -> bool:
+        K, V0, V1, _, _ = self.b.stream[whole][:5]
+        return K in (KL_MAX, KL_IMAX) and (
+            self._level_eq(side, V0) or self._level_eq(side, V1))
+
+    def _mk_max(self, a: int, b: int) -> int:
+        """D1 mk_max (K/level.cpp:81-104), branch-for-branch. Returns an
+        existing position when the smart constructor can; otherwise a fresh
+        KL_MAX node. `b` is unused after the raw-constructor branch because
+        the C++ core also keeps the operand order."""
+        if self._level_is_explicit(a) and self._level_is_explicit(b):
+            return a if self._level_depth(a) >= self._level_depth(b) else b
+        if self._level_eq(a, b):
+            return a
+        if self._level_is_zero(a):
+            return b
+        if self._level_is_zero(b):
+            return a
+        if self._level_is_side_of(a, b):      # is_max b && b == max a _
+            return b
+        if self._level_is_side_of(b, a):      # is_max a && a == max b _
+            return a
+        pa, ka = self._level_to_offset(a)
+        pb, kb = self._level_to_offset(b)
+        if pa == pb:
+            return a if ka > kb else b
+        return self.b.push(KL_MAX, V0=a, V1=b)
+
+    def _mk_imax(self, a: int, b: int) -> int:
+        """D2 mk_imax (K/level.cpp:112-123). The `is_one(l1)` branch is
+        kernel-only (Lean-visible Level.mkLevelIMax' lacks it, VM_SPEC §12.2
+        D2 note); VM follows the C++ kernel."""
+        if self._level_is_not_zero(b):
+            return self._mk_max(a, b)
+        if self._level_is_zero(b):
+            return b
+        if self._level_is_zero(a) or self._level_is_one(a):
+            return b
+        if self._level_eq(a, b):
+            return a
+        return self.b.push(KL_IMAX, V0=a, V1=b)
+
+    def _mk_succ(self, p: int) -> int:
+        """Kernel mk_succ (K/level.cpp:33): raw Succ wrapper, no smart
+        simplification."""
+        return self.b.push(KL_SUCC, V0=p)
+
+    def _level_normal_form(self, p: int):
+        """A canonical, order-insensitive key for D4 is_equivalent. Full D5
+        normalize is only needed if two syntactically different level trees
+        must compare equal; this project's corpus levels are already in
+        mk_* normal form because they come straight from the real kernel, so
+        structural equality (D3) short-circuits. The fallback recursively
+        sorts max/imax operands by their key, which is sound for the
+        associative-commutative reading but deliberately not claimed to be
+        the full C++ normalize."""
+        K, V0, V1, _, _ = self.b.stream[p][:5]
+        if K == KL_ZERO:
+            return ("z",)
+        if K == KL_PARAM:
+            return ("p", V0)
+        if K == KL_MVAR:
+            return ("m", V0)
+        if K == KL_SUCC:
+            return ("s", self._level_normal_form(V0))
+        if K in (KL_MAX, KL_IMAX):
+            a, b = self._level_normal_form(V0), self._level_normal_form(V1)
+            if b < a:
+                a, b = b, a
+            return ("x" if K == KL_MAX else "i", a, b)
+        raise VMError(ERR_UNSUPPORTED, f"level kind {K}")
+
+    def _level_is_equivalent(self, p: int, q: int) -> bool:
+        """D4 is_equivalent (K/level.cpp:518-521): lhs==rhs or
+        normalize(lhs)==normalize(rhs). Structural equality (the common case
+        for kernel-normalized declarations) is exact; the canonical key drops
+        into the symmetric max/imax fallback."""
+        if self._level_eq(p, q):
+            return True
+        return self._level_normal_form(p) == self._level_normal_form(q)
+
+    def _levels_equivalent(self, h1: int, h2: int) -> bool:
+        """Kernel is_def_eq(levels, levels) (K/type_checker.cpp:822-832):
+        element-wise D4 on the two K_CONST level-argument chains; different
+        lengths are unequal (the nil/non-nil branches)."""
+        a = self._const_level_args(h1)
+        b = self._const_level_args(h2)
+        if len(a) != len(b):
+            return False
+        return all(self._level_is_equivalent(x, y) for x, y in zip(a, b))
+
+    def _level_has_param(self, p: int) -> bool:
+        K, V0, V1, _, _ = self.b.stream[p][:5]
+        if K == KL_PARAM:
+            return True
+        if K in (KL_ZERO, KL_MVAR):
+            return False
+        if K == KL_SUCC:
+            return self._level_has_param(V0)
+        if K in (KL_MAX, KL_IMAX):
+            return self._level_has_param(V0) or self._level_has_param(V1)
+        raise VMError(ERR_UNSUPPORTED, f"level kind {K}")
+
+    def _get_undef_param(self, p: int, allowed_nids: set) -> Optional[int]:
+        """D11 get_undef_param (K/level.cpp:289-299): pre-order scan; the
+        first Param whose name id is not in `allowed_nids` is returned (its
+        nid), else None. Pre-order and early stop match for_each +
+        (has_param, r) guards (K/level.cpp:247-259,292-293)."""
+        K, V0, V1, _, _ = self.b.stream[p][:5]
+        if K == KL_ZERO:
+            return None
+        if K == KL_PARAM:
+            return None if V0 in allowed_nids else V0
+        if K == KL_MVAR:
+            return None
+        if K == KL_SUCC:
+            return self._get_undef_param(V0, allowed_nids)
+        if K in (KL_MAX, KL_IMAX):
+            r = self._get_undef_param(V0, allowed_nids)
+            if r is not None:
+                return r
+            return self._get_undef_param(V1, allowed_nids)
+        raise VMError(ERR_UNSUPPORTED, f"level kind {K}")
+
+    def _inst_level(self, p: int, mapping: dict) -> int:
+        """D10 instantiate(level, params, levels) (K/level.cpp:317-340):
+        substitute Param id -> use-site level by position. Unmatched params
+        are returned unchanged (K/level.cpp:334-335). Succ/Max/IMax rebuild
+        through mk_succ/mk_max/mk_imax (K/level.cpp:301-315) only when a child
+        changed. LMVar has no param (short-circuits in has_param,
+        K/level.cpp:320-321)."""
+        K, V0, V1, _, _ = self.b.stream[p][:5]
+        if K == KL_ZERO or K == KL_MVAR:
+            return p
+        if K == KL_PARAM:
+            return mapping.get(V0, p)
+        if K == KL_SUCC:
+            c = self._inst_level(V0, mapping)
+            return p if c == V0 else self._mk_succ(c)
+        if K in (KL_MAX, KL_IMAX):
+            a = self._inst_level(V0, mapping)
+            b = self._inst_level(V1, mapping)
+            if a == V0 and b == V1:
+                return p
+            return self._mk_max(a, b) if K == KL_MAX else self._mk_imax(a, b)
+        raise VMError(ERR_UNSUPPORTED, f"level kind {K}")
+
+    def _const_level_args(self, head: int) -> list[int]:
+        """Use-site level-argument roots of a K_CONST: roots chained through
+        X (VM_SPEC §12.1; R/expr/tokens.py:229-239). Returns [] for head=0."""
+        out: list[int] = []
+        p = head
+        seen = set()
+        while p:
+            if p in seen:
+                raise VMError(ERR_TYPE, "const level chain cycle")
+            seen.add(p)
+            out.append(p)
+            p = self.b.stream[p][4]           # X = next sibling root
+        return out
+
+    def _const_lparam_nids(self, cid: int) -> tuple:
+        """Declaration-side ordered lparams names as nids (VM_SPEC §12.1,
+        T_ENV_UNIVPARAMS). Prefers the bundle's decoded map; falls back to
+        walking the per-cid meta chain for hand-built bundles."""
+        lp = self.b.const_lparams.get(cid)
+        if lp is not None:
+            return lp
+        anchor = self.b.const_meta_pos.get(cid)
+        if anchor is None:
+            return ()
+        head = self.b.stream[anchor][3]       # T_ENV_META.V2 = meta chain head
+        nids: list[int] = []
+        p, seen = head, set()
+        while p:
+            if p in seen:
+                break
+            seen.add(p)
+            K, V0, V1, _, X = self.b.stream[p][:5]
+            if K == T_ENV_UNIVPARAMS and V0 == cid:
+                q, s2 = V1, set()
+                while q:
+                    if q in s2:
+                        break
+                    s2.add(q)
+                    nids.append(self.b.stream[q][2])   # T_ENV_LIST.V1 = nid
+                    q = self.b.stream[q][4]            # X = next node
+            p = self.b.stream[p][6]            # F2 = next meta token
+        return tuple(nids)
+
+    def _expr_has_param_univ(self, p: int) -> bool:
+        """Kernel has_param_univ (K/expr.h:157,358; short-circuit in
+        instantiate_lparams, K/instantiate.cpp:233)."""
+        K, V0, V1, _, X = self.b.stream[p][:5]
+        if K == K_SORT:
+            return self._level_has_param(V0)
+        if K == K_CONST:
+            for r in self._const_level_args(V1):
+                if self._level_has_param(r):
+                    return True
+            return False
+        if K == K_APP:
+            return (self._expr_has_param_univ(V0)
+                    or self._expr_has_param_univ(V1))
+        if K in (K_LAM, K_PI):
+            return (self._expr_has_param_univ(V0)
+                    or self._expr_has_param_univ(V1))
+        if K == K_LET:
+            return (self._expr_has_param_univ(V0)
+                    or self._expr_has_param_univ(V1)
+                    or self._expr_has_param_univ(X))
+        if K == K_MDATA:
+            return self._expr_has_param_univ(V0)
+        if K == K_PROJ:
+            return self._expr_has_param_univ(X)
+        return False                          # BVar/FVar/MVar/Lit
+
+    def _rebuild_const(self, cid: int, roots: list[int]) -> int:
+        """Emit a fresh K_CONST with a fresh sibling chain over `roots`.
+        Roots are copied before their X is repurposed as the next-sibling
+        pointer, because a use-site level root may already own an X chain
+        and must not be mutated (append-only stream, shared subtrees)."""
+        heads = []
+        for r in roots:
+            K, V0, V1, V2, _ = self.b.stream[r][:5]
+            heads.append(self.b.push(K, V0=V0, V1=V1, V2=V2))
+        for i, h in enumerate(heads):
+            t = self.b.stream[h]
+            self.b.stream[h] = (t[0], t[1], t[2], t[3],
+                                heads[i + 1] if i + 1 < len(heads) else 0)
+        return self.b.push(K_CONST, V0=cid, V1=heads[0] if heads else 0)
+
+    def _inst_expr(self, p: int, mapping: dict) -> int:
+        """D13/D14 instantiate_lparams (K/instantiate.cpp:232-246): replace
+        only Sort levels and Constant level args; other nodes recurse and are
+        rebuilt only if a child changed. Short-circuits Param-free subtrees
+        (K/instantiate.cpp:233,238-239)."""
+        if not mapping or not self._expr_has_param_univ(p):
+            return p
+        K, V0, V1, V2, X = self.b.stream[p][:5]
+        if K == K_SORT:
+            nl = self._inst_level(V0, mapping)
+            if nl == V0:
+                return p
+            return self.b.push(K_SORT, V0=nl)
+        if K == K_CONST:
+            roots = self._const_level_args(V1)
+            new = [self._inst_level(r, mapping) for r in roots]
+            if new == roots:
+                return p
+            return self._rebuild_const(V0, new)
+        if K == K_APP:
+            f = self._inst_expr(V0, mapping)
+            a = self._inst_expr(V1, mapping)
+            if f == V0 and a == V1:
+                return p
+            return self.b.push(K_APP, V0=f, V1=a)
+        if K in (K_LAM, K_PI):
+            d = self._inst_expr(V0, mapping)
+            b = self._inst_expr(V1, mapping)
+            if d == V0 and b == V1:
+                return p
+            return self.b.push(K, V0=d, V1=b, X=X)   # X = binfo
+        if K == K_LET:
+            d = self._inst_expr(V0, mapping)
+            v = self._inst_expr(V1, mapping)
+            b = self._inst_expr(X, mapping)
+            if d == V0 and v == V1 and b == X:
+                return p
+            return self.b.push(K_LET, V0=d, V1=v, X=b)
+        if K == K_MDATA:
+            c = self._inst_expr(V0, mapping)
+            return p if c == V0 else self.b.push(K_MDATA, V0=c)
+        if K == K_PROJ:
+            c = self._inst_expr(X, mapping)
+            return p if c == X else self.b.push(K_PROJ, V0=V0, V1=V1, X=c)
+        return p
+
+    def _emit_sort_at(self, lpos: int) -> tuple[int, int]:
+        """Emit Sort l for the level tree at lpos."""
+        return self.b.push(K_SORT, V0=lpos), 0
 
     def _emit_sort(self, n: int) -> tuple[int, int]:
         lpos = self.b.push(KL_ZERO)
@@ -311,13 +851,72 @@ class RefVM:
         return self.b.push(K_SORT, V0=lpos), 0
 
     def _sort_level_of(self, clo: tuple[int, int]) -> int:
-        """ensure_sort: whnf the (type-of-type) closure, expect K_SORT,
-        return its level int."""
+        """ensure_sort (K/type_checker.cpp:62-71): whnf the (type-of-type)
+        closure, expect K_SORT, return the stream position of its level."""
         pos, env = self.whnf(*clo)
         K, V0, V1, V2, X = self.b.stream[pos][:5]
         if K != K_SORT:
             raise VMError(ERR_TYPE, f"expected a sort (kind {K})")
-        return self._level_int(V0)
+        return V0
+
+    def _instantiate_value(self, cid: int, lvl_head: int) -> int:
+        """Delta unfolding of a polymorphic constant: instantiate_value_lparams
+        (K/instantiate.cpp:256-264; use point K/type_checker.cpp:555-565). The
+        result is cached per (cid, use-site level canonical form) so repeated
+        whnf of the same use site does not rebuild the value tree."""
+        vpos = self.b.const_value_pos.get(cid, 0)
+        if not vpos:
+            return vpos
+        use = self._const_level_args(lvl_head)
+        lps = self._const_lparam_nids(cid)
+        if not use or not lps or not self._expr_has_param_univ(vpos):
+            return vpos
+        key = (cid, tuple(self._level_normal_form(u) for u in use))
+        cached = self._val_inst_cache.get(key)
+        if cached is None:
+            if len(use) != len(lps):
+                raise VMError(
+                    ERR_TYPE,
+                    "incorrect number of universe levels parameters for '%s'"
+                    % self.b.cid_names.get(cid, cid))
+            mapping = {lps[i]: use[i] for i in range(len(lps))}
+            cached = self._inst_expr(vpos, mapping)
+            self._val_inst_cache[key] = cached
+        return cached
+
+    def _infer_const(self, cid: int, lvl_head: int) -> tuple[int, int]:
+        """Kernel infer_constant (K/type_checker.cpp:101-123):
+          1. length(lparams) == length(const_levels(e)) else kernel_exception
+             (K/type_checker.cpp:105-108);
+          2. check_level on each use-site level (D11) when checking;
+          3. return instantiate_type_lparams(info, ls) (D14,
+             K/instantiate.cpp:248-254) — the declared type with LParam(name)
+             replaced by the use-site level at the same position.
+        The declaration's ordered lparams names come from T_ENV_UNIVPARAMS
+        (VM_SPEC §12.1)."""
+        if cid not in self.b.const_type_pos:
+            raise VMError(ERR_MISSING_CONST, f"cid {cid}")
+        use = self._const_level_args(lvl_head)
+        lps = self._const_lparam_nids(cid)
+        if len(lps) != len(use):
+            raise VMError(
+                ERR_TYPE,
+                "incorrect number of universe levels parameters for '%s', "
+                "#%d expected, #%d provided"
+                % (self.b.cid_names.get(cid, cid), len(lps), len(use)))
+        if self._decl_lparams is not None:
+            for l in use:
+                bad = self._get_undef_param(l, self._decl_lparams)
+                if bad is not None:
+                    raise VMError(
+                        ERR_TYPE,
+                        "invalid reference to undefined universe level "
+                        "parameter '%s'" % self.b.id_names.get(bad, bad))
+        tpos = self.b.const_type_pos[cid]
+        if not use or not lps:
+            return tpos, 0
+        mapping = {lps[i]: use[i] for i in range(len(lps))}
+        return self._inst_expr(tpos, mapping), 0
 
     def infer(self, pos: int, env: int) -> tuple[int, int]:
         """Kernel infer_type subset (checking mode). Returns the type as a
@@ -330,13 +929,14 @@ class RefVM:
                 return link[1], link[4]
             return self.infer(link[1], link[4])   # value link (post-reduction)
         if K == K_CONST:
-            if V0 not in b.const_type_pos:
-                raise VMError(ERR_MISSING_CONST, f"cid {V0}")
-            return b.const_type_pos[V0], 0
+            return self._infer_const(V0, V1)
         if K == K_LIT:
             return self._emit_const("Nat"), 0     # lit_type: Nat
         if K == K_SORT:
-            return self._emit_sort(self._level_int(V0) + 1)
+            # kernel infer_sort (K/type_checker.cpp:345-347): type of Sort l
+            # is Sort (succ l), built with the mk_succ smart constructor; the
+            # level tree stays symbolic (may contain LParam).
+            return self._emit_sort_at(self._mk_succ(V0))
         if K == K_APP:
             args = []
             p, e = pos, env
@@ -367,9 +967,9 @@ class RefVM:
             l1 = self._sort_level_of(self.infer(V0, env))
             menv = self._link(V0, env, env, flag=1)
             l2 = self._sort_level_of(self.infer(V1, menv))
-            # imax over numeric levels (toy env)
-            lvl = l2 if l1 == 0 else max(l1, l2)
-            return self._emit_sort(lvl)
+            # kernel infer_pi (K/type_checker.cpp:160-165): fold
+            # r = mk_imax(us[i], r) from inner binder to outer.
+            return self._emit_sort_at(self._mk_imax(l1, l2))
         if K == K_LET:
             # V0=type, V1=value, X=body; kernel: defeq(val_type, type), local
             # decl of the declared type
@@ -378,6 +978,13 @@ class RefVM:
                 raise VMError(ERR_TYPE, "infer_let: value type mismatch")
             menv = self._link(V0, env, env, flag=1)
             return self.infer(X, menv)
+        if K == T_PI_CLO:
+            # An inferred Pi type (infer of a lambda). infer_type of a Pi is
+            # Sort (imax sort(dom) sort(cod)) (K/type_checker.cpp:160-165);
+            # the body half already carries its binder marker env (E2).
+            l1 = self._sort_level_of(self.infer(V0, X))
+            l2 = self._sort_level_of(self.infer(V1, self.b.stream[pos][5]))
+            return self._emit_sort_at(self._mk_imax(l1, l2))
         if K == K_PROJ:
             # kernel infer_proj (type_checker.cpp L247), monomorphic
             # non-rec subset: whnf(child type) must be the structure const
@@ -417,6 +1024,38 @@ class RefVM:
             pos = t[1]                            # V0 = fn
         return (pos, env), args
 
+    def _match_ctor(self, wpos: int, wenv: int, ctors):
+        """P7.2 casesOn major-premise matcher. `ctors` = [(ctor_cid, nfields)]
+        in minor order. Returns (ctor_idx, fields) with fields in application
+        order, or None if the major is not one of these constructors (stuck).
+        Mirrors the kernel: nat literals are converted to constructor form
+        first (nat_lit_to_constructor, inductive.h L94)."""
+        K, V0, V1, V2, X = self.b.stream[wpos][:5]
+        if K == K_LIT and V1 == LIT_NAT:
+            v = sum(self.b.stream[wpos + 2 + 2 * i][1] * (10 ** i)
+                    for i in range(V0))
+            cid = self.cid_zero if v == 0 else self.cid_succ
+            for idx, (cc, nf) in enumerate(ctors):
+                if cc == cid:
+                    fields = [] if v == 0 else [(self._emit_chain(v - 1), 0)]
+                    return idx, fields
+            return None
+        if K == K_CONST:
+            for idx, (cc, nf) in enumerate(ctors):
+                if cc == V0 and nf == 0:
+                    return idx, []
+            return None
+        if K == K_APP:
+            head, rargs = self._spine(wpos, wenv)   # rargs = reverse app order
+            hK, hV0, *_ = self.b.stream[head[0]][:5]
+            if hK != K_CONST:
+                return None
+            fields_app = list(reversed(rargs))       # application order
+            for idx, (cc, nf) in enumerate(ctors):
+                if cc == hV0 and len(fields_app) >= nf:
+                    return idx, fields_app[:nf]
+        return None
+
     def _nat_ctor_value(self, pos: int, env: int):
         """Kernel reduce_nat/is_nat_expr analog (M1 subset): extract the Nat
         value of a closed ctor/literal form — K_LIT, Nat.zero, or a
@@ -453,9 +1092,15 @@ class RefVM:
             K2, W0, W1, W2, X2 = sT[:5]
 
             if K == K2 and K == K_CONST and V0 == W0:
-                return True
+                # kernel is_def_eq_core const case (K/type_checker.cpp:1209-
+                # 1211): same name AND is_def_eq(const_levels), where the
+                # per-level relation is is_def_eq(level,level) = D4
+                # (K/type_checker.h:88; K/type_checker.cpp:814-820,822-832).
+                return self._levels_equivalent(V1, W1)
             if K == K2 and K == K_SORT:
-                return self._level_int(V0) == self._level_int(W0)
+                # kernel quick_is_def_eq Sort (K/type_checker.cpp:843-844) ->
+                # is_def_eq(level,level) = D4.
+                return self._level_is_equivalent(V0, W0)
             if (K == K2 and K == K_LIT and V1 == LIT_NAT and W1 == LIT_NAT):
                 return self._chain_value(t_pos, 0) == \
                     self._chain_value(s_pos, 0)
@@ -501,22 +1146,53 @@ class RefVM:
                 t = (V0, t_env)
                 s = (W0, s_env)
                 continue
-            # cross-kind Pi shapes: K_PI tree vs T_PI_CLO (infer results)
+            # cross-kind Pi shapes: K_PI tree vs T_PI_CLO (infer results).
+            # Kernel is_def_eq_binding (K/type_checker.cpp:781-794): compare
+            # domains in the current context, add ONE shared local decl
+            # (mk_local_decl) and compare bodies under it.
             pi_t = K in (K_PI, T_PI_CLO)
             pi_s = K2 in (K_PI, T_PI_CLO)
             if pi_t and pi_s:
-                dom_t, body_t = self._pi_parts(t)
-                dom_s, body_s = self._pi_parts(s)
-                if not self.defeq(dom_t, dom_s):
+                # outer env = X for T_PI_CLO, the closure env for K_PI; the
+                # body closure is (V1, E2) for T_PI_CLO (already the env the
+                # infer-side body type lives in) and (V1, env) for K_PI.
+                clo_t = K == T_PI_CLO
+                clo_s = K2 == T_PI_CLO
+                dom_env_t = X if clo_t else t_env
+                dom_env_s = X2 if clo_s else s_env
+                body_pos_t, body_env_t = V1, (tT[5] if clo_t else None)
+                body_pos_s, body_env_s = W1, (sT[5] if clo_s else None)
+                if not self.defeq((V0, dom_env_t), (W0, dom_env_s)):
                     return False
-                # a raw K_PI side has no marker env yet; push one shared-id
-                # marker per side so BVar(0) pairs up (a T_PI_CLO side
-                # already carries its own marker one link deeper — deeper
-                # bvars fall through to the general machinery)
-                mt = self._link(dom_t[0], dom_t[1], body_t[1], flag=1)
-                self._stamp_bid(mt, mt)
-                ms = self._link(dom_s[0], dom_s[1], body_s[1], flag=1, bid=mt)
-                return self.defeq((body_t[0], mt), (body_s[0], ms))
+                # binder marker: K_PI gets a fresh marker over its outer env;
+                # T_PI_CLO reuses its existing binder marker when E2 is one
+                # marker-link deeper than X (so BVar0 already denotes the
+                # binder). Unify the two marker bids (kernel shares the local
+                # decl; deq_fvar_args / deq_fvar_swap_no pin that distinct
+                # markers must stay distinct).
+                mt = self._binder_marker(clo_t, V0, dom_env_t, body_env_t,
+                                         body_pos_t)
+                ms = self._binder_marker(clo_s, W0, dom_env_s, body_env_s,
+                                         body_pos_s)
+                if mt is not None and ms is not None:
+                    bid = (self.b.stream[mt][6] or self.b.stream[ms][6] or mt)
+                    self._stamp_bid(mt, bid)
+                    self._stamp_bid(ms, bid)
+                elif mt is not None and not self.b.stream[mt][6]:
+                    self._stamp_bid(mt, mt)
+                elif ms is not None and not self.b.stream[ms][6]:
+                    self._stamp_bid(ms, ms)
+                if clo_t:
+                    env_t = body_env_t
+                else:
+                    env_t = mt if mt is not None else self._link(
+                        V0, dom_env_t, dom_env_t, flag=1)
+                if clo_s:
+                    env_s = body_env_s
+                else:
+                    env_s = ms if ms is not None else self._link(
+                        W0, dom_env_s, dom_env_s, flag=1)
+                return self.defeq((body_pos_t, env_t), (body_pos_s, env_s))
 
             nt = self._soft_whnf(t_pos, t_env)
             ns = self._soft_whnf(s_pos, s_env)
@@ -549,8 +1225,34 @@ class RefVM:
                     self._try_eta_struct(ns, nt)
                 if r is not None:
                     return r
+                r = self._unit_like(nt, ns)
+                if r is not None:
+                    return r
                 return False   # mixed stuck shapes
             t, s = nt, ns
+
+    def check(self, decls) -> tuple[int, int]:
+        """Kernel `check` driver loop (Phase 5 M4.2): per declaration,
+        infer the value's type and defeq it against the declared type.
+        decls: iterable of (type_root, val_root) stream positions, or
+        (type_root, val_root, lparams) triples where lparams is the checked
+        declaration's universe-parameter names (WP2 check_level, D11). Raises
+        VMError(ERR_TYPE) on the first mismatch; returns (1, 0) when every
+        declaration is accepted."""
+        for i, decl in enumerate(decls):
+            if len(decl) == 3:
+                type_root, val_root, lps = decl
+                self._decl_lparams = {
+                    self.b.nid(n) if isinstance(n, str) else int(n)
+                    for n in lps}
+            else:
+                type_root, val_root = decl
+                self._decl_lparams = None
+            t_pos, t_env = self.infer(val_root, 0)
+            if not self.defeq((t_pos, t_env), (type_root, 0)):
+                raise VMError(ERR_TYPE, f"decl {i}: value type mismatch")
+        self._decl_lparams = None
+        return (1, 0)
 
     def _stamp_bid(self, link_pos: int, bid: int) -> None:
         row = self.b.stream[link_pos]
@@ -562,9 +1264,11 @@ class RefVM:
         proof (or its type is outside the infer subset → l_undef)."""
         try:
             t_ty = self.infer(*t)
-            # kernel is_prop: ensure_sort(infer_type(e)) then level→0
+            # kernel is_prop (K/type_checker.cpp:383-389):
+            # normalizes_to_zero(sort_level(ensure_sort(infer_type(e)))).
             ty_sort = self.infer(*t_ty)
-            if self._sort_level_of(ty_sort) != 0:
+            if not self._level_normalizes_to_zero(
+                    self._sort_level_of(ty_sort)):
                 return None
         except VMError as e:
             if e.code in (ERR_TYPE, ERR_UNSUPPORTED):
@@ -627,3 +1331,22 @@ class RefVM:
             if not self.defeq((ppos, t[1]), args[nparams + nfields - 1 - i]):
                 return False
         return True
+
+    def _unit_like(self, t: tuple[int, int], s: tuple[int, int]):
+        """Kernel is_def_eq_unit_like (type_checker.cpp L1159): if t's type
+        whnf's to a non-rec structure whose single constructor has 0 fields,
+        every element is equal → t ≡ s iff their types are defeq. Returns
+        True/False, or None when t's type head is not a 0-field structure
+        (proof-irrel already handled Prop; this covers Type-level subsingletons
+        like `Unit`)."""
+        b = self.b
+        t_ty = self.infer(*t)
+        head, _ = self._spine(*self.whnf(*t_ty))   # get_app_fn of the type
+        hK, hV0, *_ = b.stream[head[0]][:5]
+        if hK != K_CONST:
+            return None
+        ent = self.ctor_of_struct.get(hV0)
+        if ent is None or ent[2] != 0:             # not a structure, or has fields
+            return None
+        s_ty = self.infer(*s)
+        return self.defeq(t_ty, s_ty)

@@ -33,6 +33,19 @@ logger = logging.getLogger(__name__)
 
 HARD_K = 1e4  # Temperature for hardmax approximation (matches alm_graph.py)
 
+# ReGLU output clamp of the compiled weight channel. One semantic, three
+# mirrors: this constant (used in forward() and forward_stream()),
+# model/runner.py (imports this one), and engine/vm.cpp's REGLU_CLAMP
+# (C++ mirror — keep byte-for-byte in sync by hand).
+# Bounds (docs/decisions/013-reglu-clamp-1e6.md): must exceed every legal
+# stream-position read — the step loop emits <= 10 tokens/step and the
+# engine harness budget is 3000 steps, so stream <= n0+30001 (largest legal
+# read observed: 1003, pow case) — and must stay <= 2^24-1 = 16777215 so
+# integer readouts are exact under fp32 storage and llround. 1e6 satisfies
+# both. The old +-1000 flattened pow's F readout 1003 -> 1000 and desynced
+# the machine (docs/handoffs/002-C-wp6.md C5 step 1.6).
+REGLU_CLAMP = 1e6
+
 
 # ─── Compact Attention ─────────────────────────────────────────────────
 
@@ -79,11 +92,194 @@ class CompactAttention(nn.Module):
         if attn_mask is not None:
             scores = scores + attn_mask.unsqueeze(0).unsqueeze(0)
 
-        attn = torch.softmax(scores, dim=-1)
-        out = torch.matmul(attn, v)  # (B, H, T, dh)
+        if getattr(self, "hard_fetch", True):
+            # LookUpDimension is a discrete fetch: take the argmax and gather
+            # it exactly rather than approximating one-hot with a softmax.
+            # argmax is scale-invariant, so this needs no HARD_K temperature
+            # and no exp — the softmax path's ~1e9-1e10 scores overflow fp16
+            # (65504) to inf/NaN and are quantized to ~1e3 in fp32.
+            idx = scores.argmax(dim=-1)                  # (B, H, T)
+            out = v.gather(2, idx.unsqueeze(-1).expand(-1, -1, -1, dh))
+        else:
+            attn = torch.softmax(scores, dim=-1)
+            out = torch.matmul(attn, v)  # (B, H, T, dh)
         out = out.transpose(1, 2).contiguous().view(B, T, H * dh)
         result = out @ self.out_weight.t()  # (B, T, D)
         return result, None
+
+
+# ─── Sparse-native build objects (H1/H2) ─────────────────────────────────
+#
+# The dense lowering allocates 2.4e9 parameters (19.2 GB fp64) to store
+# 28,546 nonzeros — it OOMs the 30 GB host.  These objects implement the
+# exact subset of the torch tensor surface `build_weights` uses (whole-row
+# assignment from `expr_to_tensor`, element set, element `+=`, `zero_()`)
+# while storing only nonzeros, so the SAME construction code can drive
+# either backend.  Byte-for-byte the emitted CSR matches what
+# `save_weights_sparse` would derive from the dense tensors.
+
+
+class SparseMatrix:
+    """Row-major float64 sparse matrix: rows are ``{col: value}`` dicts."""
+
+    __slots__ = ("rows", "cols", "row_data")
+
+    def __init__(self, rows: int, cols: int):
+        self.rows = int(rows)
+        self.cols = int(cols)
+        self.row_data: Dict[int, Dict[int, float]] = {}
+
+    @property
+    def data(self):
+        """nn.Parameter.data analogue: build_weights reads ``w.data``."""
+        return self
+
+    def zero_(self):
+        self.row_data.clear()
+        return self
+
+    def __setitem__(self, key, value):
+        if isinstance(key, tuple):
+            i, j = int(key[0]), int(key[1])
+            v = float(value)
+            if v == 0.0:
+                row = self.row_data.get(i)
+                if row is not None:
+                    row.pop(j, None)
+                    if not row:
+                        self.row_data.pop(i, None)
+                return
+            row = self.row_data.get(i)
+            if row is None:
+                row = {}
+                self.row_data[i] = row
+            row[j] = v
+            return
+
+        # Whole-row assignment (mirrors ``tensor[i] = dense_row``).
+        i = int(key)
+        row: Dict[int, float] = {}
+        if value is None:
+            pass
+        elif isinstance(value, dict):
+            for j, v in value.items():
+                v = float(v)
+                if v != 0.0:
+                    j = int(j)
+                    row[j] = row.get(j, 0.0) + v
+        elif isinstance(value, torch.Tensor):
+            nz = value.nonzero(as_tuple=False).reshape(-1)
+            vals = value[nz]
+            for j, v in zip(nz.tolist(), vals.tolist()):
+                v = float(v)
+                if v != 0.0:
+                    row[int(j)] = row.get(int(j), 0.0) + v
+        else:
+            for j, v in enumerate(value):
+                v = float(v)
+                if v != 0.0:
+                    j = int(j)
+                    row[j] = row.get(j, 0.0) + v
+        row = {j: v for j, v in row.items() if v != 0.0}
+        if row:
+            self.row_data[i] = row
+        else:
+            self.row_data.pop(i, None)
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple):
+            i, j = int(key[0]), int(key[1])
+            return self.row_data.get(i, {}).get(j, 0.0)
+        i = int(key)
+        out = [0.0] * self.cols
+        for j, v in self.row_data.get(i, {}).items():
+            out[j] = v
+        return out
+
+    def nnz(self) -> int:
+        return sum(len(r) for r in self.row_data.values())
+
+
+class _SparseLinear:
+    def __init__(self, rows: int, cols: int):
+        self.weight = SparseMatrix(rows, cols)
+
+
+class _SparseEmbedding:
+    def __init__(self, rows: int, cols: int):
+        self.weight = SparseMatrix(rows, cols)
+
+
+class _SparseAttention:
+    """CompactAttention analogue with per-layer head count (H2)."""
+
+    def __init__(self, embed_dim: int, n_heads: int, d_head: int = 2):
+        h2 = n_heads * d_head
+        self.embed_dim = embed_dim
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self._qkv_dim = h2
+        self.q_weight = SparseMatrix(h2, embed_dim)
+        self.k_weight = SparseMatrix(h2, embed_dim)
+        self.v_weight = SparseMatrix(h2, embed_dim)
+        self.out_weight = SparseMatrix(embed_dim, h2)
+
+
+class SparseLeanModel:
+    """LeanTransformer-shaped container backed by SparseMatrix objects.
+
+    Keeps the attribute surface `build_weights` touches (and the header
+    fields `save_sparse_native` writes) but allocates only nonzeros.
+    ``layer_heads[li]`` is the H_li for that layer; the attention blocks are
+    sized 2*H_li, so layers with no lookups carry empty matrices.
+    """
+
+    def __init__(self, vocab_size, d_model, n_heads, n_layers, d_ffn,
+                 layer_heads, stop_token_id=0):
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.d_ffn = d_ffn
+        self.layer_heads = list(layer_heads)
+        self.stop_token_id = stop_token_id
+        self.tok_embedding = _SparseEmbedding(vocab_size, d_model)
+        self.attn_layers = [
+            _SparseAttention(d_model, h, d_head=2) for h in self.layer_heads
+        ]
+        self.ff_in = [_SparseLinear(2 * d_ffn, d_model)
+                      for _ in range(n_layers)]
+        self.ff_out = [_SparseLinear(d_model, d_ffn)
+                       for _ in range(n_layers)]
+        self.head = _SparseLinear(vocab_size, d_model)
+        self.attn_erase: List[List[int]] = []
+        self.ffn_erase: List[List[int]] = []
+        self.head_tiebreak: List[List[int]] = []
+        self.tanh_c = 100.0
+
+    def nnz(self) -> int:
+        total = 0
+        for a in self.attn_layers:
+            total += (a.q_weight.nnz() + a.k_weight.nnz()
+                      + a.v_weight.nnz() + a.out_weight.nnz())
+        for li in range(self.n_layers):
+            total += self.ff_in[li].weight.nnz()
+            total += self.ff_out[li].weight.nnz()
+        total += self.head.weight.nnz()
+        return total
+
+    def nnz_breakdown(self) -> Dict[str, int]:
+        d = {"q": 0, "k": 0, "v": 0, "out": 0, "ff_in": 0, "ff_out": 0,
+             "head": self.head.weight.nnz()}
+        for a in self.attn_layers:
+            d["q"] += a.q_weight.nnz()
+            d["k"] += a.k_weight.nnz()
+            d["v"] += a.v_weight.nnz()
+            d["out"] += a.out_weight.nnz()
+        for li in range(self.n_layers):
+            d["ff_in"] += self.ff_in[li].weight.nnz()
+            d["ff_out"] += self.ff_out[li].weight.nnz()
+        return d
 
 
 # ─── Transformer Model Definition ────────────────────────────────────────
@@ -155,6 +351,55 @@ class LeanTransformer(nn.Module):
         # compilations to preserve input embedding values.
         self.tanh_c: float = 100.0
 
+    def _erase_idx_for(self, li: int, device):
+        """(attn, ffn) LongTensor slot indices for layer li, or None.
+
+        attn_erase/ffn_erase are Python slot lists; zeroing them with a
+        per-slot ``x[..., slot] = 0.0`` loop costs thousands of dispatches per
+        forward (ffn_erase alone lists ~4000 slots over the 98 layers, ~9 s
+        per pass regardless of sequence length).  Cached per device.
+        """
+        cache = getattr(self, "_erase_cache", None)
+        if cache is None or cache[0] != device:
+            cache = (device, {})
+            self._erase_cache = cache
+        d = cache[1]
+        if li not in d:
+            a = self.attn_erase[li] if li < len(self.attn_erase) else []
+            f = self.ffn_erase[li] if li < len(self.ffn_erase) else []
+            a = [s for s in a if 0 <= s < self.d_model]
+            f = [s for s in f if 0 <= s < self.d_model]
+            d[li] = (
+                torch.as_tensor(a, dtype=torch.long, device=device)
+                if a else None,
+                torch.as_tensor(f, dtype=torch.long, device=device)
+                if f else None,
+            )
+        return d[li]
+
+    def _live_attn_layers(self) -> set:
+        """Layer indices whose attention block can contribute a non-zero value.
+
+        Tested on ``out_weight`` alone: the block writes ``attn @ out_weight.t()``
+        into the residual stream, so an all-zero ``out_weight`` makes the whole
+        sublayer identically zero no matter what Q/K/V compute. That makes the
+        criterion sound (dropping such a layer is provably exact) and
+        conservative (a layer kept because its out_weight is non-zero may still
+        contribute nothing, which only costs time).
+
+        The scheduler reserves an attention block in every layer but only the
+        layers that carry a LookUp get weights written; on the P7.5c build 89
+        of 98 layers are dead this way. Scanned once, cached per instance
+        (weights never change after build_weights).
+        """
+        cache = getattr(self, "_live_attn", None)
+        if cache is not None:
+            return cache
+        live = {li for li, a in enumerate(self.attn_layers)
+                if a.out_weight.detach().count_nonzero().item()}
+        self._live_attn = live
+        return live
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the model.
 
@@ -196,31 +441,32 @@ class LeanTransformer(nn.Module):
                 diagonal=1,
             )
 
+        live_attn = self._live_attn_layers()
         for li in range(self.n_layers):
+            a_er, f_er = self._erase_idx_for(li, x.device)
             # ── Erase slots before attention (stale values from previous layers) ──
-            if li < len(self.attn_erase) and self.attn_erase[li]:
-                for slot in self.attn_erase[li]:
-                    if 0 <= slot < D:
-                        x[..., slot] = 0.0
+            if a_er is not None:
+                x[..., a_er] = 0.0
 
-            # Attention sublayer (causal)
-            attn_out, _ = self.attn_layers[li](x, x, x, attn_mask=causal_mask)
-            x = x + attn_out
+            # Attention sublayer (causal); skipped entirely when the layer's
+            # QKV/out weights are all zero (the block would add 0).
+            if li in live_attn:
+                attn_out, _ = self.attn_layers[li](x, x, x, attn_mask=causal_mask)
+                x = x + attn_out
 
             # FFN sublayer (ReGLU): read first, then erase stale slots, then write
             gate_out = self.ff_in[li](x)  # read phase
             gate, val = gate_out.chunk(2, dim=-1)
             act = torch.relu(gate) * val
-            # Prevent ReGLU overflow: when gate and val both read from large
-            # hidden state values, their product can be enormous (e.g., 133*133=17689).
-            # Clamp each neuron's output to a reasonable range.
-            act = torch.clamp(act, min=-1000.0, max=1000.0)
+            # Guardrail against non-halting-path product blow-up (gate and
+            # val can both read large hidden values, e.g. 133*133=17689).
+            # The bound must not flatten legitimate position reads — see
+            # the REGLU_CLAMP definition above and docs/decisions/013.
+            act = torch.clamp(act, min=-REGLU_CLAMP, max=REGLU_CLAMP)
 
             # ── Erase reused slots AFTER read, BEFORE write ──
-            if li < len(self.ffn_erase) and self.ffn_erase[li]:
-                for slot in self.ffn_erase[li]:
-                    if 0 <= slot < D:
-                        x[..., slot] = 0.0
+            if f_er is not None:
+                x[..., f_er] = 0.0
 
             x = x + self.ff_out[li](act)  # write phase
 
@@ -266,24 +512,25 @@ class LeanTransformer(nn.Module):
                 diagonal=1,
             )
 
+        live_attn = self._live_attn_layers()
         for li in range(self.n_layers):
-            if li < len(self.attn_erase) and self.attn_erase[li]:
-                for slot in self.attn_erase[li]:
-                    if 0 <= slot < D:
-                        x[..., slot] = 0.0
+            a_er, f_er = self._erase_idx_for(li, x.device)
+            if a_er is not None:
+                x[..., a_er] = 0.0
 
-            attn_out, _ = self.attn_layers[li](x, x, x, attn_mask=causal_mask)
-            x = x + attn_out
+            # Skipped when the layer's QKV/out weights are all zero (the
+            # attention block provably contributes nothing).
+            if li in live_attn:
+                attn_out, _ = self.attn_layers[li](x, x, x, attn_mask=causal_mask)
+                x = x + attn_out
 
             gate_out = self.ff_in[li](x)
             gate, val = gate_out.chunk(2, dim=-1)
             act = torch.relu(gate) * val
-            act = torch.clamp(act, min=-1000.0, max=1000.0)
+            act = torch.clamp(act, min=-REGLU_CLAMP, max=REGLU_CLAMP)
 
-            if li < len(self.ffn_erase) and self.ffn_erase[li]:
-                for slot in self.ffn_erase[li]:
-                    if 0 <= slot < D:
-                        x[..., slot] = 0.0
+            if f_er is not None:
+                x[..., f_er] = 0.0
 
             x = x + self.ff_out[li](act)
 
@@ -327,6 +574,7 @@ def build_weights(
     output_tokens: Dict[str, Any],
     use_erase: bool = True,
     min_d_model: int = 0,
+    sparse: bool = False,
 ) -> Tuple[LeanTransformer, List[str], Dict[str, int]]:
     """Build transformer weights from a schedule plan.
 
@@ -340,6 +588,11 @@ def build_weights(
       input_tokens: Input token to expression mapping.
       output_tokens: Output token to expression mapping.
       use_erase: Whether to use erase-based slot reuse.
+      sparse: When True, return a SparseLeanModel (SparseMatrix storage,
+              per-layer head counts) instead of a dense LeanTransformer.
+              Same construction code, only the storage backend changes, so
+              the nonzeros are identical — but no dense tensor is ever
+              allocated (the 19.2 GB OOM cause).
 
     Returns:
       (model, all_tokens, tok_to_idx_map)
@@ -535,14 +788,30 @@ def build_weights(
     vocab_size = len(all_tokens)
 
     # Create model
-    model = LeanTransformer(
-        vocab_size=vocab_size,
-        d_model=D,
-        n_heads=H,
-        n_layers=L,
-        d_ffn=F,
-        stop_token_id=tok_to_idx.get("halt", 0),
-    )
+    if sparse:
+        # H2: each layer's attention block is sized by its own head count
+        # H_li = _heads_per_layer[li], not the global max.  The per-layer
+        # weight loop below only ever writes head indices 0..H_li-1, so no
+        # value changes; layers with H_li == 0 carry empty matrices and the
+        # engine skips their routing sublayer entirely.
+        model = SparseLeanModel(
+            vocab_size=vocab_size,
+            d_model=D,
+            n_heads=H,
+            n_layers=L,
+            d_ffn=F,
+            layer_heads=_heads_per_layer,
+            stop_token_id=tok_to_idx.get("halt", 0),
+        )
+    else:
+        model = LeanTransformer(
+            vocab_size=vocab_size,
+            d_model=D,
+            n_heads=H,
+            n_layers=L,
+            d_ffn=F,
+            stop_token_id=tok_to_idx.get("halt", 0),
+        )
 
     # ── Pre-build name→dim indexes for O(1) lookup ──
     _reglu_by_name: Dict[str, Any] = {}
@@ -925,12 +1194,12 @@ def _assign_slots(all_dims: List, schedule_plan: Any,
                   output_dims: Optional[set] = None) -> Dict:
     """Assign each dimension to a residual stream slot using interval coloring.
 
-    Uses lifetime information (birth = producer phase, death = max consumer
-    phase + 1) to reuse slots across layers when dimensions have non-overlapping
-    lifetimes. The +1 in death ensures no same-layer slot reuse, which avoids
-    the erase-timing issue: the erase happens at the sublayer boundary *after*
-    the read phase and *before* the write phase, so stale values from a previous
-    layer are cleared before the new sublayer reads.
+    Uses lifetime information (birth = producer phase, death = last direct
+    consumer phase + 1) to reuse slots.  Coloring runs at LAYER granularity:
+    writes are additive and erases only fire across layer boundaries, so a
+    slot's writers must occupy strictly increasing layers (occupancy =
+    closed interval [birth//4, (death-1)//4]); the erase mask machinery
+    (build_weights) then clears each slot before every cross-layer rewrite.
 
     Slots 0-3 are reserved for built-ins (one, position, inv_log_pos,
     position_sq) — these are always alive.
@@ -1009,57 +1278,38 @@ def _assign_slots(all_dims: List, schedule_plan: Any,
             if min_birth > birth.get(d, 0):
                 birth[d] = min_birth
 
-    # Non-input dims: death = max TRANSITIVE consumer phase + 1
-    # The +1 ensures no same-layer slot reuse. We must consider TRANSITIVE
-    # consumers because a dim's value must survive until ALL downstream
-    # consumers (direct or transitive) have read it. For a chain
-    # A→B→C→D, A's value must survive until D reads it, not just until B reads it.
+    # Non-input dims: death = max DIRECT consumer phase + 1
+    # The +1 keeps the dim alive through the phase of its last reader.
+    # NOT transitive: in a materialized dataflow chain A→B→C, B's slot
+    # captures A's contribution once B's producer fires, so A dies at its
+    # last direct consumer; extending A through C (let alone through the
+    # output head) left ~98% of dims alive for the whole run and collapsed
+    # slot reuse (d_model ≈ num_dims, the pre-M5 compile blew up 4x).
     if consumers is not None:
-        # Build transitive consumer map: for each dim, find all transitive consumers
-        transitive_consumers: Dict = {}
         for d in all_dims:
             if isinstance(d, InputDimension) or d in protected_slots:
                 continue
-            # Compute transitive closure of consumers
-            visited = set()
-            stack = list(consumers.get(d, set()))
-            all_cons = set()
-            while stack:
-                c = stack.pop()
-                if c in visited:
-                    continue
-                visited.add(c)
-                all_cons.add(c)
-                # Add c's consumers
-                for cc in consumers.get(c, set()):
-                    if cc not in visited:
-                        stack.append(cc)
-            transitive_consumers[d] = all_cons
-
-        for d in all_dims:
-            if isinstance(d, InputDimension) or d in protected_slots:
-                continue
-            all_cons = transitive_consumers.get(d, set())
-            if all_cons:
-                max_consumer_phase = -1
-                for c in all_cons:
-                    c_name = None
-                    if isinstance(c, (ReGLUDimension, PersistDimension)):
-                        c_name = c.name
-                    elif isinstance(c, LookUp):
-                        c_name = f"lookup_{c.id}"
-                    if c_name and c_name in plan_phases:
-                        li, pi = plan_phases[c_name]
-                        ph = 4 * li + pi
-                        if ph > max_consumer_phase:
-                            max_consumer_phase = ph
-                if max_consumer_phase >= 0:
-                    # death = max transitive consumer phase + 1 (safe cross-layer reuse)
-                    death[d] = max_consumer_phase + 1
-                else:
-                    death[d] = birth.get(d, 0)  # never consumed → no lifetime
+            max_consumer_phase = -1
+            for c in consumers.get(d, set()):
+                c_name = None
+                if isinstance(c, (ReGLUDimension, PersistDimension)):
+                    c_name = c.name
+                elif isinstance(c, LookUp):
+                    c_name = f"lookup_{c.id}"
+                if c_name and c_name in plan_phases:
+                    li, pi = plan_phases[c_name]
+                    ph = 4 * li + pi
+                    if ph > max_consumer_phase:
+                        max_consumer_phase = ph
+            if max_consumer_phase >= 0:
+                death[d] = max_consumer_phase + 1
             else:
                 death[d] = birth.get(d, 0)  # never consumed → no lifetime
+    else:
+        for d in all_dims:
+            if isinstance(d, InputDimension) or d in protected_slots:
+                continue
+            death[d] = P
 
     # Default for any remaining dims
     for d in all_dims:
@@ -1074,50 +1324,15 @@ def _assign_slots(all_dims: List, schedule_plan: Any,
             if od in death:
                 death[od] = P
 
-    # ── 3c3. Extend death of all transitive dependencies of output dims ──
-    # If an output dim lives until the end, all dims it depends on (transitively)
-    # must also live until the end, otherwise their slots could be reused and
-    # their values lost before the output is computed.
-    if output_dims and consumers is not None:
-        # Build forward dependency map: dim -> set of dims it directly depends on
-        fwd_deps: Dict = {}
-        for d in all_dims:
-            if isinstance(d, ReGLUDimension):
-                deps = set()
-                for expr in (d.a_expr, d.b_expr):
-                    if isinstance(expr, Expression):
-                        for td in expr.terms:
-                            deps.add(td)
-                if deps:
-                    fwd_deps[d] = deps
-            if isinstance(d, PersistDimension):
-                if isinstance(getattr(d, 'expr', None), Expression):
-                    deps = set(d.expr.terms.keys())
-                    if deps:
-                        fwd_deps[d] = deps
-            if isinstance(d, LookUpDimension):
-                deps = set(d.lookup.dims)
-                if deps:
-                    fwd_deps[d] = deps
-
-        # For each output dim, walk forward through its dependencies
-        # and extend their death to match the output dim's death (P)
-        for od in output_dims:
-            if od in death:
-                od_death = death[od]
-                visited = set()
-                stack = [od]
-                while stack:
-                    cur = stack.pop()
-                    if cur in visited:
-                        continue
-                    visited.add(cur)
-                    if cur in fwd_deps:
-                        for dep in fwd_deps[cur]:
-                            if dep in death and death[dep] < od_death:
-                                death[dep] = od_death
-                            if dep not in visited:
-                                stack.append(dep)
+    # ── 3c2. Late-stage dims live until the end ──
+    # REMOVED: This caused unexpected side effects on slot allocation.
+    #
+    # 3c3 (transitive dependencies of output dims extended to P) is also
+    # REMOVED: the output head reads only the dims named directly in the
+    # output token expressions (protected by 3c). An intermediate dim
+    # feeding an output dim through a lookup/Persist chain is captured by
+    # that consumer's own slot once it fires; extending it to P was the
+    # main driver of the d_model blow-up (see death comment above).
 
     # ── 3c2. Late-stage dims live until the end ──
     # REMOVED: This caused unexpected side effects on slot allocation.
@@ -1127,15 +1342,22 @@ def _assign_slots(all_dims: List, schedule_plan: Any,
     # output dim births, preventing slot reuse and inflating d_model from
     # ~300 to ~1200. The output dim slot protection in step 5 is sufficient.
 
-    # ── 4. Greedy interval coloring ─────────────────────────────
+    # ── 4. Greedy interval coloring (layer granularity) ─────────
+    # Writes are additive (x += attn_out / ff_out) and the erase masks only
+    # fire when the previous writer of a slot lives in an EARLIER layer, so
+    # a slot's consecutive writers must sit in strictly increasing layers.
+    # Occupancy is therefore the closed layer interval
+    # [birth//4, (death-1)//4]; a slot is free for a writer born in layer
+    # L only when its previous occupant died in a layer < L.
     intervals = []
     for d in all_dims:
         if d in protected_slots or d in slot_of:
             continue
         b = birth.get(d, 0)
-        de = death.get(d, P)
-        if de > b:
-            intervals.append((b, de, d))
+        de = min(death.get(d, P), P)
+        lo = b // 4
+        hi = max(lo, (de - 1) // 4)
+        intervals.append((lo, hi, d))
 
     intervals.sort(key=lambda x: (x[0], x[1]))
 
@@ -1143,22 +1365,25 @@ def _assign_slots(all_dims: List, schedule_plan: Any,
     free_heap = []
     next_slot = 4
 
-    for b, de, d in intervals:
+    for lo, hi, d in intervals:
         freed = []
-        while free_heap and free_heap[0][0] <= b:
-            freed.append(heapq.heappop(free_heap)[1])
-
+        while free_heap and free_heap[0][0] < lo:
+            freed.append(heapq.heappop(free_heap))
         if freed:
-            slot = min(freed)
-            for s in freed:
+            # reuse the lowest-numbered free slot; push the rest back with
+            # their ORIGINAL key — re-keying to `lo` would lock them against
+            # every same-layer candidate (the churn bug that collapsed
+            # reuse to ~1 slot/layer and blew d_model up to ~num_dims)
+            _, slot = min(freed, key=lambda ks: ks[1])
+            for k, s in freed:
                 if s != slot:
-                    heapq.heappush(free_heap, (b, s))
+                    heapq.heappush(free_heap, (k, s))
         else:
             slot = next_slot
             next_slot += 1
 
         slot_of[d] = slot
-        heapq.heappush(free_heap, (de, slot))
+        heapq.heappush(free_heap, (hi, slot))
 
     # Assign any remaining dims that were missed
     for d in all_dims:
@@ -1166,25 +1391,16 @@ def _assign_slots(all_dims: List, schedule_plan: Any,
             slot_of[d] = next_slot
             next_slot += 1
 
-    # ── 5. Write-count limiting ──
-    # The residual stream accumulates writes per slot.  Interval coloring
-    # considers lifetimes non-overlapping as "safe" reuse, but >2 writers
-    # per slot on a shared accumulator causes erasure or saturation.
-    # Limit each slot to MAX_WRITES_PER_SLOT writers (skip protected 0-3).
-    MAX_WRITES_PER_SLOT = 2
-    slot_write_count: Dict[int, int] = defaultdict(int)
-    for d, slot in slot_of.items():
-        slot_write_count[slot] += 1
-    for slot, count in list(slot_write_count.items()):
-        if count > MAX_WRITES_PER_SLOT and slot >= 4:
-            excess_dims = [d for d, s in slot_of.items() if s == slot]
-            for d in excess_dims[MAX_WRITES_PER_SLOT:]:
-                slot_of[d] = next_slot
-                next_slot += 1
+    return slot_of
 
-    # ── 6. Output dim protection ──
-    # Output dims now have death=P (step 3c), so interval coloring already
-    # prevents their slots from being reused. No post-processing needed.
+    # ── 5/6. (removed) ──
+    # Step 5 (MAX_WRITES_PER_SLOT=2) was a blunt anti-corruption guard from
+    # the pre-MILP era: with erase masks firing before every cross-layer
+    # write (guaranteed by the layer-granularity coloring above), any
+    # number of consecutive writers per slot is safe, and the cap collapsed
+    # reuse on wide graphs (every 3rd dim got a fresh slot).
+    # Step 6 needed no code: output dims have death=P (step 3c), so the
+    # coloring already prevents their slots from being reused.
 
     return slot_of
 
@@ -1279,6 +1495,213 @@ def save_weights(model: LeanTransformer, all_tokens: List[str], path: str):
                 f.write(struct.pack("<i", idx))
 
     logger.info("Saved weights to %s", path)
+
+
+def save_weights_sparse(model: LeanTransformer, all_tokens: List[str],
+                        path: str):
+    """Save the engine-facing weights as a CSR-sparse binary ("L4SV" v1).
+
+    The analytic construction leaves all but a handful of the model's
+    entries exactly 0.0, so the dense file is ~40 GB of zeros on disk that
+    the C++ engine re-reads (and re-sparsifies) on every invocation. This
+    format stores only the nonzeros — the engine mmaps it and is ready in
+    milliseconds. The embedding matrix is omitted (the engine never reads
+    it: input fields go straight into residual slots).
+
+    Layout (little-endian):
+      magic "L4SV" | int32 version=1
+      <6i header: vocab, d_model, n_layers, n_heads, d_ffn, stop_token_id>
+      token names: int32 len + bytes, × vocab
+      matrices in order q,k,v,out × layers, then ff_in, ff_out × layers,
+        then head; each: int32 rows, int32 cols, int64 nnz,
+        int64 ptr[rows+1], int32 col[nnz], f64 val[nnz]
+      erase / tiebreak / runner-meta tail: identical to save_weights.
+    """
+    import numpy as np
+
+    def csr_bytes(t: torch.Tensor) -> bytes:
+        a = t.detach().contiguous().cpu().to(torch.float64).numpy()
+        rows, cols = a.shape
+        flat = a.reshape(-1)
+        idx = np.flatnonzero(flat)
+        nnz = int(idx.size)
+        counts = np.bincount(idx // cols, minlength=rows)
+        ptr = np.zeros(rows + 1, dtype=np.int64)
+        np.cumsum(counts, out=ptr[1:])
+        out = struct.pack("<iiq", rows, cols, nnz)
+        out += ptr.tobytes()
+        if nnz:
+            out += (idx % cols).astype(np.int32).tobytes()
+            out += flat[idx].astype(np.float64).tobytes()
+        return out
+
+    n_layers = len(model.attn_layers)
+    parts = [b"L4SV", struct.pack("<i", 1),
+             struct.pack("<6i", len(all_tokens), model.d_model, n_layers,
+                         model.n_heads, model.d_ffn, model.stop_token_id)]
+    for t in all_tokens:
+        b = t.encode()
+        parts.append(struct.pack("<I", len(b)))
+        parts.append(b)
+    for li in range(n_layers):
+        attn = model.attn_layers[li]
+        if not hasattr(attn, "q_weight"):
+            raise ValueError("sparse format supports CompactAttention only")
+        for m in (attn.q_weight, attn.k_weight, attn.v_weight,
+                  attn.out_weight, model.ff_in[li].weight,
+                  model.ff_out[li].weight):
+            parts.append(csr_bytes(m))
+    parts.append(csr_bytes(model.head.weight))
+
+    has_erase = hasattr(model, "attn_erase") and len(model.attn_erase) > 0
+    tail = [struct.pack("<i", 1 if has_erase else 0)]
+    if has_erase:
+        for li in range(n_layers):
+            ae = model.attn_erase[li] if li < len(model.attn_erase) else []
+            tail.append(struct.pack("<i", len(ae)))
+            tail.extend(struct.pack("<i", s) for s in ae)
+            fe = model.ffn_erase[li] if li < len(model.ffn_erase) else []
+            tail.append(struct.pack("<i", len(fe)))
+            tail.extend(struct.pack("<i", s) for s in fe)
+    has_tiebreak = (hasattr(model, "head_tiebreak")
+                    and len(model.head_tiebreak) > 0)
+    tail.append(struct.pack("<i", 1 if has_tiebreak else 0))
+    if has_tiebreak:
+        H = model.n_heads
+        for li in range(n_layers):
+            tb = (model.head_tiebreak[li]
+                  if li < len(model.head_tiebreak) else [0] * H)
+            for h in range(H):
+                tail.append(struct.pack("<i", tb[h] if h < len(tb) else 0))
+    meta = getattr(model, "runner_meta", None)
+    tail.append(struct.pack("<i", 1 if meta is not None else 0))
+    if meta is not None:
+        field_items = sorted(meta["field_slots"].items())
+        tail.append(struct.pack("<i", len(field_items)))
+        for name, slot in field_items:
+            b = name.encode()
+            tail.append(struct.pack("<i", len(b)))
+            tail.append(b)
+            tail.append(struct.pack("<i", slot))
+        tail.append(struct.pack("<i", meta["one_slot"]))
+        out_items = sorted(meta["output_index"].items())
+        tail.append(struct.pack("<i", len(out_items)))
+        for name, idx in out_items:
+            b = name.encode()
+            tail.append(struct.pack("<i", len(b)))
+            tail.append(b)
+            tail.append(struct.pack("<i", idx))
+    parts.extend(tail)
+
+    with open(path, "wb") as f:
+        for p in parts:
+            f.write(p)
+    logger.info("Saved sparse weights to %s", path)
+
+
+def _smat_csr_bytes(m: "SparseMatrix") -> bytes:
+    """Serialize a SparseMatrix to the CSR blob used in the .sbin format.
+
+    Same encoding as ``csr_bytes``: rows/cols/nnz header, int64 ptr, int32
+    col, float64 val; within a row columns ascend (np.flatnonzero order).
+    """
+    import numpy as np
+
+    ptr = np.zeros(m.rows + 1, dtype=np.int64)
+    cols: List[int] = []
+    vals: List[float] = []
+    for i in range(m.rows):
+        row = m.row_data.get(i)
+        if row:
+            for j in sorted(row):
+                cols.append(j)
+                vals.append(row[j])
+        ptr[i + 1] = len(cols)
+    nnz = len(cols)
+    out = struct.pack("<iiq", m.rows, m.cols, nnz)
+    out += ptr.tobytes()
+    if nnz:
+        out += np.asarray(cols, dtype=np.int32).tobytes()
+        out += np.asarray(vals, dtype=np.float64).tobytes()
+    return out
+
+
+def save_sparse_native(model: "SparseLeanModel", all_tokens: List[str],
+                       path: str) -> int:
+    """Write a SparseLeanModel straight to an "L4SV" v2 .sbin (H1/H2).
+
+    Unlike ``save_weights_sparse`` (which CSR-ises dense tensors), this
+    serializes the analytic construction directly from the SparseMatrix
+    dicts — the dense grid is never allocated.  Returns the total nnz.
+
+    v2 adds a per-layer head-count array (int32 × n_layers) immediately
+    after the 6-int header; every layer's q/k/v are (2*H_li, D), out is
+    (D, 2*H_li).  v1 files stay readable by the engine (global H).
+    """
+    n_layers = model.n_layers
+    parts = [b"L4SV", struct.pack("<i", 2),
+             struct.pack("<6i", len(all_tokens), model.d_model, n_layers,
+                         model.n_heads, model.d_ffn, model.stop_token_id)]
+    for h in model.layer_heads:
+        parts.append(struct.pack("<i", int(h)))
+    for t in all_tokens:
+        b = t.encode()
+        parts.append(struct.pack("<I", len(b)))
+        parts.append(b)
+    for li in range(n_layers):
+        attn = model.attn_layers[li]
+        for m in (attn.q_weight, attn.k_weight, attn.v_weight,
+                  attn.out_weight, model.ff_in[li].weight,
+                  model.ff_out[li].weight):
+            parts.append(_smat_csr_bytes(m))
+    parts.append(_smat_csr_bytes(model.head.weight))
+
+    has_erase = hasattr(model, "attn_erase") and len(model.attn_erase) > 0
+    tail = [struct.pack("<i", 1 if has_erase else 0)]
+    if has_erase:
+        for li in range(n_layers):
+            ae = model.attn_erase[li] if li < len(model.attn_erase) else []
+            tail.append(struct.pack("<i", len(ae)))
+            tail.extend(struct.pack("<i", s) for s in ae)
+            fe = model.ffn_erase[li] if li < len(model.ffn_erase) else []
+            tail.append(struct.pack("<i", len(fe)))
+            tail.extend(struct.pack("<i", s) for s in fe)
+    has_tiebreak = (hasattr(model, "head_tiebreak")
+                    and len(model.head_tiebreak) > 0)
+    tail.append(struct.pack("<i", 1 if has_tiebreak else 0))
+    if has_tiebreak:
+        H = model.n_heads
+        for li in range(n_layers):
+            tb = (model.head_tiebreak[li]
+                  if li < len(model.head_tiebreak) else [0] * H)
+            for h in range(H):
+                tail.append(struct.pack("<i", tb[h] if h < len(tb) else 0))
+    meta = getattr(model, "runner_meta", None)
+    tail.append(struct.pack("<i", 1 if meta is not None else 0))
+    if meta is not None:
+        field_items = sorted(meta["field_slots"].items())
+        tail.append(struct.pack("<i", len(field_items)))
+        for name, slot in field_items:
+            b = name.encode()
+            tail.append(struct.pack("<i", len(b)))
+            tail.append(b)
+            tail.append(struct.pack("<i", slot))
+        tail.append(struct.pack("<i", meta["one_slot"]))
+        out_items = sorted(meta["output_index"].items())
+        tail.append(struct.pack("<i", len(out_items)))
+        for name, idx in out_items:
+            b = name.encode()
+            tail.append(struct.pack("<i", len(b)))
+            tail.append(b)
+            tail.append(struct.pack("<i", idx))
+    parts.extend(tail)
+
+    with open(path, "wb") as f:
+        for p in parts:
+            f.write(p)
+    logger.info("Saved sparse-native (v2) weights to %s (%d nnz)",
+                path, model.nnz())
+    return model.nnz()
 
 
 def load_weights(path: str) -> Tuple[LeanTransformer, List[str], Dict[str, int]]:

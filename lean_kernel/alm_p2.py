@@ -26,7 +26,10 @@ built-in dimension, so no extra multiplication is needed.
 """
 
 from __future__ import annotations
+import math
 from typing import Dict, Any, List, Sequence, Union
+
+import numpy as np
 
 from .alm_graph import (
     InputDimension, Expression, ProgramGraph, LookUp,
@@ -278,17 +281,178 @@ class IncrementalGraphEvaluator:
     driver appends tokens one micro-step at a time; re-evaluating the whole
     prefix each step is O(n^2). Tokens are append-only and each position's
     values depend only on the prefix, so earlier vals are final and only the
-    new positions need computing."""
+    new positions need computing.
+
+    Semantics are identical to ``_eval_position`` (same insert-then-query
+    protocol, same hardmax tie rule, same expression arithmetic); this
+    variant only makes the replay fast enough for large environments:
+
+    * the dimension walk is a precompiled per-graph plan of code-generated
+      lambdas reading a flat slot list (no isinstance dispatch, no dict
+      ``get`` per expression term);
+    * each lookup's (kx, ky) history is mirrored in NumPy, so the hardmax
+      scan is vectorized instead of a Python loop over all entries per
+      position (the quadratic hot spot on 1000+-token env prefixes).
+
+    Public contract preserved: ``.vals`` (per-position dicts, now carrying
+    the PersistDimension outputs the driver reads), ``.lookup_history``
+    (dict id -> list of (pos, kx, ky, values) tuples — the authoritative
+    history; tests snapshot/replace it to fork cases off a warm env prefix,
+    which is detected by list identity and mirrored by a rebuild), and
+    ``.sync(token_names) -> vals[-1]``.
+    """
 
     def __init__(self, graph: ProgramGraph):
         self.graph = graph
         self.lookup_history: Dict[int, list] = {
             lu.id: [] for lu in graph.all_lookups}
         self.vals: List[Dict[Any, float]] = []
+        self._plan = _get_eval_plan(graph)
+        # lu.id -> [kx_arr, ky_arr, hist_list, n_synced] NumPy mirror of
+        # each lookup's key history (values stay in the tuple list).
+        self._mir: Dict[int, list] = {}
 
     def sync(self, token_names: List[str]) -> Dict[Any, float]:
         """Compute/return the vals dict of the LAST position."""
         for pos in range(len(self.vals), len(token_names)):
-            self.vals.append(_eval_position(
-                self.graph, token_names[pos], pos, self.lookup_history))
+            self.vals.append(self._eval_pos(token_names[pos], pos))
         return self.vals[-1]
+
+    def _eval_pos(self, tok_name: str, pos: int) -> Dict[Any, float]:
+        g = self.graph
+        if tok_name not in g.input_tokens:
+            raise KeyError(f"Unknown input token: {tok_name}")
+        ops, nslots, builtins, persist_dims = self._plan
+        v = [0.0] * nslots
+        v[builtins[0]] = 1.0
+        v[builtins[1]] = float(pos)
+        v[builtins[2]] = 1.0 / math.log(2) - 1.0 / math.log(pos + 2)
+        v[builtins[3]] = float(pos * pos)
+        for d, c in g.input_tokens[tok_name].terms.items():
+            v[d.id] += c
+
+        hist_all = self.lookup_history
+        mir = self._mir
+        seen: Dict[int, list] = {}
+        for op in ops:
+            t = op[0]
+            if t == 0:                                    # ReGLU
+                b = op[3](v)
+                v[op[1]] = op[2](v) * (b if b > 0.0 else 0.0)
+            elif t == 1:                                  # Persist / CumSum
+                v[op[1]] = op[2](v)
+            else:                                         # LookUp
+                lid = op[2]
+                bv = seen.get(lid)
+                if bv is None:
+                    hist = hist_all[lid]
+                    kx = op[4](v)
+                    ky = op[5](v)
+                    now = [f(v) for f in op[8]]
+                    hist.append((pos, kx, ky, now))       # insert-then-query
+                    h = len(hist)
+                    m = mir.get(lid)
+                    if m is None or m[2] is not hist or m[3] > h:
+                        cap = max(64, 2 * h)
+                        kxa = np.empty(cap)
+                        kya = np.empty(cap)
+                        for i, e in enumerate(hist):
+                            kxa[i] = e[1]
+                            kya[i] = e[2]
+                        mir[lid] = m = [kxa, kya, hist, h]
+                    elif m[3] < h:
+                        kxa, kya = m[0], m[1]
+                        if kxa.size < h:
+                            cap = max(2 * kxa.size, h)
+                            kxa = np.concatenate((kxa, np.empty(cap - kxa.size)))
+                            kya = np.concatenate((kya, np.empty(cap - kya.size)))
+                            m[0] = kxa
+                            m[1] = kya
+                        for i in range(m[3], h):
+                            e = hist[i]
+                            kxa[i] = e[1]
+                            kya[i] = e[2]
+                        m[3] = h
+                    qx = op[6](v)
+                    qy = op[7](v)
+                    sc = qx * m[0][:h] + qy * m[1][:h]
+                    # hardmax; ties (|diff| <= 1e-9) go to the LATEST entry —
+                    # scores are float64-exact integer arithmetic here, so
+                    # "last >= max - 1e-9" reproduces the _eval_position scan.
+                    bv = hist[int(np.flatnonzero(
+                        sc >= sc.max() - 1e-9)[-1])][3]
+                    seen[lid] = bv
+                v[op[1]] = bv[op[3]]
+
+        out: Dict[Any, float] = {}
+        for d in persist_dims:
+            out[d] = v[d.id]
+        return out
+
+
+# ─── Per-graph evaluation plan (codegen, built once per graph) ─────────────
+
+def _alm_compile_expr(e: Expression, refmax: List[int]):
+    """Compile one Expression to a lambda v: float over a flat slot list.
+    Mirrors Expression.evaluate (the 'one' InputDimension is a constant)."""
+    const = 0.0
+    parts = []
+    for d, c in e.terms.items():
+        if d.id > refmax[0]:
+            refmax[0] = d.id
+        if isinstance(d, InputDimension) and d.name == "one":
+            const += c
+        else:
+            parts.append(f"({c!r})*v[{d.id}]")
+    src = "+".join(parts)
+    if const:
+        src = f"({const!r})+{src}" if src else f"({const!r})"
+    if not src:
+        return lambda v: 0.0
+    return eval(compile(f"lambda v: {src}", "<alm_p2 eval plan>", "eval"))
+
+
+def _get_eval_plan(graph: ProgramGraph):
+    plan = getattr(graph, "_alm_eval_plan", None)
+    if plan is not None:
+        return plan
+    refmax = [0]
+    ops = []
+    persist_dims = []
+    maxid = 0
+    for d in graph.all_dims:
+        if d.id > maxid:
+            maxid = d.id
+        if isinstance(d, ReGLUDimension):
+            ops.append((0, d.id,
+                        _alm_compile_expr(d.a_expr, refmax),
+                        _alm_compile_expr(d.b_expr, refmax)))
+        elif isinstance(d, PersistDimension):
+            persist_dims.append(d)
+            ops.append((1, d.id, _alm_compile_expr(d.expr, refmax)))
+        elif isinstance(d, CumSumDimension):
+            ops.append((1, d.id, _alm_compile_expr(d.value_expr, refmax)))
+        elif isinstance(d, LookUpDimension):
+            lu = d.lookup
+            k = lu.key_exprs_2d
+            q = lu.query_exprs_2d
+            ops.append((3, d.id, lu.id, d.value_index,
+                        _alm_compile_expr(k[0], refmax),
+                        _alm_compile_expr(k[1], refmax),
+                        _alm_compile_expr(q[0], refmax),
+                        _alm_compile_expr(q[1], refmax),
+                        tuple(_alm_compile_expr(vv, refmax)
+                              for vv in lu.value_exprs)))
+        # InputDimension / anything else: the original sets 0.0 or skips —
+        # a zero-initialized flat slot is exactly that.
+    nslots = max(maxid, refmax[0]) + 1
+    # token input embeddings also index by dim id
+    for e in graph.input_tokens.values():
+        for d in e.terms:
+            if d.id >= nslots:
+                nslots = d.id + 1
+    builtins = (_one_dim.id, _position_dim.id,
+                _inv_log_pos_dim.id, _position_sq_dim.id)
+    plan = (ops, nslots, builtins, persist_dims)
+    graph._alm_eval_plan = plan
+    return plan
