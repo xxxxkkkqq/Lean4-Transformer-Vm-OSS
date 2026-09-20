@@ -13,6 +13,7 @@ Oracle semantics probed on 4.33.1 (2026-08-30):
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +23,16 @@ from expr.model import (
     MData, Proj, LZero, LSucc, LMax, LIMax, LParam, LMVar,
 )
 
-LEAN = Path.home() / ".elan" / "bin" / "lean"
+# Oracle contract = the v4.33.1 binary: every differential expectation in the
+# repo was probed against it, and verdict identity is only claimed for it.
+# `elan default` drifted to 4.34.0 (2026-09-20), so resolve the pinned
+# toolchain explicitly; L4TVM_LEAN overrides for a future re-baseline, which
+# then needs its own differential re-run (docs/ORACLE.md).
+_LEAN_PINNED = (Path.home() / ".elan" / "toolchains"
+                / "leanprover--lean4---v4.33.1" / "bin" / "lean")
+LEAN = (Path(os.environ["L4TVM_LEAN"]) if os.environ.get("L4TVM_LEAN")
+        else (_LEAN_PINNED if _LEAN_PINNED.exists()
+              else Path.home() / ".elan" / "bin" / "lean"))
 
 ORACLE_TEMPLATE = """\
 import Lean

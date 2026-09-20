@@ -16,7 +16,7 @@ this corpus); an undocumented difference fails the test rather than passing
 silently.
 
 Part B (capacity, measured not asserted from theory). Representative real
-declarations from Lean core and, when reachable, /tmp/mlbench Mathlib are
+declarations from Lean core and, when reachable, /home/xkq/mathlib_src Mathlib are
 dumped through the real binary and measured for
   * constants in the transitive dependency closure (cid / nid fields are
     capped at 4095, VM_SPEC §2); and
@@ -341,10 +341,10 @@ def _part_b(fails: list[str]) -> int:
               "VM_CAPACITY_MATHLIB=1 to measure; see docs/ORACLE.md §5 for "
               "the recorded numbers.")
         return n_checks
-    if not Path("/tmp/mlbench").is_dir():
-        print("  [/tmp/mlbench] not present: Mathlib capacity skipped")
+    if not Path("/home/xkq/mathlib_src").is_dir():
+        print("  [/home/xkq/mathlib_src] not present: Mathlib capacity skipped")
         return n_checks
-    ml_cmd, ml_cwd = ["lake", "env", "lean"], "/tmp/mlbench"
+    ml_cmd, ml_cwd = ["lake", "env", "lean"], "/home/xkq/mathlib_src"
 
     med = measure(ML_MED_DEFS, ML_MED_ROOTS, "mathlib-medium",
                   lean_cmd=ml_cmd, cwd=ml_cwd,

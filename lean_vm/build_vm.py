@@ -5493,7 +5493,13 @@ def build_step_graph():
     fr1_F2 = _select(ck_g1_val, Expression({_one_dim: CK_TY}), fr1_F2)
     fr2_task = _select(ck_g1_val, Expression({_one_dim: TASK_INFER}), fr2_task)
     fr2_V2 = _select(ck_g1_val, c1, fr2_V2)
-    fr2_E2 = _select(ck_g1_val, One, fr2_E2)          # hard infer flag (E2=1)
+    # card 010 G03: the body check of an unsafe add_definition runs on the
+    # NEW environment with the unsafe-mode checker (K/environment.cpp:
+    # 172-177), so the launched body INFER carries the anchor's mode bit
+    # (G06's E2 layout) and the G10 gate stays silent for self-references.
+    # g3_mode decodes the E2 payload copied forward by the G02 select above.
+    fr2_E2 = _select(ck_g1_val, One + reglu(g3_mode, One * CHECK_E2_STRIDE),
+                     fr2_E2)                          # hard infer flag (E2=1)
     A_c = _select(ck_g1_val, frX, A_c)                # value root focus
     B_c = _select(ck_g1_val + ax_go + ax_done, Zero, B_c)
     C_c = _select(ck_g1_val + ax_go + ax_done, Zero, C_c)
@@ -5511,11 +5517,18 @@ def build_step_graph():
     # card 010 G02: E2 rides along (anchor kind payload → ST → CK_G1's arm);
     # with the legacy kinds=None driver call the anchor E2 is 0, so the
     # payload is what it always was.
+    # card 010 G03: the HEADER check of an unsafe add_definition also runs
+    # the unsafe-mode checker (K/environment.cpp:165-169), so the launched
+    # header INFER carries the anchor's mode bit in its E2 high slot.  The
+    # mode only ever rides phase-1 values (1 → 1+8), so the INFER dispatch's
+    # phase-2 compare is unaffected; kinds=None keeps every E2 at 0/1.
+    ck_mode_k = _geq_expr(frE2, Expression({_one_dim: CHECK_E2_STRIDE}))
     fr1_task_k, fr1_V1_k, fr1_V2_k, fr1_X_k, fr1_E2_k, fr1_F2_k = \
         Expression({_one_dim: TASK_ST}), frV1, frV2, frX, frE2, \
         Expression({_one_dim: CK_G0})
     fr2_task_k, fr2_V1_k, fr2_V2_k, fr2_X_k, fr2_E2_k, fr2_F2_k = \
-        Expression({_one_dim: TASK_INFER}), Zero, c1, Zero, One, Zero
+        Expression({_one_dim: TASK_INFER}), Zero, c1, Zero, \
+        One + reglu(ck_mode_k, One * CHECK_E2_STRIDE), Zero
     A_k, B_k, C_k, D_k, E_k, F_k = frV1, Zero, Zero, c2, Zero, Zero
 
     # ── INFER frame dispatch (task=6; focus = (A,B), phase in E2) ───────────
@@ -5542,6 +5555,17 @@ def build_step_graph():
     em_raw_i = Zero
     raw_K_i, raw_V0_i = Zero, Zero
     rej_i, rej_code_i = Zero, Zero
+    # card 010 G03: checker-mode carrier on TASK_INFER frames (the §2.8 mode
+    # bit anchored on the TASK_CHECK frame's E2).  The G10 unsafe/partial-use
+    # throw (K/type_checker.cpp:110-117) must be silent while an UNSAFE
+    # checker walks (the unsafe add_definition header/body checks,
+    # K/environment.cpp:165-177), so the mode rides the E2 high slot of every
+    # infer frame launched from a mode=1 CHECK anchor and is decoded here.
+    # The mode only ever rides phase-1 values (1 → 1+8), so the phase-2
+    # compare below is untouched; with the legacy kinds=None driver call
+    # every E2 stays 0/1/2 and inf_mode is 0.
+    inf_mode = reglu(is_infer_frame,
+                     _geq_expr(frE2, Expression({_one_dim: CHECK_E2_STRIDE})))
     # P_EMIT phase gate is mode-gated: frE2 on non-INFER frames (e.g. the
     # lit-compare ST's digit counter) collides with phase 2
     ph_emit = reglu(is_infer_frame, _eq_expr(frE2, One * 2))
@@ -5583,7 +5607,10 @@ def build_step_graph():
     fr2_task_i = _select(peel_end, Expression({_one_dim: TASK_INFER}),
                          fr2_task_i)
     fr2_V2_i = _select(peel_end, c2, fr2_V2_i)
-    fr2_E2_i = _select(peel_end, One, fr2_E2_i)      # INFER phase 1
+    # card 010 G03: the FN infer inherits the mode bit (the spine head — an
+    # unsafe self-reference — is inferred here).
+    fr2_E2_i = _select(peel_end, One + reglu(inf_mode, One * CHECK_E2_STRIDE),
+                       fr2_E2_i)     # INFER phase 1
     fr2_F2_i = _select(peel_end, frF2, fr2_F2_i)     # inherit soft-infer flag
     D_i = _select(peel_end, c3, D_i)
     # LAM: infer the domain (ST keeps lam dom/env/body for T_PI_CLO)
@@ -5594,7 +5621,10 @@ def build_step_graph():
     fr1_F2_i = _select(lam_i, Expression({_one_dim: I_LAMDOM}), fr1_F2_i)
     fr2_task_i = _select(lam_i, Expression({_one_dim: TASK_INFER}), fr2_task_i)
     fr2_V2_i = _select(lam_i, c1, fr2_V2_i)
-    fr2_E2_i = _select(lam_i, One, fr2_E2_i)
+    # card 010 G03: the lam-DOMAIN infer inherits the mode bit
+    # (K/environment.cpp:165-169 header / :172-177 body unsafe checker).
+    fr2_E2_i = _select(lam_i, One + reglu(inf_mode, One * CHECK_E2_STRIDE),
+                       fr2_E2_i)
     fr2_F2_i = _select(lam_i, frF2, fr2_F2_i)        # inherit soft-infer flag
     A_i = _select(lam_i, fV0, A_i)                   # domain
     D_i = _select(lam_i, c2, D_i)
@@ -5606,7 +5636,9 @@ def build_step_graph():
     fr1_F2_i = _select(pi_i, Expression({_one_dim: I_PIDOM}), fr1_F2_i)
     fr2_task_i = _select(pi_i, Expression({_one_dim: TASK_INFER}), fr2_task_i)
     fr2_V2_i = _select(pi_i, c1, fr2_V2_i)
-    fr2_E2_i = _select(pi_i, One, fr2_E2_i)
+    # card 010 G03: the pi-DOMAIN infer inherits the mode bit.
+    fr2_E2_i = _select(pi_i, One + reglu(inf_mode, One * CHECK_E2_STRIDE),
+                       fr2_E2_i)
     fr2_F2_i = _select(pi_i, frF2, fr2_F2_i)         # inherit soft-infer flag
     A_i = _select(pi_i, fV0, A_i)
     D_i = _select(pi_i, c2, D_i)
@@ -5618,7 +5650,9 @@ def build_step_graph():
     fr1_F2_i = _select(let_i, Expression({_one_dim: I_LETV}), fr1_F2_i)
     fr2_task_i = _select(let_i, Expression({_one_dim: TASK_INFER}), fr2_task_i)
     fr2_V2_i = _select(let_i, c1, fr2_V2_i)
-    fr2_E2_i = _select(let_i, One, fr2_E2_i)
+    # card 010 G03: the let-VALUE infer inherits the mode bit.
+    fr2_E2_i = _select(let_i, One + reglu(inf_mode, One * CHECK_E2_STRIDE),
+                       fr2_E2_i)
     fr2_F2_i = _select(let_i, frF2, fr2_F2_i)        # inherit soft-infer flag
     A_i = _select(let_i, fV1, A_i)                   # value
     D_i = _select(let_i, c2, D_i)
@@ -5643,8 +5677,20 @@ def build_step_graph():
     # the kernel (unfoldDefinition at K/type_checker.cpp:555+ never calls
     # infer_constant), so the DEFEQ arms are untouched.
     anc_f2 = fetch_by_position([f2_], _anc(fV0))[0]
-    safety_i = reglu(const_i, _geq_expr(anc_f2, One))
-    const_i = reglu(const_i, One - _geq_expr(anc_f2, One))
+    # card 010 G03: the throw is the CHECKER's, not the constant's — a
+    # safe-mode checker rejects the reference (K/type_checker.cpp:110-117,
+    # m_definition_safety != unsafe), while the unsafe-mode checkers that
+    # walk an unsafe add_definition's header and body (K/environment.cpp
+    # :167/:173, definition_safety::unsafe) must not.  inf_mode decodes the
+    # mode bit the CHECK anchor's E2 payload brought down onto the infer
+    # frames; inf_mode=0 reduces ck7_gate to the old conjunction
+    # value-for-value (legacy kinds=None streams: every E2 is 0 → gate
+    # unchanged).  The DEMOTION below shares the gate: without it a
+    # suppressed const would neither throw nor infer and fall through to
+    # the WHNF delta arm, whose self-referential value loops forever.
+    ck7_gate = reglu(One - inf_mode, _geq_expr(anc_f2, One))
+    safety_i = reglu(const_i, ck7_gate)
+    const_i = reglu(const_i, One - ck7_gate)
     A_i = _select(const_i, _select(_geq_expr(fE2, One), fE2, eV1), A_i)
     B_i = _select(const_i, Zero, B_i)
     E_i = _select(const_i, One, E_i)
@@ -5709,7 +5755,9 @@ def build_step_graph():
     fr2_task_i = _select(proj_i, Expression({_one_dim: TASK_INFER}),
                          fr2_task_i)
     fr2_V2_i = _select(proj_i, c1, fr2_V2_i)
-    fr2_E2_i = _select(proj_i, One, fr2_E2_i)
+    # card 010 G03: the proj-child infer inherits the mode bit.
+    fr2_E2_i = _select(proj_i, One + reglu(inf_mode, One * CHECK_E2_STRIDE),
+                       fr2_E2_i)
     fr2_F2_i = _select(proj_i, frF2, fr2_F2_i)       # inherit soft-infer flag
     A_i = _select(proj_i, fX, A_i)                  # child
     D_i = _select(proj_i, c2, D_i)

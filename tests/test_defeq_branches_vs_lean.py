@@ -42,9 +42,8 @@ from expr.model import (App, Const, FVar, Lam, LitNat, MVar, BVar,
 from expr.tokens import Encoder
 from lean_vm.build_vm import build_step_graph
 from lean_vm.step_driver import StepDriver, VMError
+from reference.lean_ref import LEAN
 from reference.toy_env import TOY_CONSTS, TOY_CTORS, TOY_LEAN_DEFS, NAT, _pi_nat_nat
-
-LEAN = os.path.expanduser("~/.elan/bin/lean")
 
 N = LitNat
 

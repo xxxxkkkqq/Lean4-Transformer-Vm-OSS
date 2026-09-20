@@ -65,6 +65,16 @@ if [ -z "$PY" ]; then
     echo "FATAL: cannot resolve python '${PYTHON:-python3}' on PATH" >&2
     exit 2
 fi
+# Oracle pin (2026-09-20): elan default drifted to 4.34.0 while the verdict
+# contract is 4.33.1 (AGENTS acceptance rule 1 evidence base). Suites resolve
+# the oracle through reference/lean_ref.py, which honours L4TVM_LEAN.
+L4TVM_LEAN="${L4TVM_LEAN:-$HOME/.elan/toolchains/leanprover--lean4---v4.33.1/bin/lean}"
+export L4TVM_LEAN
+if [ ! -x "$L4TVM_LEAN" ]; then
+    echo "FATAL: pinned lean not executable: $L4TVM_LEAN" >&2
+    exit 2
+fi
+"$L4TVM_LEAN" --version
 THREADS="${OMP_NUM_THREADS:-3}"
 export OMP_NUM_THREADS="$THREADS" MKL_NUM_THREADS="$THREADS"
 LOG_DIR="${REGRESSION_LOG_DIR:-$HOME/logs/lean4vm_cpu_regression}"
@@ -117,6 +127,13 @@ SUITES=(
     # whnf 721s; m5_cache_all.log).  Timeout 1800->2700 (26% margin), RSS
     # 5000->6000 (d6 P1-only arm peak 4737 + oracle children).
     "2700|6000|defeq_cache_vs_lean|tests/test_defeq_cache_vs_lean.py"
+    # card 010 G02 (added at acceptance, 2026-09-20): decl-injection
+    # differential (a0 drift guard + carrier idleness + kind/level arms vs
+    # live #KDECL oracle). Full set measured 1395.6s (G02) -> 1492.8s (G06)
+    # -> 1755.4s / 1981MB (G03, g03_reg): the suite grows one section per
+    # beat, so the timeout was raised 2100->2700 at G03 acceptance to keep
+    # >1.5x margin; re-measure at every section addition.
+    "2700|4000|decl_injection_vs_lean|tests/test_decl_injection_vs_lean.py"
     "1200|0|engine_vs_refvm|scripts/verify_engine_vs_refvm.py"
 )
 

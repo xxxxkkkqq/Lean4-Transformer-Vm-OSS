@@ -32,6 +32,3 @@ tests/_engine_tmp/
 .claude/last-session.txt
 .claude/handoff-snapshot.md
 
-# confidential cold-start kickoff doc (roadmap + state) — never public;
-# lives at repo root, so also add to the /tmp/l4tvm-public build exclusion
-NEXT_PROMPT.md

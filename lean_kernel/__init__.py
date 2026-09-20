@@ -8,5 +8,5 @@ This package provides:
     exact-arithmetic graph interpreter (correctness reference only)
 
 There is NO Python port of the Lean 4 kernel here. The correctness oracle is
-the real Lean 4 binary; see docs/DESIGN.md and docs/PLAN.md.
+the real Lean 4 binary; see docs/DESIGN.md and ARCHITECTURE.md.
 """

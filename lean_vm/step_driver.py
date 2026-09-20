@@ -21,8 +21,10 @@ from lean_kernel.alm_p2 import IncrementalGraphEvaluator
 from expr.tokens import (
     StreamBundle, T_PEND, T_LINK, T_STATE, T_FRAME, T_LIT_DIG, K_LIT,
     K_CONST, LIT_NAT, T_REJECT, T_HALT, TASK_INFER, TASK_DEFEQ, TASK_CHECK,
+    Encoder,
+    CK_AXIOM, CK_DEFINITION, CK_THEOREM, CK_OPAQUE,
 )
-from lean_vm.ref_vm import VMError
+from lean_vm.ref_vm import VMError, ERR_MISSING_CONST
 
 # ── card 010 G02: declaration-kind carrier on the TASK_CHECK anchor frame ────
 # The kernel dispatches `add_theorem` / `add_axiom` / `add_definition` /
@@ -61,6 +63,13 @@ def check_e2(kind_code: int, mode_code: int = CHECK_MODE_SAFE) -> int:
             f"check mode code {mode_code} not in "
             f"{(CHECK_MODE_SAFE, CHECK_MODE_UNSAFE)}")
     return kind_code + CHECK_E2_STRIDE * mode_code
+
+
+# Card 010 G6: driver-side bookkeeping reject code (VM_SPEC §16.5).  The graph
+# has no name space and no block concept, so mutual-block well-formedness
+# (K/environment.cpp:228-248, plain kernel_exception → .other messages) never
+# enters the graph: InjectionEnv raises before any graph pass.
+ERR_MUTUAL_WF = 9
 
 
 class StepDriver:
@@ -206,6 +215,36 @@ class StepDriver:
         self.init_state(term_pos)
         return self._run_loop(max_steps)
 
+    def run_whnf(self, term_pos: int, max_steps: int = 2000,
+                 max_rounds: int = 16) -> tuple[int, int]:
+        """Card 010 G04 (ADR016-B): caller-side whnf-to-head-normal loop.
+
+        The graph's TASK_WHNF delivers a raw field at a proj (the P7.5c-2
+        contract, VM_SPEC §11.16), while the kernel's whnf_core feeds a
+        successful proj reduction back into whnf_core
+        (K/type_checker.cpp:504-508) — its whnf of `t.fst` is the field
+        value reduced on.  Plan B keeps the graph contract frozen and moves
+        that loop to the caller: re-launch TASK_WHNF on the delivered
+        closure until the focus stops advancing (pos AND env both
+        unchanged).
+
+        No Python semantics: every round is one graph task (the same
+        init_state/_run_loop primitives run() uses); this method only
+        iterates and judges termination.  Budget discipline per ADR016-B:
+        a non-advancing focus is the ONLY stop condition (open/stuck terms
+        settle instead of spinning); exhausting max_rounds raises
+        TimeoutError — the same type _run_loop raises for the per-round
+        budget."""
+        pos, env = term_pos, 0
+        for _ in range(max_rounds):
+            self.init_state(pos, env)
+            new_pos, new_env = self._run_loop(max_steps)
+            if (new_pos, new_env) == (pos, env):
+                return new_pos, new_env
+            pos, env = new_pos, new_env
+        raise TimeoutError(
+            f"run_whnf: focus still advancing after {max_rounds} rounds")
+
     def run_infer(self, term_pos: int, env: int = 0,
                   max_steps: int = 10000) -> tuple[int, int]:
         """Run a T_INFER task. Returns the type closure (pos, env)."""
@@ -222,7 +261,7 @@ class StepDriver:
         return self._run_loop(max_steps)
 
     def run_check(self, decls, max_steps: int = 50000,
-                  kinds=None) -> tuple[int, int]:
+                  kinds=None, check_mode: int = CHECK_MODE_SAFE) -> tuple[int, int]:
         """Run the M4.2 CHECK driver loop. decls: list of (type_root,
         val_root) stream positions. CHECK anchor frames (V0=TASK_CHECK,
         V1=declared type, X=value, V2=next anchor) are pushed in reverse so
@@ -235,13 +274,25 @@ class StepDriver:
         anchor's E2 slot, so the graph can apply the theorem-only `is_prop`
         check (K/environment.cpp:200-202).  `kinds=None` leaves every E2 at 0
         = `CHECK_KIND_UNSPECIFIED`, which keeps the legacy behaviour
-        byte-for-byte (all kind gates inert)."""
+        byte-for-byte (all kind gates inert).
+
+        check_mode (card 010 G6): checker-mode code encoded into the same E2
+        slot as kind_code + CHECK_E2_STRIDE * mode_code (§2.8 layout).  The
+        graph decodes the kind mode-independently (add_theorem always uses a
+        SAFE checker, K/environment.cpp:196); the mode arm — unsafe checker
+        for unsafe add_definition bodies and mutual blocks, K/environment.cpp
+        :167-172/:236/:260 — is card 010 G03 and until then no gate consumes
+        the bit, so this is faithful data with no behavioural effect."""
         if not decls:
             raise ValueError("run_check: empty declaration list")
         if kinds is None:
+            if check_mode != CHECK_MODE_SAFE:
+                raise ValueError(
+                    "run_check: check_mode requires kinds (the kinds=None "
+                    "legacy path must keep every E2 at 0)")
             e2s = [check_e2(CHECK_KIND_UNSPECIFIED)] * len(decls)
         else:
-            e2s = [check_e2(k) for k in kinds]
+            e2s = [check_e2(k, check_mode) for k in kinds]
             if len(e2s) != len(decls):
                 raise ValueError(
                     f"run_check: {len(decls)} declarations but {len(e2s)} kinds")
@@ -251,4 +302,221 @@ class StepDriver:
                                X=v_root, E2=e2)
         self.init_state(decls[0][1], 0, 0, D=nxt)
         return self._run_loop(max_steps)
+
+
+class InjectionEnv:
+    """Card 010 G6: driver-side mirror of the kernel add_* declaration family
+    (K/environment.cpp:271-284 dispatch).
+
+    Division of labour: the graph judges single declarations (one TASK_CHECK
+    anchor chain per pass).  Everything the kernel decides from environment
+    *bookkeeping* — name presence, mutual-block well-formedness — has no
+    graph counterpart (no name space, no block concept), so it lives here as
+    data over the consts/ctors tables and rejects with
+    VMError(ERR_MUTUAL_WF) BEFORE any graph pass; type checking is delegated
+    to StepDriver.run_check against the grown environment.  Reference of an
+    unregistered name surfaces as VMError(ERR_MISSING_CONST) at encode time,
+    mirroring env.get's unknown_constant_exception (K/environment.cpp:78-85).
+
+    consts/ctors use the test-harness shapes: consts is a list of
+    (name, type tree, value tree | None), ctors a name collection.
+    graph_builder is injected (callable → (graph, outputs)) — this module
+    does not import build_vm.  Registration is per-constant bookkeeping only:
+    the graph never sees declaration names, and re-adding an existing name
+    (kernel alreadyDeclared, K/environment.cpp:102-105) is G8, card 011.
+
+    Per-branch phasing mirrors the kernel exactly:
+      add_axiom    check_constant_val only (env.cpp:152-158) — the anchor
+                   X=0 no-value shape (G5 convention).
+      add_definition(safe)   check old env → register (:179-188).
+      add_definition(unsafe) header check → register → body check
+                   (:163-178): the self-reference is visible to the body
+                   check because registration precedes it.
+      add_theorem  check (incl. is_prop → the graph's code 8) old env →
+                   register (:192-209); the checker is always SAFE here
+                   (:196), so check_mode stays 0.
+      add_opaque   check old env → register (:211-223).
+      add_mutual   header loop on the OLD env (:236-251, incl.
+                   check_constant_val's checker.check(type) :127-132) →
+                   register ALL members (:253-257) → body loop on the NEW
+                   env (:259-267); any failure rolls the whole block back
+                   (measured 2026-09-20, handoff 006 G06 P2: the caller's
+                   environment is unchanged, the exception payload carries
+                   the would-be env).
+    """
+
+    def __init__(self, consts, ctors, graph_builder):
+        self._consts = list(consts)
+        self._ctors = ctors
+        self._graph_builder = graph_builder
+        self._names: Dict[str, int] = {
+            n: cid for cid, (n, _t, _v) in enumerate(self._consts)}
+        # card 010 G03: per-cid ConstantInfo metadata (ENV_FORMAT §2.3/§2.4)
+        # for the injected declarations, handed to the Encoder so the G10
+        # use_reject bit (anchor F2, K/type_checker.cpp:110-117) reaches the
+        # graph.  Base-environment constants carry no metadata — their
+        # anchors stay all-zero (F2=0, the gate is inert) exactly as in the
+        # G02/G06 corpora.
+        self._meta: Dict[int, dict] = {}
+        self.steps_last = 0   # micro-steps of the most recent graph pass
+
+    # ── registration bookkeeping ──────────────────────────────────────────
+    def contains(self, name: str) -> bool:
+        """Registration probe (kernel env.find, K/environment.cpp:74-76)."""
+        return name in self._names
+
+    def _append_entry(self, name, ty, val, meta=None) -> tuple[int, tuple]:
+        cid = len(self._consts)
+        prev = self._names.get(name)
+        self._consts.append((name, ty, val))
+        self._names[name] = cid
+        if meta is not None:
+            self._meta[cid] = meta
+        return cid, (name, prev)
+
+    def _rollback(self, mark: int, appended) -> None:
+        """Undo every append made after `mark` (kernel rollback = the failed
+        add's environment object is simply not adopted).  `appended` carries
+        each name's previous _names binding so a shadowed base entry is
+        restored, not erased.  Metadata is cid-keyed, so dropping every
+        entry at or above the mark undoes it exactly."""
+        del self._consts[mark:]
+        for cid in [c for c in self._meta if c >= mark]:
+            del self._meta[cid]
+        for n, prev in appended:
+            if prev is None:
+                self._names.pop(n, None)
+            else:
+                self._names[n] = prev
+
+    # ── graph passes ──────────────────────────────────────────────────────
+    def _check(self, items, kinds, check_mode) -> int:
+        """One graph pass over the CURRENT environment.  items:
+        [(type tree, value tree | None)] (None = anchor X=0, the G5 no-value
+        shape).  Returns the micro-step count; raises VMError on reject."""
+        build = self._graph_builder
+        graph, outputs = build()
+        # card 010 G03: the injected declarations' ConstantInfo metadata
+        # (kind/safety) reaches the encoder, which precomputes the anchor
+        # F2 use_reject bit (expr/tokens.py:569-580, ENV_FORMAT §2.3) — the
+        # data the graph's G10 gate and its new mode arm key on.
+        const_meta = dict(self._meta)
+        enc = Encoder(self._consts, is_ctor=self._ctors,
+                      const_meta=const_meta or None)
+        decls = []
+        try:
+            for t, v in items:
+                decls.append((enc.encode_term(t),
+                              enc.encode_term(v) if v is not None else 0))
+        except KeyError as ex:
+            raise VMError(ERR_MISSING_CONST,
+                          f"unknown constant {ex.args[0]!r}") from ex
+        drv = StepDriver(enc.b, graph, outputs)
+        try:
+            drv.run_check(decls, kinds=kinds, check_mode=check_mode)
+        finally:
+            self.steps_last = drv.steps
+        return drv.steps
+
+    # ── the add_* family (K/environment.cpp:271-284) ──────────────────────
+    def add_axiom(self, name, type_tree) -> int:
+        self._check([(type_tree, None)], [CHECK_KIND_AXIOM], CHECK_MODE_SAFE)
+        return self._append_entry(
+            name, type_tree, None, {"kind": CK_AXIOM, "safety": 1})[0]
+
+    def add_definition(self, name, type_tree, value_tree,
+                       is_unsafe=False) -> int:
+        meta = {"kind": CK_DEFINITION,
+                "safety": 0 if is_unsafe else 1}
+        if is_unsafe:
+            # header on the old env (unsafe checker), register, body on the
+            # new env; failed body rolls the registration back
+            self._check([(type_tree, None)], [CHECK_KIND_DEFINITION],
+                        CHECK_MODE_UNSAFE)
+            cid, ap = self._append_entry(name, type_tree, value_tree, meta)
+            try:
+                self._check([(type_tree, value_tree)],
+                            [CHECK_KIND_DEFINITION], CHECK_MODE_UNSAFE)
+            except VMError:
+                self._rollback(cid, [ap])
+                raise
+            return cid
+        self._check([(type_tree, value_tree)], [CHECK_KIND_DEFINITION],
+                    CHECK_MODE_SAFE)
+        return self._append_entry(name, type_tree, value_tree, meta)[0]
+
+    def add_theorem(self, name, type_tree, value_tree) -> int:
+        self._check([(type_tree, value_tree)], [CHECK_KIND_THEOREM],
+                    CHECK_MODE_SAFE)
+        return self._append_entry(
+            name, type_tree, value_tree,
+            {"kind": CK_THEOREM, "safety": 1})[0]
+
+    def add_opaque(self, name, type_tree, value_tree) -> int:
+        self._check([(type_tree, value_tree)], [CHECK_KIND_OPAQUE],
+                    CHECK_MODE_SAFE)
+        return self._append_entry(
+            name, type_tree, value_tree,
+            {"kind": CK_OPAQUE, "safety": 1})[0]
+
+    def add_mutual(self, members) -> list:
+        """members: [(name, lparams, type tree, value tree, safety)] with
+        safety in the ENV_FORMAT §2.4 encoding 0=unsafe / 1=safe / 2=partial;
+        the block's checker mode is the HEAD member's safety (env.cpp:230).
+        lparams are carried for the same-lparams bookkeeping only (per-decl
+        dup-univ-params and level polymorphism = G9, card 011).
+
+        Known approximations (VM_SPEC §16.5/§16.6): partial blocks run the
+        graph passes with the unsafe mode bit (the §2.8 layout has no partial
+        value); the kernel interleaves per-member bookkeeping with header
+        checks while this implementation books every member first, then
+        headers — observable only on multi-defect blocks.  Since card 010
+        G03 the members' safety reaches the encoder as const_meta (anchor
+        F2 use_reject), and the block's unsafe mode bit suppresses the G10
+        gate for the block's own header/body passes; the mode bit does not
+        survive across ST-continuation hops (I_PI/I_LAMSORT/I_LETD —
+        VM_SPEC §16.6 known gap)."""
+        if not members:
+            raise VMError(ERR_MUTUAL_WF, "invalid empty mutual definition")
+        safety = members[0][4]
+        if safety == 1:
+            raise VMError(ERR_MUTUAL_WF, "invalid mutual definition, "
+                          "declaration is not tagged as unsafe/partial")
+        mode = CHECK_MODE_UNSAFE          # block checker: unsafe or partial
+        head_lparams = members[0][1]
+        found = set()
+        for name, lparams, _t, _v, s in members:
+            if s != safety:
+                raise VMError(ERR_MUTUAL_WF, "invalid mutual definition, "
+                              "declarations must have the same safety "
+                              "annotation")
+            if list(lparams) != list(head_lparams):
+                raise VMError(ERR_MUTUAL_WF, "invalid mutual definition, "
+                              "declarations must have the same universe "
+                              "level parameters")
+            if name in found:
+                raise VMError(ERR_MUTUAL_WF, "invalid mutual definition, "
+                              "duplicate declaration name '" + name + "'")
+            found.add(name)
+        # header pass — old environment; the kernel checks every member's
+        # header BEFORE registering anything (:236-251 precede :253-257)
+        n = len(members)
+        self._check([(t, None) for _nm, _lp, t, _v, _s in members],
+                    [CHECK_KIND_DEFINITION] * n, mode)
+        # register all members, then the body pass on the new environment
+        mark = len(self._consts)
+        appended = []
+        cids = []
+        for name, _lp, t, v, _s in members:
+            cid, ap = self._append_entry(
+                name, t, v, {"kind": CK_DEFINITION, "safety": _s})
+            cids.append(cid)
+            appended.append(ap)
+        try:
+            self._check([(t, v) for _nm, _lp, t, v, _s in members],
+                        [CHECK_KIND_DEFINITION] * n, mode)
+        except VMError:
+            self._rollback(mark, appended)
+            raise
+        return cids
 

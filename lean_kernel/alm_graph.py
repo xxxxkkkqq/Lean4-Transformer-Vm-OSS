@@ -9,7 +9,7 @@ Five primitives compose into a DAG that encodes a deterministic computation:
 
 The DSL follows the same approach as transformer-vm (Percepta-Core), which
 encodes a WASM VM into transformer weights. Here it is used to encode the
-Lean 4 kernel VM (see docs/DESIGN.md and docs/PLAN.md).
+Lean 4 kernel VM (see docs/DESIGN.md and ARCHITECTURE.md.
 
 Evaluation paths:
   - eval_graph_sequence (lean_kernel/alm_p2.py): exact-arithmetic graph

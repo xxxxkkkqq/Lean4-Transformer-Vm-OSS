@@ -1,0 +1,29 @@
+{
+  "autoCompactWindow": 200000,
+  "hooks": {
+    "PreCompact": [
+      {
+        "matcher": "auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/handoff.sh",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/inject-handoff.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
