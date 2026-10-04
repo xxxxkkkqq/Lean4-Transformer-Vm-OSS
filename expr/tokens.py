@@ -626,6 +626,17 @@ class Encoder:
             b.stream[p] = (t[0], t[1], t[2], t[3], nxt, t[5], t[6])
         return poss[0] if poss else 0
 
+    def emit_univparams(self, names) -> int:
+        """Card 011 G9: emit a scratch universe-parameter name chain (the
+        same T_ENV_LIST role=2 shape the per-cid T_ENV_UNIVPARAMS chain uses,
+        VM_SPEC §12.1) and return its head position (0 for an empty list).
+        A CHECK anchor's F2 slot carries this head so the graph's duplicate-
+        param scan (K/environment.cpp:111-121) can walk it; the chain cells
+        are compared by V1 = interred nid, so same-name params hit and the
+        graph stays name-free (acceptance rule 3 — nids are stream data, the
+        name table is never exposed to the graph)."""
+        return self._emit_list(0, list(names), ENV_LIST_UNIVPARAMS)
+
     def _chain_append(self, head: int, pos: int) -> int:
         """Append ``pos`` to the end of an F2 meta chain whose head is
         ``head``; returns the (possibly new) head. The per-cid meta chain

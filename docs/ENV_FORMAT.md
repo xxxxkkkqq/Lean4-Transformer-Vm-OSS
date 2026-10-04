@@ -345,6 +345,15 @@ kind 判定**与 mode 无关**——`add_theorem` 恒用 safe checker
 
 取值越界（kind>4、mode>1、非 int）由 `check_e2()` 抛 `ValueError`，不静默写入。
 
+**卡 011 G9 扩展（2026-09-21/23）**：`TASK_CHECK` 锚帧的 **F2 槽**成为
+声明 univ 参数链的载体——F2 = `T_ENV_LIST(role=2)`（`ENV_LIST_UNIVPARAMS`，
+`expr/tokens.py:emit_univparams`）链头，链 cell 间以 V1 = interred nid
+比较（图不暴露名字表，验收铁律 3）；F2=0（legacy driver 写入）→ G9 臂
+惰性、旧路径逐字节不变。新拒绝码随卡 011 入 reject 链：**10 =
+duplicate universe level parameter**（图内臂，`K/environment.cpp:111-121`
+→ .other 类）、**11 = alreadyDeclared**（driver 簿记族不进图，`:102-105`
+→ 专用构造器类，与码 9=mutualWF 同族）。码表权威在 VM_SPEC §16.8。
+
 空闲性不是声明出来的，是实证的：`tests/test_decl_injection_vs_lean.py` 的
 `guard` 段在**整份 `test_check_e2e` 语料**上比较 `kinds=None` 与
 `kinds=[1]`（非零、且闸门不看的哨兵 kind）的判定/错误码/微步数，要求逐字相等；

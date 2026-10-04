@@ -2958,13 +2958,15 @@ add_opaque/add_mutual 家族，逐分支镜像 ：271-284 分发的各检查序�
   新节点取值与旧图相同。实证 = guard 段（整份 check_e2e 语料
   kinds=None vs 哨兵 kind，判定/码/微步逐字相等，本拍复跑）+ 三 canary
   判定与步数基线不变。
-- **已知缺口（XFAIL-KNOWN-GAPS 登记，XPASS 协议）**：mode 位跨 ST 续体
+- **已知缺口（卡 016 已清偿两条；2026-09-26 更新）**：mode 位跨 ST 续体
   交付不存活——自引用作为 **APP 参数**（I_FN→I_PI 跳）或 **lam/let
   body**（I_LAMDOM→I_LAMSORT / I_LETD 跳）到达时假拒 7（`g03g_arg_selfref`、
-  `g03h_lam_selfref`，4.33.1 实测 oracle OK / 图 7@11/25 步）；pi
-  codomain（I_PIL1 三跳链）与 DEFEQ 链 soft 发射（帧六槽全占）同理不
-  携带。假拒方向 = 保守侧（多拒），与 thm_imax 缺口（§16.4）同类。
-  行集构造不依赖这些形状；续体携带 mode 位 = 卡 011+ 若拆位再议。
+  `g03h_lam_selfref`，4.33.1 实测 oracle OK / 图 7@11/25 步）——**卡 016
+  3-甲 已修复并摘除登记**（见 §16.7.1 载体编码）。遗留近似（仍不携带
+  mode，保守侧）：pi codomain 链（I_PIS1→I_PIL1→I_PIS2→I_PIL2 与其
+  body infer 发射）与 DEFEQ 链 soft 发射（帧六槽全占、F2=s_env 为位置值，
+  步进编码不适用，若未来覆盖须为 DEFEQ 帧族另设计通道）。假拒方向 =
+  保守侧（多拒），与 thm_imax 缺口（§16.4）同类。
 - **差分行集**（`tests/test_decl_injection_vs_lean.py` G03 节，G02_ONLY=g03）：
   `g03a_selfref`（unsafe 自引用正例，两相 mode 抑制）、`g03b_later_ref` /
   `g03b2_unsafe_ref`（mode=0 抛 7 vs mode=1 放行的同语料孪生对——
@@ -3039,19 +3041,197 @@ raw-field 停止仍是稳定原语，**本拍图零改动、零重编译、零�
   8.9-11.9GB RSS（违反 6GB 纪律的裸跑），stage C 后 iv 族峰值 3.8GB
   （`/home/xkq/logs/010G/g04b_diag.log`）。交付模式每族一个子进程
   （G04_FAMILY 协议），任何时刻树上只有一个大 env 求值器。
-- **已知缺口（XFAIL-KNOWN-GAPS 登记，XPASS 协议）**：`g04iv_eG4IV2`。
-  IV 索引剥离步交付 `Nat.casesOn (Nat.add 0 1) …` 并 HALT——主前提
-  `Nat.add 0 1` 未 whnf，非 head-normal；核侧 `inductive.h:93` 对 caseOn
-  主前提先 whnf（oracle 4.33.1 现跑 = `LitNat(6)`）。driver 循环在此**无解**：
-  对 stuck 焦点重发 TASK_WHNF 幂等返回同一焦点（最小 env：raw 120 步
-  halt、round-1 re-whnf 34 步同焦点——`g04b_diag.log`）；probe7 全闭包
-  env 则 ≤2000 步不 halt。两态皆与 oracle 不一致，定性 = 图侧
-  I_CASE 主前提续推缺口（005 F7-01 "spine-root 交付（头未 delta）"家族），
-  与 proj raw-field 合同正交——修复需动 build_vm，越 G04 边界，归
-  卡 011+。登记不是掩盖：该行在语料里保持常跑，图修复日按 XPASS 规程摘除。
+- **已知缺口（卡 016 已清偿；2026-09-26 更新）**：`g04iv_eG4IV2`（IV 索引
+  剥离步交付 `Nat.casesOn (Nat.add 0 1) …` 并 HALT，主前提未 whnf，非
+  head-normal；核侧 `inductive.h:93` 对 caseOn 主前提先 whnf，oracle
+  4.33.1 现跑 = `LitNat(6)`）——**已修复并摘除登记**，死因两段：缺口 B =
+  iv 族 stage C 闭包不含 `Nat.pred`/`Nat.rec` → `rec_ids_ok` 门压 0（环境
+  纪律缺口，§16.7.2 条款 C-16.7.x-1 修复）；缺口 A = ctor 应用 major 的
+  交付分类面 literal-only（语义缺口，§16.7.2 修复）。005 F7-01
+  "spine-root 交付（头未 delta）"家族在本语料上的余量 = stuck major 的
+  delta 头形状差（图交付原 `Nat.casesOn` spine，核侧 delta 展开为
+  `Nat.rec` spine）——判定同为 stuck、语料行不触及，保持登记不在本卡。
 - **验收通道边界（申报）**：`run_whnf` 是 Python 驱动器出口语义，C++
   引擎与编译通道不经过它（§16.4/§16.6 同款边界）；引擎侧 whnf 顶层交付
   合同维持 P7.5c-2 现状。
+
+### 16.7.1 ST 续体 F2 的 checker-mode 载体编码（卡 016 拍 B 3-甲，2026-09-26）
+
+ST 帧六槽唯一值域余量在 F2（续体 id ≤ 70）：**`ST.F2 = cont_id +
+128*mode`（`MODE_STRIDE = 128`）**，mode = addDecl 的 checker safety 位
+（§16.6 的 E2 通道向 ST 链的延伸）。
+
+- **解码单点**（`build_vm.py:3207-3220` 续体门区）：`mode_st = is_st_frame ∧
+  frF2 ≥ 128`、`fid = frF2 − mode_st*128`，续体门改键
+  `gid(n) = (fid == n)`；`cg = gid ∧ cont_mode` 结构不变。is_st_frame 门
+  是合同审计（卡 016 执行段 B3）的硬约束：DEFEQ 帧 F2 = s_env 为位置值
+  （可 >128），非 ST 帧一律不得解码出 mode。
+- **写侧合同（B3 审计定谳）**："ST.F2 = 续体 id（+mode 高位）"——全部
+  ST 帧压帧点核查为零例外；INFER 帧 F2 = 软旗（0/1）、DEFEQ 帧 F2 =
+  s_env、CHECK 锚帧 F2 = g9 链/NAT 帧 F2 = pend 项链，各有专属语义，
+  均不进步进编码。
+- **mode 流**：锚 E2（kind+8*mode）→ kickoff/ck_g1_val 的 INFER 发射
+  （E2 = 1+8*mode，§16.6 ①②）→ INFER 派发 6 处 ST 写点
+  `mid(id, inf_mode)`（I_FN/I_LAMDOM/I_PIDOM/I_LETV/I_SORTEM/IP_TY）→
+  CONT 树 8 处链内 ST 写点 `mid(id, mode_st)`（I_FN→I_PI、I_PI→
+  I_ARG_S/I_ARG、I_ARG→I_CHK、chk_ok→I_PI、args_walk→I_ARG_S、
+  I_LAMDOM→I_LAMSORT、I_LAMSORT→I_LAMBODY、I_LETV→I_LETD）→ 三处续体
+  TASK_INFER 发射 `E2 = One + reglu(mode_st, 8)`（I_PI = APP 参数
+  infer、I_LAMSORT = lam body infer、I_LETD = let body infer）——
+  **mode 从当前帧自身 F2 解码**，不依赖落点下方帧的拓扑（G03 H2 的
+  SD-1 失效破局点）。gate 消费面（`ck7_gate` 经 `inf_mode`）零改动。
+- **遗留近似（保守侧，保留登记）**：pi codomain 链
+  （I_PIS1/I_PIL1/I_PIS2/I_PIL2 及其 body infer 发射）与 DEFEQ 链 soft
+  发射不携带 mode；pi 域链在 I_PIDOM 入口携带、链内不续。
+- **mode=0 不变性**：`fid = frF2`（逐值还原）、全部 `mid(id, 0)` 写点
+  = 裸 id；实证 = g03b/g03b2 mode 孪生对与 guard/bcd/canary 全节复跑
+  （卡 016 执行段 B4/B7）。
+
+### 16.7.2 I_CASE 主前提 whnf 续推：ctor 应用 major 的规则匹配（卡 016 拍 B 2-乙，2026-09-26）
+
+核侧合同（`K/inductive.h:77-121`）：`major = whnf(major)`（:93）后按
+**whnf 后 major 的头构造子**匹配规则（:100），字段原样进 rhs（:114）。
+`Nat.succ <field>` 型 major（field 为 stuck 叶）在核侧 head-normal 存活
+——whnf 不入 ctor 参数、`reduce_nat` 只吃 `is_nat_lit_ext` 实参
+（`is_nat_lit_ext` = `Nat.zero` 常量或字面量，`K/type_checker.cpp:637`；
+succ 臂 ：704-713，实参先 whnf 再过门）——然后 succ 规则照配。图侧三件套：
+
+1. **fire 门 decline**（NAT 帧作用域）：调用帧为 TASK_NAT 且实参为直接
+   stuck 非字面量叶（Sort/FVar/MVar/Pi/T_PI_CLO/字符串 K_LIT，以及
+   **无值 Const**）时 succ/pred/arity-2 op 不点火——ctor 应用经
+   `const_stuck` 以**剥离态**完成 whnf（焦点 = `Const(Nat.succ)`、字段项
+   = pend 顶，自带 env）。**无值 Const 判别** = cid≠0 且 env 头 `cid+1`
+   位置 V2 值指针为 0（即 axiom/opaque/ctor/thm；与主机器 `const_delta`
+   的 `eV2 ≥ 1` 同寻址同信号，`build_vm.py` C-scheme 头注释 ：341-343、
+   decline 取值 ：782-791）——**有值 Const（def）照旧点火**：核侧 delta
+   只展开有值常量（`K/type_checker.cpp:555-563` `is_delta` 门
+   `info->has_value()`；`K/declaration.h:230` `has_value() =
+   is_definition()`），有值 def 可 delta 归约到字面量（如
+   `T_four = Nat.mul T_two T_two`）；修前把非零 Const 一律当 stuck 叶
+   曾饿死 pend 臂致死 nat_hard（卡 016 修复段 F1-F4 探针定案：
+   succ_delta 修前 REJECT code 1 @beat6、fire1=fire2=0，修复后 79 步
+   AGREE 且与 pre-beat-B 逐值同）。BVar（walk 可解）与可归约实参照旧
+   点火；非 NAT 调用者的 soft/hard 交付合同不动。
+2. **交付分类面扩展**：`ctor_succ_head = 焦点 K_CONST ∧ V0 == _SUCC_CID`
+   （名字扫描，铁律 3 合规）；`rec_ctor = rec_dn ∧ ctor_succ_head` 并入
+   `build_r` 门（OP_REC 走既有 15 步 build：e4 LINK 链自带 rmajX，
+   `<maj>` 输入 rmajV0 本就是 major 原位）；cs 侧不走平铺 build（无法
+   携带字段 env，p2_ctor 教训同源）——**直接交付** `cs_ctor_r`：焦点 =
+   succ minor（home env）、pend = 字段项++extras（decline 路径 pend
+   未被打扰），beta 以字段项自携 env 绑定（`K/inductive.h:114` 语义）。
+   `cs_stuck_r` 同步收缩（补集式）。
+3. **pred 形状规则** `Nat.pred (Nat.succ X) → X`（pred 臂 dn1 拍，
+   `natbad1 ∧ OP_PRED ∧ ctor_succ_head`）：核侧经 delta 展开+iota 匹配
+   归约（非 reduce_nat），软硬上下文均归约——优先级在 nat_soft 之前。
+   交付 = 字段项（pend 顶自携 env），弹出该项与 NAT(pred) 帧。
+   `rej_n`/`em_frame` 相应扣除（该拍弹帧不拒不压）。
+- **残余（登记，后续里程碑）**：minor 体含 `Nat.add <stuck> <lit>` 时
+  （如 `fun n => n + 1000`），核侧 rec 展开一步给
+  `Nat.succ (Nat.add k 999)`，图侧 nat-arg 门硬拒——§11.7 已登记的
+  "offset/构造子 stuck 参数" 债，非本拍范围；stuck major 的 delta 头
+  形状差（`Nat.casesOn` vs 展开的 `Nat.rec`）= 005 F7-01 家族余量；
+  裸 `Nat.succ <无值 Const>`（如 `Nat.succ kq`，kq=axiom）在 NAT 链
+  decline 后的 const_stuck 完成路径未接住（图 REJECT code 1，oracle
+  钉真值 = stuck 形 `Nat.succ kq`）——卡 016 修复段 F2 探针实测
+  **pre-beat-B 即同行为**（非本卡引入，三版本逐值相同），登记后续卡。
+- **差分行集**：G04 `csctor` 族 3 行（`g04cs_eG4CSC` ctor-major casesOn
+  直接交付 = 42、`g04cs_eG4RECC` Nat.rec build = 999、`g04cs_eG4PRED`
+  pred 形状规则 = k），env 10 常量，oracle `#ORACLE` WHNF 现跑。
+
+> **C-16.7.x 运行时现造名的闭包保留纪律**（stage C 条款，卡 016 拍 A
+> memo §1.3 转正式；逐条 归约臂 file:line → 动态名 → ENV 保证方式 的
+> 盘点表见 docs/decisions/023-reduction-continuation-family-memo.md §1.2 D1-D10）
+> 1. 归约/推理/差分臂按名字现造节点的完整清单：`Nat.pred`、`Nat.rec`、
+>    `Bool.true`、`Bool.false`、`Nat`、`String`、`String.ofList`。这些名字
+>    不经过输入项的静态引用闭包；任何环境最小化（stage C）必须把清单中与
+>    语料归约路径相关的名字并入闭包 frontier 种子（等价于按需 keep-toy；
+>    实测：iv 族 dump 本含 `Nat.rec` 不含 `Nat.pred`——roots 与种子都要
+>    补），缺名时图必须走存在计数门优雅降级（`rec_ids_ok` → stuck），禁止
+>    合成伪 cid。
+> 2. 差分语料若覆盖 iota succ 规则或合成名面，verifier 须先断言对应名字
+>    的名字扫描存在计数 ≥1 再比对判定——否则该行的分歧定性为「环境缺失」，
+>    不构成语义分歧证据。
+> 3. legacy toy cid 回退维持现状三处（Bool.true/false、Nat、UnitT），
+>    新臂禁止新增回退点。
+> 4. `rec_ids_ok` 对 casesOn 变体的 `_REC_OK` 合取为过保守（cs_build 三步
+>    只造 pred）；2-乙 实施后 cs_ctor_r 直接交付不再经 build 循环，该合取
+>    维持现状（保守方向，不收窄不算错）。
+
+### 16.8 CHECK 通道的 G8/G9：重名拒绝与重复 univ 参数（卡 011 拍 1，2026-09-21/23）
+
+`check_constant_val`（`K/environment.cpp:127-135`）对单一声明依次跑
+`check_name`（:128）→ `check_duplicated_univ_params`（:129）→
+`check_no_metavar_no_fvar`（:130）→ checker。两条新臂按同一顺序接入：
+
+- **码 11 = alreadyDeclared（driver 簿记族，不进图）**：`check_name`
+  （`K/environment.cpp:102-105`）抛专用构造器 `already_declared_exception`
+  （`K/kernel_exception.h:32-37` → `Kernel.Exception.alreadyDeclared`，catch
+  :168-169）；Lean 侧渲染 "constant has already been declared 'n'"。图没有
+  名字空间，判定由 `InjectionEnv` 注册簿记（`_names` 名→cid 表）在任何图
+  体检之前完成——与码 9=mutualWF 同族（§16.5）。driver 消息镜像核文案，
+  oracle 类别 alreadyDeclared ↔ 码 11。
+- **码 10 = duplicate universe level parameter（图内臂）**：
+  `check_duplicated_univ_params`（`K/environment.cpp:111-121`）O(n²) 成对
+  比较，命中抛纯文本 `kernel_exception` → `Kernel.Exception.other`，
+  oracle 类别 other ↔ 码 10。图侧载体：声明的 univ 参数名单经
+  `Encoder.emit_univparams`（`expr/tokens.py`，复用 `_emit_list`
+  role=2 = `ENV_LIST_UNIVPARAMS` 形状，§12.1 同款）编码为
+  `T_ENV_LIST(role=2)` 链，链头写进 `TASK_CHECK` 锚帧的 **F2 槽**
+  （`step_driver.run_check(lparams=…)` 第 5 参，None/0 → 臂惰性、旧路径
+  逐字节不变）；cell 间以 V1 = interred nid 比较——nid 是流数据，图不暴露
+  名字表（验收铁律 3）。
+- **扫描臂（build_vm.py `CK_G9`=70 续体）**：resume-mode 续推循环，焦点
+  A=外层 cell / B=内层 cell，每微步一对 cell 取数；耗尽（无内层）→ 外移
+  下一 cell；全耗尽 → `g9_done` **代发**原 kickoff 对（帧载 V1/X/V2/E2 =
+  type/value/next/kind），使 g7 的 fvar/mvar 根检（核序 :130 在 dup 扫描
+  之后）**顺延**到同一 done 步——核序 name→dup-univ→fvar→checker 逐级
+  保持。命中 → reject_code 链顶插 10（链序 10>7>6>5>8>4，各臂续体模式
+  互斥无共射）。本轮实测：dims +76(+0.22%)/lookups +6/nnz +394(+0.17%)
+  （011 scratch vs 015 基线），常数量级电路与 O(1) 预算一致。
+- **verifier 行集**：`tests/test_decl_injection_vs_lean.py` section_g8
+  （8 行：新名 accept ×3 kind + 重名 reject code=11 + badbody/nonprop 顺序
+  行）与 section_g9（9 行：accept ×3 + `u,u` dup reject code=10 ×3 + 顺序
+  行 + `g9name_lp` 证 G8 先于 G9，oracle 类别 other/alreadyDeclared 先探针
+  实测再落测试）。全部 17/17 oracle 现跑 PASS（312s），引擎对拍 34/34。
+
+### 16.9 引擎任务通道 INFER/DEFEQ/CHECK（卡 013，2026-09-21/23）
+
+`engine/vm.cpp` 原只有 WHNF 入口；本卡把图侧已构造进权重的三任务判定
+（INFER/DEFEQ/CHECK，`model/runner.py:357-398` 的 Python 实现）补齐到
+C++ 引擎，判定逐例与 RefVM/runner 一致。CLI 向后兼容：第四参为数字 =
+legacy WHNF（旧用法逐字不变）；为词 = 任务模式：
+
+```
+vm_run <sbin> <stream> <term_pos> <max_steps>             # WHNF（旧）
+vm_run <sbin> <stream> <term_pos> <ms> infer [t_env]
+vm_run <sbin> <stream> <t_pos> <ms> defeq <t_env> <s_pos> <s_env>
+vm_run <sbin> <stream> <v0> <ms> check <n> <t1> <v1> <e2_1> …
+vm_run <sbin> --meta-check                                # 转储 token 常量
+```
+
+- **前导帧注入**：任务模式在 STATE 前先 push 前导 `T_FRAME`（TASK_INFER=6/
+  TASK_DEFEQ=7/TASK_CHECK=9，`expr/tokens.py:137-140`），字段布局与 STATE
+  载荷逐字照 `runner.py`（infer 帧 E2=1、defeq 帧载 t/s 双焦点、check 帧
+  逆序链 + STATE A=首声明 value 根）；`check` 的每锚 `e2` = ENV_FORMAT
+  §2.8 kind 载体，0 = runner 的 legacy 全惰形状。
+- **reject 通道**：主循环新读 `reject`/`reject_code` 两输出维（
+  `step_driver.py:89-97` 合同），命中即发 `T_REJECT(203)` + `T_HALT(204)`
+  （`expr/tokens.py:75-76`）并停止，终局打印 `REJECT <code> <focus> <env>
+  <steps>`；reject 微步不发 STATE、不计步（与 Python driver 同款）。
+- **发射臂补齐**：`em_raw`（6 维，raw_K 即任意 token kind，F2=0 与
+  driver raw 臂不传 F2 逐字一致）、`em_link2`（6 维，同用 T_LINK）、
+  `em_link` 补发 `link_flag`/`link_F2`（原硬编码 0）——发射顺序与
+  `step_driver.py:145-204` 逐项对拍。
+- **meta-check 防漂移**：`vm_run --meta-check` 转储 HEADER/SLOT/OUT/CONST
+  （全部硬编码 token 常量 + 读到的 sbin meta），`scripts/verify_engine_tasks.py
+  meta` 与 `expr/tokens.py` + sbin 尾部对拍——token 漂移由 harness 抓，
+  不靠肉眼。本次证据：`OK (76 output dims, 13 token consts)`。
+- **verifier**：WHNF 基线 34/34 不倒退（钉 `step_vm_015_full_scratch.sbin`）；
+  三任务对拍 99/99（INFER 19 + DEFEQ 65 + CHECK 12 + SEQ 3，accept/reject/
+  reject_code 三元逐例 == RefVM，540.8s）；`#KDECL` 真内核直连 12/12
+  （覆盖全部可达错误类别，≥10 要求）；23 套件 canary 级 3/3 rc=0
+  （engine_vs_refvm 34 例 + level×2，图侧零改动故 canary 足够，理由入
+  handoff 009-K）。引擎对拍一律钉封版 sbin、禁重编（防在途图改动混入）。
 
 ## 17. 编译通道 ReGLU 钳位常数（卡 008，2026-09-15，代理 E）
 

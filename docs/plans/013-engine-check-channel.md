@@ -1,7 +1,15 @@
 # 任务 013：引擎 CHECK/INFER/DEFEQ 权重通道（engine/vm.cpp）
 
-状态：open，待派（ADR 014 修订 2026-09-16 人裁入册；排产在卡 009 结案后、
-010/011 间隙串行派发，"同时只许 1 个写盘代理"纪律不破）。
+状态：**CLOSED（2026-09-23 总控五道门验收 PASS）**。拍 1 实现+自验
+（2026-09-21 后端工程师，四验证全绿 + canary 3/3 rc=0，证据落 009-K）；
+总控独立复跑链（09-23 04:2x-04:5x，核 8-13，钉 `step_vm_015_full_scratch.sbin`，
+`~/logs/013K/lead/`）三项全绿：WHNF **34/34**（whnf.log）、三任务
+**99/99**（tasks.log，548.2s）、`#KDECL` **12/12**（kdecl.log）。
+验收记录：机械门=改动仅 vm.cpp+新 harness+两文档；语义门=diff 逐段审
+（reject 通道/em_raw+em_link2/三任务前导帧 vs step_driver.py:89-204 合同，
+WHNF legacy 路径字节不变由 34/34 证）；架构门=不动 sbin 格式、零硬编码
+新增（meta-check 机制防 token 漂移）；诚实门=无 NOT-VERIFIED 掩盖。
+引擎通道节已入 VM_SPEC §16.9，真值表 vm_run 行已同步。
 
 ## 目标
 
@@ -53,15 +61,34 @@ J 段 B 条）核实缺项与估计 100-200 行 C++，不动 sbin 格式：
 
 ## Verifier 集（完工唯一依据）
 
-- [ ] WHNF 基线不倒退：`SBIN=$PWD/model/<现真值>.sbin
+- [x] WHNF 基线不倒退：`SBIN=$PWD/model/<现真值>.sbin
   python3 -u scripts/verify_engine_vs_refvm.py` 34/34（原文）。
-- [ ] 三任务引擎对拍绿：CHECK 15 + INFER/DEFEQ 84 逐例，引擎判定 ==
+- [x] 三任务引擎对拍绿：CHECK 15 + INFER/DEFEQ 84 逐例，引擎判定 ==
   RefVM/`runner.py` 判定（accept/reject/reject_code 三元一致，原文尾行）。
-- [ ] 真 lean 直连抽验：CHECK 子集经 `#KDECL` 通道与引擎判定一致（≥10 例，
+- [x] 真 lean 直连抽验：CHECK 子集经 `#KDECL` 通道与引擎判定一致（≥10 例，
   含全部错误类别代表；原文）。
-- [ ] token 常量值 vs sbin meta 校验通过（硬编码防漂移）。
-- [ ] 20 套件回归（图侧零改动，canary 级即可，注明理由）。
-- [ ] 硬编码扫描零新增；`git diff` 只触及声明文件。
+- [x] token 常量值 vs sbin meta 校验通过（硬编码防漂移）。
+- [x] 20 套件回归（图侧零改动，canary 级即可，注明理由）— 选件与结果见
+  `docs/handoffs/009-K-engine-check.md`「卡 013 续接」节 canary 回归段；
+  原文 `$HOME/logs/013K/canary.log`（RUN1 engine_vs_refvm 1/1 rc=0，
+  RUN2 level_vs_lean+level_encoding 2/2 rc=0，总 3/3 rc=0）。
+- [x] 硬编码扫描零新增；`git diff` 只触及声明文件（扫描结论全文见
+  `docs/handoffs/009-K-engine-check.md`「卡 013 续接」节硬编码扫描段）。
+
+### 拍 1 验证证据（2026-09-21 续接落账，原文均见 009-K 续接节完工证据）
+
+- ① WHNF 34/34：`$HOME/logs/013K/whnf_baseline_s1.log`
+  `=== H3 engine vs RefVM: 34/34 verdicts correct ===`
+- ② 三任务 99/99：`$HOME/logs/013K/tasks_s2.log`
+  `=== engine tasks vs RefVM: 99/99 accept/reject+code triples correct
+  (INFER 19 + DEFEQ 65 + CHECK 12 + SEQ 3), 540.8s ===`
+- ③ KDECL 12/12：`$HOME/logs/013K/kdecl_s6.log`
+  `=== engine vs #KDECL raw kernel: 12/12 consistent (>=10 required, all
+  reachable error classes) ===`
+- ④ meta：`$HOME/logs/013K/meta_s7.log`
+  `=== engine meta vs sbin+tokens: OK (76 output dims, 13 token consts) ===`
+- 真值钉定：卡 013 全部对拍用 `model/step_vm_015_full_scratch.sbin`（ARCHITECTURE
+  真值表当前图侧封版验证基线，015 CLOSED 09-21），run 命令原文见 009-K S2/S2b 段。
 
 ## 排产与晋升约束
 

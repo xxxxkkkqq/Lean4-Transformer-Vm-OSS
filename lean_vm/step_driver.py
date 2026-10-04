@@ -70,6 +70,18 @@ def check_e2(kind_code: int, mode_code: int = CHECK_MODE_SAFE) -> int:
 # (K/environment.cpp:228-248, plain kernel_exception → .other messages) never
 # enters the graph: InjectionEnv raises before any graph pass.
 ERR_MUTUAL_WF = 9
+# Card 011 G8: name-presence bookkeeping reject code (same channel as 9 — the
+# graph has no name space, so check_name (K/environment.cpp:102-105, called
+# from check_constant_val :128) is decided by the driver before any graph
+# pass.  The kernel class is the dedicated constructor
+# `already_declared_exception` (K/kernel_exception.h:32-37 → Kernel.Exception
+# .alreadyDeclared, catch at :168-169); the driver message mirrors the
+# Lean-side rendering "(kernel) constant has already been declared 'n'"
+# (src/Lean/Message.lean:896).  Oracle-confirmed 2026-09-21 (handoff 006 G8/G9
+# probe): the name check runs inside check_constant_val BEFORE is_prop /
+# value checks, so a duplicate name wins over thmTypeIsNotProp (8),
+# declTypeMismatch (1) and the G9 duplicate-univ-param reject (10).
+ERR_ALREADY_DECLARED = 11
 
 
 class StepDriver:
@@ -261,7 +273,8 @@ class StepDriver:
         return self._run_loop(max_steps)
 
     def run_check(self, decls, max_steps: int = 50000,
-                  kinds=None, check_mode: int = CHECK_MODE_SAFE) -> tuple[int, int]:
+                  kinds=None, check_mode: int = CHECK_MODE_SAFE,
+                  lparams=None) -> tuple[int, int]:
         """Run the M4.2 CHECK driver loop. decls: list of (type_root,
         val_root) stream positions. CHECK anchor frames (V0=TASK_CHECK,
         V1=declared type, X=value, V2=next anchor) are pushed in reverse so
@@ -282,7 +295,14 @@ class StepDriver:
         SAFE checker, K/environment.cpp:196); the mode arm — unsafe checker
         for unsafe add_definition bodies and mutual blocks, K/environment.cpp
         :167-172/:236/:260 — is card 010 G03 and until then no gate consumes
-        the bit, so this is faithful data with no behavioural effect."""
+        the bit, so this is faithful data with no behavioural effect.
+
+        lparams (card 011 G9): optional per-declaration stream positions of
+        T_ENV_LIST(role=2) universe-parameter chains (heads from
+        `Encoder.emit_univparams`), written into each anchor's F2 slot.  The
+        graph's duplicate-param scan (K/environment.cpp:111-121, reject code
+        10) walks them; `lparams=None`/head 0 leaves the arm inert exactly as
+        before."""
         if not decls:
             raise ValueError("run_check: empty declaration list")
         if kinds is None:
@@ -296,10 +316,19 @@ class StepDriver:
             if len(e2s) != len(decls):
                 raise ValueError(
                     f"run_check: {len(decls)} declarations but {len(e2s)} kinds")
+        if lparams is None:
+            f2s = [0] * len(decls)
+        else:
+            f2s = list(lparams)
+            if len(f2s) != len(decls):
+                raise ValueError(
+                    f"run_check: {len(decls)} declarations but {len(f2s)} "
+                    f"lparams chain heads")
         nxt = 0
-        for (t_root, v_root), e2 in zip(reversed(decls), reversed(e2s)):
+        for (t_root, v_root), e2, f2 in zip(reversed(decls), reversed(e2s),
+                                            reversed(f2s)):
             nxt = self._append(T_FRAME, V0=TASK_CHECK, V1=t_root, V2=nxt,
-                               X=v_root, E2=e2)
+                               X=v_root, E2=e2, F2=f2)
         self.init_state(decls[0][1], 0, 0, D=nxt)
         return self._run_loop(max_steps)
 
@@ -322,8 +351,9 @@ class InjectionEnv:
     (name, type tree, value tree | None), ctors a name collection.
     graph_builder is injected (callable → (graph, outputs)) — this module
     does not import build_vm.  Registration is per-constant bookkeeping only:
-    the graph never sees declaration names, and re-adding an existing name
-    (kernel alreadyDeclared, K/environment.cpp:102-105) is G8, card 011.
+    the graph never sees declaration names, and re-adding an existing name is
+    rejected with VMError(ERR_ALREADY_DECLARED) (card 011 G8, kernel
+    alreadyDeclared, K/environment.cpp:102-105) before any graph pass.
 
     Per-branch phasing mirrors the kernel exactly:
       add_axiom    check_constant_val only (env.cpp:152-158) — the anchor
@@ -390,10 +420,14 @@ class InjectionEnv:
                 self._names[n] = prev
 
     # ── graph passes ──────────────────────────────────────────────────────
-    def _check(self, items, kinds, check_mode) -> int:
+    def _check(self, items, kinds, check_mode, lp_lists=None) -> int:
         """One graph pass over the CURRENT environment.  items:
         [(type tree, value tree | None)] (None = anchor X=0, the G5 no-value
-        shape).  Returns the micro-step count; raises VMError on reject."""
+        shape).  lp_lists (card 011 G9): optional per-item universe-parameter
+        name lists; non-empty entries are emitted as T_ENV_LIST(role=2)
+        chains whose head positions ride the anchors' F2 slots for the
+        graph's duplicate-param scan.  Returns the micro-step count; raises
+        VMError on reject."""
         build = self._graph_builder
         graph, outputs = build()
         # card 010 G03: the injected declarations' ConstantInfo metadata
@@ -411,60 +445,90 @@ class InjectionEnv:
         except KeyError as ex:
             raise VMError(ERR_MISSING_CONST,
                           f"unknown constant {ex.args[0]!r}") from ex
+        # G9 (K/environment.cpp:111-121): per-declaration lparams chains enter
+        # on the anchors' F2 slot; the scan compares interred name ids — the
+        # graph itself stays name-free (acceptance rule 3).
+        heads = [enc.emit_univparams(lp) if lp else 0
+                 for lp in (lp_lists or [None] * len(items))]
         drv = StepDriver(enc.b, graph, outputs)
         try:
-            drv.run_check(decls, kinds=kinds, check_mode=check_mode)
+            drv.run_check(decls, kinds=kinds, check_mode=check_mode,
+                          lparams=heads)
         finally:
             self.steps_last = drv.steps
         return drv.steps
 
     # ── the add_* family (K/environment.cpp:271-284) ──────────────────────
-    def add_axiom(self, name, type_tree) -> int:
-        self._check([(type_tree, None)], [CHECK_KIND_AXIOM], CHECK_MODE_SAFE)
-        return self._append_entry(
-            name, type_tree, None, {"kind": CK_AXIOM, "safety": 1})[0]
+    def _check_name(self, name):
+        """G8 (K/environment.cpp:102-105 via check_constant_val :128): a name
+        already present in the environment rejects with alreadyDeclared before
+        ANY check runs — before type checking, before is_prop, before the G9
+        duplicate-univ-param scan.  Driver bookkeeping (the graph has no name
+        space), same channel as the code-9 family."""
+        if name in self._names:
+            raise VMError(ERR_ALREADY_DECLARED,
+                          f"constant has already been declared '{name}'")
+
+    def add_axiom(self, name, type_tree, lparams=None) -> int:
+        self._check_name(name)
+        self._check([(type_tree, None)], [CHECK_KIND_AXIOM], CHECK_MODE_SAFE,
+                    lp_lists=[lparams])
+        meta = {"kind": CK_AXIOM, "safety": 1}
+        if lparams:
+            meta["lparams"] = list(lparams)
+        return self._append_entry(name, type_tree, None, meta)[0]
 
     def add_definition(self, name, type_tree, value_tree,
-                       is_unsafe=False) -> int:
+                       is_unsafe=False, lparams=None) -> int:
+        self._check_name(name)
         meta = {"kind": CK_DEFINITION,
                 "safety": 0 if is_unsafe else 1}
+        if lparams:
+            meta["lparams"] = list(lparams)
         if is_unsafe:
             # header on the old env (unsafe checker), register, body on the
             # new env; failed body rolls the registration back
             self._check([(type_tree, None)], [CHECK_KIND_DEFINITION],
-                        CHECK_MODE_UNSAFE)
+                        CHECK_MODE_UNSAFE, lp_lists=[lparams])
             cid, ap = self._append_entry(name, type_tree, value_tree, meta)
             try:
                 self._check([(type_tree, value_tree)],
-                            [CHECK_KIND_DEFINITION], CHECK_MODE_UNSAFE)
+                            [CHECK_KIND_DEFINITION], CHECK_MODE_UNSAFE,
+                            lp_lists=[lparams])
             except VMError:
                 self._rollback(cid, [ap])
                 raise
             return cid
         self._check([(type_tree, value_tree)], [CHECK_KIND_DEFINITION],
-                    CHECK_MODE_SAFE)
+                    CHECK_MODE_SAFE, lp_lists=[lparams])
         return self._append_entry(name, type_tree, value_tree, meta)[0]
 
-    def add_theorem(self, name, type_tree, value_tree) -> int:
+    def add_theorem(self, name, type_tree, value_tree, lparams=None) -> int:
+        self._check_name(name)
         self._check([(type_tree, value_tree)], [CHECK_KIND_THEOREM],
-                    CHECK_MODE_SAFE)
-        return self._append_entry(
-            name, type_tree, value_tree,
-            {"kind": CK_THEOREM, "safety": 1})[0]
+                    CHECK_MODE_SAFE, lp_lists=[lparams])
+        meta = {"kind": CK_THEOREM, "safety": 1}
+        if lparams:
+            meta["lparams"] = list(lparams)
+        return self._append_entry(name, type_tree, value_tree, meta)[0]
 
-    def add_opaque(self, name, type_tree, value_tree) -> int:
+    def add_opaque(self, name, type_tree, value_tree, lparams=None) -> int:
+        self._check_name(name)
         self._check([(type_tree, value_tree)], [CHECK_KIND_OPAQUE],
-                    CHECK_MODE_SAFE)
-        return self._append_entry(
-            name, type_tree, value_tree,
-            {"kind": CK_OPAQUE, "safety": 1})[0]
+                    CHECK_MODE_SAFE, lp_lists=[lparams])
+        meta = {"kind": CK_OPAQUE, "safety": 1}
+        if lparams:
+            meta["lparams"] = list(lparams)
+        return self._append_entry(name, type_tree, value_tree, meta)[0]
 
     def add_mutual(self, members) -> list:
         """members: [(name, lparams, type tree, value tree, safety)] with
         safety in the ENV_FORMAT §2.4 encoding 0=unsafe / 1=safe / 2=partial;
         the block's checker mode is the HEAD member's safety (env.cpp:230).
-        lparams are carried for the same-lparams bookkeeping only (per-decl
-        dup-univ-params and level polymorphism = G9, card 011).
+        lparams ride each member's header/body anchors (card 011 G9: the
+        graph's duplicate-param scan, K/environment.cpp:111-121, runs per
+        member inside the check_constant_val graph pass); the
+        same-lparams-equality bookkeeping stays in the pre-loop below.
 
         Known approximations (VM_SPEC §16.5/§16.6): partial blocks run the
         graph passes with the unsafe mode bit (the §2.8 layout has no partial
@@ -498,23 +562,36 @@ class InjectionEnv:
                 raise VMError(ERR_MUTUAL_WF, "invalid mutual definition, "
                               "duplicate declaration name '" + name + "'")
             found.add(name)
+            # G8 (K/environment.cpp:243-247 + check_constant_val :128): the
+            # kernel's per-member check_name sees the OLD env (no block member
+            # is registered yet), so an already-declared member name is
+            # alreadyDeclared; the in-block duplicate check above runs first,
+            # exactly the kernel's loop order.
+            self._check_name(name)
         # header pass — old environment; the kernel checks every member's
-        # header BEFORE registering anything (:236-251 precede :253-257)
+        # header BEFORE registering anything (:236-251 precede :253-257).
+        # Card 011 G9: each member's lparams ride the header anchors' F2
+        # chains — check_constant_val's duplicate-param scan (per member,
+        # kernel :129) runs inside these graph passes.
         n = len(members)
         self._check([(t, None) for _nm, _lp, t, _v, _s in members],
-                    [CHECK_KIND_DEFINITION] * n, mode)
+                    [CHECK_KIND_DEFINITION] * n, mode,
+                    lp_lists=[m[1] for m in members])
         # register all members, then the body pass on the new environment
         mark = len(self._consts)
         appended = []
         cids = []
-        for name, _lp, t, v, _s in members:
-            cid, ap = self._append_entry(
-                name, t, v, {"kind": CK_DEFINITION, "safety": _s})
+        for name, lp, t, v, _s in members:
+            meta = {"kind": CK_DEFINITION, "safety": _s}
+            if lp:
+                meta["lparams"] = list(lp)
+            cid, ap = self._append_entry(name, t, v, meta)
             cids.append(cid)
             appended.append(ap)
         try:
             self._check([(t, v) for _nm, _lp, t, v, _s in members],
-                        [CHECK_KIND_DEFINITION] * n, mode)
+                        [CHECK_KIND_DEFINITION] * n, mode,
+                        lp_lists=[m[1] for m in members])
         except VMError:
             self._rollback(mark, appended)
             raise

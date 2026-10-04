@@ -21,16 +21,30 @@
 // cached but nothing ever reads them again, so this is exact.
 //
 // Usage:
-//   vm_run <weights.bin|.sbin> <stream.txt> <term_pos> [max_steps=2000]
+//   vm_run <weights.bin|.sbin> <stream.txt> <term_pos> [max_steps]          # WHNF
+//   vm_run <weights.bin|.sbin> <stream.txt> <term_pos> <max_steps> infer [env]
+//   vm_run <weights.bin|.sbin> <stream.txt> <t_pos> <max_steps> defeq <t_env> <s_pos> <s_env>
+//   vm_run <weights.bin|.sbin> <stream.txt> <v0> <max_steps> check <n> <type_root> <val_root> <e2> ...
+//   vm_run <weights.bin|.sbin> --meta-check
 // stream.txt: first line n, then n lines "K V0 V1 V2 X E2 F2" (the stream
-// BEFORE init_state; the engine appends the initial STATE token itself).
+// BEFORE the prelude/STATE injection; the engine appends the prelude frames
+// and the initial STATE token itself).  The task modes mirror
+// model/runner.py run_infer/run_defeq/run_check (card 013): the frame
+// emission order and STATE payload are that contract — check's <e2> is the
+// per-anchor kind carrier (ENV_FORMAT §2.8), 0 = the runner's legacy shape.
 // Output: the final stream (same format), then
-//   DONE <result_pos> <env_pos> <steps> | NOT_DONE <steps>
+//   DONE <result_pos> <env_pos> <steps>
+//   REJECT <code> <focus> <env> <steps>   (graph reject channel, card 013)
+//   NOT_DONE <steps>
+// --meta-check prints everything the C++ side read out of the weights file
+// (header, field slots, output index, hard-coded token constants) so the
+// verify harness can diff it against expr/tokens.py and the file tail.
 //
 // Weights file: either the legacy dense format (save_weights) or the CSR
 // sparse "L4SV" format (save_weights_sparse, compiler/weights.py), chosen
 // by magic. The sparse file is mmapped and parsed in place — load is
 // milliseconds instead of a full multi-GB read.
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -319,8 +333,17 @@ struct Tok { long long f[7]; };
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 4) {
-        fprintf(stderr, "usage: vm_run <weights.bin|.sbin> <stream.txt> <term_pos> [max_steps]\n");
+    // --meta-check mode (`vm_run <weights> --meta-check`, card 013) dumps
+    // everything the C++ loader read out of the file tail so the verify
+    // harness can diff it against expr/tokens.py + the sbin itself; it never
+    // touches a stream file.
+    const bool meta_check = argc == 3 && strcmp(argv[2], "--meta-check") == 0;
+    if ((argc < 4 && !meta_check) || (argc > 4 && argv[4][0] == '-' &&
+                                      strcmp(argv[4], "--meta-check") != 0)) {
+        fprintf(stderr,
+                "usage: vm_run <weights.bin|.sbin> <stream.txt> <term_pos> "
+                "[max_steps | infer|defeq|check args]\n"
+                "       vm_run <weights.bin|.sbin> --meta-check\n");
         return 2;
     }
     Weights W;
@@ -371,6 +394,36 @@ int main(int argc, char** argv) {
     const double k1log2 = 1.0 / std::log(2.0);
     const double SCALE = std::sqrt(2.0);
 
+    // Token kinds mirrored from expr/model.py + expr/tokens.py.  These values
+    // ARE the stream contract (they never travel in the weights file), so the
+    // --meta-check dump below prints them and the verify harness diffs them
+    // against expr/tokens.py — a drift there fails the harness, not the eye.
+    const long long T_PEND = 30, T_LINK = 31, T_FRAME = 32, T_STATE = 33,
+                    T_LIT_DIG = 13, K_LIT = 10, K_CONST = 5, LIT_NAT = 0,
+                    T_REJECT = 203, T_HALT = 204;  // expr/tokens.py:75-76
+    const long long TASK_INFER = 6, TASK_DEFEQ = 7, TASK_CHECK = 9;  // :137-140
+
+    if (meta_check) {
+        printf("HEADER vocab %d d_model %d n_layers %d n_heads %d d_ffn %d stop %d\n",
+               W.vocab, W.d_model, W.n_layers, W.n_heads, W.d_ffn, W.stop_token_id);
+        auto dump = [](const char* tag, const std::unordered_map<string, int>& m) {
+            vector<std::pair<string, int>> v(m.begin(), m.end());
+            std::sort(v.begin(), v.end());
+            for (const auto& kv : v) printf("%s %s %d\n", tag, kv.first.c_str(), kv.second);
+        };
+        dump("SLOT", W.field_slots);
+        printf("SLOT one %d\n", W.one_slot);
+        dump("OUT", W.output_index);
+        printf("CONST T_PEND %lld\nCONST T_LINK %lld\nCONST T_FRAME %lld\n"
+               "CONST T_STATE %lld\nCONST T_LIT_DIG %lld\nCONST K_LIT %lld\n"
+               "CONST K_CONST %lld\nCONST LIT_NAT %lld\nCONST T_REJECT %lld\n"
+               "CONST T_HALT %lld\nCONST TASK_INFER %lld\nCONST TASK_DEFEQ %lld\n"
+               "CONST TASK_CHECK %lld\n",
+               T_PEND, T_LINK, T_FRAME, T_STATE, T_LIT_DIG, K_LIT, K_CONST,
+               LIT_NAT, T_REJECT, T_HALT, TASK_INFER, TASK_DEFEQ, TASK_CHECK);
+        return 0;
+    }
+
     // ── initial stream (pre-init_state) ──
     FILE* sf = fopen(argv[2], "r");
     if (!sf) { fprintf(stderr, "cannot open %s\n", argv[2]); return 2; }
@@ -385,7 +438,49 @@ int main(int argc, char** argv) {
     }
     fclose(sf);
     long long term_pos = atoll(argv[3]);
-    int max_steps = argc > 4 ? atoi(argv[4]) : 2000;
+    // Task selector (card 013): a numeric argv[4] is the legacy WHNF max_steps
+    // (byte-identical to the pre-013 CLI); a word selects INFER/DEFEQ/CHECK
+    // with its own max_steps at argv[5].  The prelude frames mirror
+    // model/runner.py run_infer/run_defeq/run_check — same field layout, same
+    // append-before-STATE order, check's per-anchor E2 = ENV_FORMAT §2.8
+    // kind carrier (0 = the runner's legacy shape).
+    enum Task { WHNF, INFER, DEFEQ, CHECK } task = WHNF;
+    int max_steps = 2000;
+    long long t_env = 0, s_pos = 0, s_env = 0;
+    struct Chk { long long t, v, e2; };
+    vector<Chk> decls;
+    if (argc > 4) {
+        char* endp = nullptr;
+        const long long ms = strtoll(argv[4], &endp, 10);
+        if (*endp == '\0' && endp != argv[4]) {
+            if (argc > 5) { fprintf(stderr, "extra args after WHNF max_steps\n"); return 2; }
+            max_steps = (int)ms;
+        } else {
+            const string t(argv[4]);
+            if (argc < 6) { fprintf(stderr, "task %s needs max_steps\n", argv[4]); return 2; }
+            max_steps = atoi(argv[5]);
+            if (t == "infer") {
+                task = INFER;
+                t_env = argc > 6 ? atoll(argv[6]) : 0;
+            } else if (t == "defeq") {
+                if (argc < 9) { fprintf(stderr, "defeq needs <t_env> <s_pos> <s_env>\n"); return 2; }
+                task = DEFEQ;
+                t_env = atoll(argv[6]); s_pos = atoll(argv[7]); s_env = atoll(argv[8]);
+            } else if (t == "check") {
+                if (argc < 7) { fprintf(stderr, "check needs n>=1 and n*(type_root val_root e2)\n"); return 2; }
+                const long long n = atoll(argv[6]);
+                if (n < 1 || argc < 7 + 3 * (long long)n) {
+                    fprintf(stderr, "check: bad n %lld (argc %d)\n", n, argc); return 2;
+                }
+                task = CHECK;
+                for (long long i = 0; i < n; ++i)
+                    decls.push_back({atoll(argv[7 + 3 * i]), atoll(argv[8 + 3 * i]),
+                                     atoll(argv[9 + 3 * i])});
+            } else {
+                fprintf(stderr, "unknown task %s\n", argv[4]); return 2;
+            }
+        }
+    }
 
     auto need = [&](const std::unordered_map<string, int>& m,
                     const char* name) -> int {
@@ -435,10 +530,27 @@ int main(int argc, char** argv) {
               I_HEAD_V2 = need(W.output_index, "head_V2"),
               I_HEAD_X = need(W.output_index, "head_X");
     const int I_CONST_CID = need(W.output_index, "const_cid");
-
-    // Token kinds mirrored from expr/model.py + expr/tokens.py
-    const long long T_PEND = 30, T_LINK = 31, T_FRAME = 32, T_STATE = 33,
-                    T_LIT_DIG = 13, K_LIT = 10, K_CONST = 5, LIT_NAT = 0;
+    // Card 013 channels: reject verdict + raw/link2 emission arms + the link
+    // arm's E2/F2 payload (step_driver.py:136-171 contract — the engine read
+    // `done` only and zeroed link E2/F2 before this card).
+    const int I_REJECT = need(W.output_index, "reject"),
+              I_REJECT_CODE = need(W.output_index, "reject_code");
+    const int I_ERAW = need(W.output_index, "em_raw"),
+              I_RAW_K = need(W.output_index, "raw_K"),
+              I_RAW_V0 = need(W.output_index, "raw_V0"),
+              I_RAW_V1 = need(W.output_index, "raw_V1"),
+              I_RAW_V2 = need(W.output_index, "raw_V2"),
+              I_RAW_X = need(W.output_index, "raw_X"),
+              I_RAW_E2 = need(W.output_index, "raw_E2");
+    const int I_ELINK2 = need(W.output_index, "em_link2"),
+              I_LINK2_V0 = need(W.output_index, "link2_V0"),
+              I_LINK2_V1 = need(W.output_index, "link2_V1"),
+              I_LINK2_PREV = need(W.output_index, "link2_prev"),
+              I_LINK2_ENV = need(W.output_index, "link2_env"),
+              I_LINK2_FLAG = need(W.output_index, "link2_flag"),
+              I_LINK2_F2 = need(W.output_index, "link2_F2");
+    const int I_LINK_FLAG = need(W.output_index, "link_flag"),
+              I_LINK_F2 = need(W.output_index, "link_F2");
 
     // ── residual rows + incremental forward ──
     vector<vector<double>> kc(W.n_layers), vc(W.n_layers);  // T * H2 each
@@ -554,13 +666,39 @@ int main(int argc, char** argv) {
         stream.push_back(t);
     };
 
-    // init_state: STATE(A=term_pos), then forward every position once
-    emit(T_STATE, term_pos, 0, 0, 0, 0, 0);
+    // init_state: prelude frames (task modes only) then STATE, then forward
+    // every position once.  Frame field layout and the STATE payload per task
+    // are model/runner.py:357-398 verbatim; WHNF keeps the old bare-STATE
+    // init.  push() returns the appended token's position — the driver-side
+    // _append return value the runner's fpos/D wiring uses.
+    auto push = [&](long long K, long long V0, long long V1, long long V2,
+                    long long X, long long E2, long long F2) {
+        stream.push_back(Tok{{K, V0, V1, V2, X, E2, F2}});
+        return (long long)stream.size() - 1;
+    };
+    long long iA = term_pos, iB = 0, iC = 0, iD = 0, iE = 0, iF = 0;
+    if (task == INFER) {
+        iD = push(T_FRAME, TASK_INFER, 0, 0, 0, 1, 0);
+        iB = t_env;
+    } else if (task == DEFEQ) {
+        iD = push(T_FRAME, TASK_DEFEQ, term_pos, 0, t_env, s_pos, s_env);
+        iB = t_env; iE = s_pos; iF = s_env;
+    } else if (task == CHECK) {
+        long long nxt = 0;
+        for (int i = (int)decls.size() - 1; i >= 0; --i)
+            nxt = push(T_FRAME, TASK_CHECK, decls[i].t, nxt, decls[i].v,
+                       decls[i].e2, 0);
+        iA = decls[0].v;  // runner: STATE A = first declaration's value root
+        iD = nxt;
+    }
+    emit(T_STATE, iA, iB, iC, iD, iE, iF);
     while (T < (long long)stream.size()) append_pos(stream[T]);
 
     long long steps = 0;
     long long result_pos = -1, result_env = -1;
     bool done = false;
+    bool rejected = false;
+    long long reject_code = 0, reject_focus = 0, reject_env = 0;
     vector<double> out(D);
     for (int s = 0; s < max_steps; ++s) {
         // last position (the STATE token) was already forwarded by the
@@ -582,8 +720,30 @@ int main(int argc, char** argv) {
             result_env = rd(I_B);
             break;
         }
+        // Graph reject channel (step_driver.py:136-144): surface the verdict
+        // in the stream (T_REJECT(code) + T_HALT) and stop — like the Python
+        // driver, that micro-step appends nothing else and its STATE is not
+        // counted in steps; the two verdict tokens are never forwarded.
+        if (rd(I_REJECT)) {
+            rejected = true;
+            reject_code = rd(I_REJECT_CODE);
+            reject_focus = rd(I_A);
+            reject_env = rd(I_B);
+            emit(T_REJECT, reject_code, 0, 0, 0, 0, 0);
+            emit(T_HALT, 0, 0, 0, 0, 0, 0);
+            break;
+        }
+        // emission order contract (step_driver.py:145-204): raw, pend, link,
+        // link2, litdig, frame, frame2, lithead, gap, litdig2, const — then
+        // STATE.  raw emits an arbitrary token kind (T_PI_CLO / level-chain /
+        // cache nodes) and the second PEND of a spine peel; link2 the second
+        // LINK of a peel — the INFER/DEFEQ/CHECK paths reach these arms.
+        if (rd(I_ERAW))
+            emit(rd(I_RAW_K), rd(I_RAW_V0), rd(I_RAW_V1), rd(I_RAW_V2),
+                 rd(I_RAW_X), rd(I_RAW_E2), 0);
         if (rd(I_EPEND)) emit(T_PEND, rd(I_PEND_V0), 0, rd(I_PEND_PREV), rd(I_PEND_ENV), 0, 0);
-        if (rd(I_ELINK)) emit(T_LINK, rd(I_LINK_V0), rd(I_LINK_V1), rd(I_LINK_PREV), rd(I_LINK_ENV), 0, 0);
+        if (rd(I_ELINK)) emit(T_LINK, rd(I_LINK_V0), rd(I_LINK_V1), rd(I_LINK_PREV), rd(I_LINK_ENV), rd(I_LINK_FLAG), rd(I_LINK_F2));
+        if (rd(I_ELINK2)) emit(T_LINK, rd(I_LINK2_V0), rd(I_LINK2_V1), rd(I_LINK2_PREV), rd(I_LINK2_ENV), rd(I_LINK2_FLAG), rd(I_LINK2_F2));
         if (rd(I_ELITDIG)) emit(T_LIT_DIG, rd(I_DIG_V0), 0, rd(I_F), 0, 0, 0);
         if (rd(I_EFRAME)) emit(T_FRAME, rd(I_FRAME_TASK), rd(I_FRAME_V1), rd(I_FRAME_V2), rd(I_FRAME_X), rd(I_FRAME_E2), rd(I_FRAME_F2));
         if (rd(I_EFRAME2)) emit(T_FRAME, rd(I_F2_TASK), rd(I_F2_V1), rd(I_F2_V2), rd(I_F2_X), rd(I_F2_E2), rd(I_F2_F2));
@@ -604,6 +764,8 @@ int main(int argc, char** argv) {
                t.f[0], t.f[1], t.f[2], t.f[3], t.f[4], t.f[5], t.f[6]);
     }
     if (done) printf("DONE %lld %lld %lld\n", result_pos, result_env, steps);
+    else if (rejected) printf("REJECT %lld %lld %lld %lld\n",
+                              reject_code, reject_focus, reject_env, steps);
     else printf("NOT_DONE %lld\n", steps);
     return 0;
 }

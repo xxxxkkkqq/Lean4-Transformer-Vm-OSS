@@ -245,6 +245,12 @@ CHECK_MODE_UNSAFE = 1                # graph behaviour: card 010 G03 (G2-unsafe)
 # channels (A=0 marker, ensure_pi soft delivery) and I_CHK's True success
 # path verbatim.
 I_ARG_S = 69
+# Card 011 G9: resume-loop id for the duplicate-universe-parameter scan of
+# a declaration's lparams chain (K/environment.cpp:111-121
+# check_duplicated_univ_params, pairwise, class plain-kernel_exception →
+# .other, new reject code 10).  The chain head rides the TASK_CHECK anchor's
+# F2 slot (0 = no lparams → the arm is inert; ENV_FORMAT §2.8).
+CK_G9 = 70
 
 # Card 014 (ADR 017): the is_def_eq memo layer. VM014_CACHE=0 removes every
 # cache arm at build time (the verdict-invariance control: the two settings
@@ -436,6 +442,15 @@ def build_step_graph():
                         One - _is_rec_ind(ind)), _eq_expr(np, Zero))
         return _select(reglu(_no_meta(cid), One),
                        _eq_expr(cid, Expression({_one_dim: CID_P2MK})), p)
+
+    def _is_ctor_any(cid):
+        """cid is a constructor token (T_ENV_CTORVAL) — the only requirement
+        reduce_proj_core puts on the projection's head constant
+        (K/type_checker.cpp:427-429), with the legacy P2.mk fallback for
+        no-meta streams (same fallback as _is_struct_ctor2)."""
+        return _select(reglu(_no_meta(cid), One),
+                       _eq_expr(cid, Expression({_one_dim: CID_P2MK})),
+                       _ctor_bind(cid)[3])
 
     def _struct_ind(cid):
         """induct_cid of a constructor cid (legacy fallback CID_P2)."""
@@ -743,8 +758,54 @@ def build_step_graph():
                  + reglu(_geq_expr(eX, OP_GCD),
                          One - _geq_expr(eX, OP_SHR + One)))
     has2 = _geq_expr(pV2, One)
-    fire2 = reglu(reglu(natop, op_arity2), reglu(pend_nonempty, has2))
-    fire1 = reglu(reglu(natop, op_arity1), pend_nonempty)
+    # C-16.7 (memo 023 §2): a nat op whose argument is a DIRECT stuck
+    # non-literal leaf does not fire when the caller is a NAT control frame —
+    # the kernel leaves `Nat.succ k` head-normal (whnf never descends into
+    # ctor args; reduce_nat only fires on is_nat_expr args,
+    # K/type_checker.cpp:702-733), and that ctor app must survive as the
+    # iota major (K/inductive.h:93 whnf + :100 rule match).  BVar args still
+    # fire (the walk may resolve them), reducible args still fire, and
+    # outside NAT frames the soft/hard delivery contract is untouched.
+    _slK1 = fetch_by_position([k_], pV0)[0]
+    _slV01 = fetch_by_position([v1_], pV0)[0]
+    _slK2 = fetch_by_position([k_], qV0)[0]
+    _slV02 = fetch_by_position([v1_], qV0)[0]
+    # A K_CONST arg declines only when it can never whnf to a nat literal:
+    # not the machine's zero-const (cid 0 — the is_zconst_r face) and
+    # VALUELESS.  The env-header value pointer at cid+1 (the same signal the
+    # main delta arm consumes via const_delta eV2 >= 1) is 0 exactly for
+    # axiom/opaque/ctor/thm consts (K/type_checker.cpp:555-563 is_delta
+    # gates on info->has_value(); K/declaration.h:230 has_value() =
+    # is_definition(); reduce_nat fires only on is_nat_lit_ext args =
+    # Nat.zero-const or literal, :637/:704-733 — a def with a value may
+    # delta-reach one, so it must still fire; hiding it here starves the
+    # pending op and the frame dies nat_hard instead).
+    _slcid1 = _fv0(pV0)
+    _slval1 = fetch_by_position([v2_], _slcid1 + One)[0]
+    _slcid2 = _fv0(qV0)
+    _slval2 = fetch_by_position([v2_], _slcid2 + One)[0]
+    _sl1 = (_kind_eq_raw(_slK1, K_SORT, One) + _kind_eq_raw(_slK1, K_FVAR, One)
+            + _kind_eq_raw(_slK1, K_MVAR, One) + _kind_eq_raw(_slK1, K_PI, One)
+            + _kind_eq_raw(_slK1, T_PI_CLO, One)
+            + reglu(_kind_eq_raw(_slK1, K_CONST, One),
+                    reglu(One - _is_zero(_slcid1),
+                          One - _geq_expr(_slval1, One)))
+            + reglu(_kind_eq_raw(_slK1, K_LIT, One),
+                    _geq_expr(_slV01, One)))
+    _sl2 = (_kind_eq_raw(_slK2, K_SORT, One) + _kind_eq_raw(_slK2, K_FVAR, One)
+            + _kind_eq_raw(_slK2, K_MVAR, One) + _kind_eq_raw(_slK2, K_PI, One)
+            + _kind_eq_raw(_slK2, T_PI_CLO, One)
+            + reglu(_kind_eq_raw(_slK2, K_CONST, One),
+                    reglu(One - _is_zero(_slcid2),
+                          One - _geq_expr(_slval2, One)))
+            + reglu(_kind_eq_raw(_slK2, K_LIT, One),
+                    _geq_expr(_slV02, One)))
+    _nat_caller = _kind_eq_raw(frV0, TASK_NAT, One)
+    fire2 = reglu(reglu(natop, op_arity2),
+                  reglu(pend_nonempty, reglu(has2,
+                        One - reglu(_nat_caller, _sl1 + _sl2))))
+    fire1 = reglu(reglu(natop, op_arity1),
+                  reglu(pend_nonempty, One - reglu(_nat_caller, _sl1)))
 
     # ── P6.5 iota: Nat.rec dispatch (kernel inductive_reduce_rec) ───────────
     # ENV_HDR.X = OP_REC gates the recursor const; major_idx=3 means the
@@ -1003,8 +1064,16 @@ def build_step_graph():
     # name-keyed scan); if either is absent from the env the loop declines and
     # the spine stays stuck rather than emitting a bogus hardcoded cid.
     rec_ids_ok = reglu(_REC_OK, _PRED_OK)
+    # C-16.7 缺口 A (memo 023 §2): the completed major may be a
+    # `Nat.succ <field>` ctor app — the fire-decline above lets it survive
+    # whnf head-normal, so the focus is the peeled Const(Nat.succ) and the
+    # field entry sits on the pend top.  The kernel matches the succ rule on
+    # the ctor head and passes the field into the rhs (K/inductive.h:100/:114).
+    ctor_succ_head = reglu(_kind_eq_raw(fK, K_CONST, One),
+                           _eq_expr(fV0, _SUCC_CID))
+    rec_ctor = reglu(rec_dn, ctor_succ_head)
     build_r = reglu(reglu(rec_dn, rec_ids_ok),
-                    reglu(is_lit_r, One - is_zlit_r))
+                    reglu(is_lit_r, One - is_zlit_r) + rec_ctor)
     stuck_r = reglu(rec_dn, One - zero_r - build_r)
 
     # ── P7.5b casesOn: major-premise delivery under NAT(OP_CASESON, ., 1) ────
@@ -1033,7 +1102,14 @@ def build_step_graph():
     # Same metadata-driven pred-id gate as the Nat.rec build loop.
     cs_succ_r = reglu(reglu(cs_dn, rec_ids_ok),
                       reglu(is_lit_r, One - is_zlit_r))
-    cs_stuck_r = reglu(cs_dn, One - cs_zero_r - cs_succ_r)
+    # ctor-app major (see ctor_succ_head above): the rec build's LINK chain
+    # carries the field env, so OP_REC enters the build loop via rec_ctor,
+    # while the cs flat build cannot (the p2_ctor lesson), so cs delivers
+    # DIRECTLY: focus = the succ minor in its home env, pend = the field
+    # entry ++ extras (beta binds the field with the entry's own env).
+    cs_ctor = reglu(cs_dn, ctor_succ_head)
+    cs_ctor_r = reglu(cs_ctor, rec_ids_ok)
+    cs_stuck_r = reglu(cs_dn, One - cs_zero_r - cs_succ_r - cs_ctor_r)
 
     # ── P7.5b-3 P2.casesOn: major delivery under NAT(OP_CASESON_P2, ., 1) ────
     # The major whnf's to a stuck `P2.mk a b` ctor app (focus SA = the outer
@@ -1505,6 +1581,11 @@ def build_step_graph():
     E_dn1 = _select(_kind_eq_raw(frV1, OP_SUCC, One), Zero, One)  # pred: borrow
     F_dn1 = _select(_kind_eq_raw(frV1, OP_SUCC, One)
                     + _kind_eq_raw(frV1, OP_PRED, One), c2, Zero)
+    # pred shape rule (pred_ctor_r): deliver the succ-app's field (pend top,
+    # env on the entry), popping the field entry off the pend (extras stay)
+    # and the NAT(pred) frame with it.
+    A_predctor, B_predctor, C_predctor, D_predctor = pV0, pX, pV2, frV2
+    E_predctor, F_predctor = Zero, SF
 
     # ── P6.5 iota branch states ─────────────────────────────────────────────
     # fire_rec: focus = major-premise closure (pend popped to extras); the
@@ -1549,6 +1630,11 @@ def build_step_graph():
     # the cs_build loop (B = step ctr); focus stays at the completed major SA.
     A_succ_cs, B_succ_cs, C_succ_cs, D_succ_cs = SA, Zero, cs_extras, c1   # M5: re-derived extras
     E_succ_cs, F_succ_cs = Zero, SF
+    # ctor-app major (cs_ctor_r): DIRECT delivery — focus = the succ minor in
+    # its home env, pend = the field entry ++ extras as the decline-path left
+    # them (no compute ran, so the pend is not clobbered); pop the NAT frame.
+    A_ctor_cs, B_ctor_cs, C_ctor_cs, D_ctor_cs = rsuccV0_c, rsuccX_c, SC, frV2
+    E_ctor_cs, F_ctor_cs = Zero, SF
 
     # ── P7.5b-3 P2.casesOn branch states ─────────────────────────────────────
     # fire: focus = t (pend head), pop the 3 spine entries (C = alt entry's
@@ -3076,28 +3162,36 @@ def build_step_graph():
     sidx = _fv0(dqE2)
     # ── Phase 5 M3: proj-reduction peel (I_PROJ continuation reads the
     # whnf'd child in SA; the proj token sits at frV1, its idx in V1). The
-    # child must be a fully applied 2-field P2.mk spine App(App(Const(18),a),b)
-    # — the only non-rec structure in the toy env (TOY_STRUCTS). field =
-    # idx==0 ? a (inner/fst) : b (outer/snd); else the proj re-sticks.
-    pr_cK = fetch_by_position([k_], SA)[0]            # child whnf kind
-    pr_oV0 = _fv0(SA)         # inner App pos
-    pr_oV1 = fetch_by_position([v1_], SA)[0]         # outer arg (snd)
-    pr_iK = fetch_by_position([k_], pr_oV0)[0]
-    pr_iV0 = _fv0(pr_oV0)     # ctor pos
-    pr_iV1 = fetch_by_position([v1_], pr_oV0)[0]     # inner arg (fst)
-    pr_mK = fetch_by_position([k_], pr_iV0)[0]
-    pr_mCid = _fv0(pr_iV0)
+    # field extraction is the kernel's reduce_proj_core
+    # (K/type_checker.cpp:420-441): peel the child's full app spine, the head
+    # must be a constructor of the projected structure (its inductive NAME
+    # equals the proj's sname — `mk_val.get_induct() != sname` rejects, :434),
+    # and the field is `args[nparams + idx]` (:436-440, nparams from the
+    # inductive metadata).  This replaces the old P2-only 2-arg spine
+    # `App(App(Const(18),a),b)`: a REAL universe-polymorphic accessor produces
+    # a 2-param + 2-field ctor app `@UProd.mk u α β a b` that the 2-arg rule
+    # never matched → the proj re-stuck and the accessor whnf diverged
+    # (g04b_c2_probe2.log: 2000 steps / 4GB; card 015 component 3).  The P2
+    # toy case (nparams=0, 2 args) falls out of the same rule unchanged.
     pr_idx = fetch_by_position([v1_], frV1)[0]       # proj token V1 (field idx)
     pr_sname = fetch_by_position([v0_], frV1)[0]     # proj token V0 (sname nid)
-    # Metadata-driven structure match: the child's head is a constructor of a
-    # non-recursive inductive with nfields==2, and its inductive NAME (nid)
-    # equals the projection's own sname. No hardcoded P2/P2.mk cid.
-    pr_full = reglu(reglu(reglu(
-                _kind_eq_raw(pr_cK, K_APP, One),
-                _kind_eq_raw(pr_iK, K_APP, One)),
-                _kind_eq_raw(pr_mK, K_CONST, One)),
-                reglu(_is_struct_ctor2(pr_mCid),
-                      _eq_expr(_struct_nid(pr_mCid), pr_sname)))
+    pr_nodes = [SA]
+    for _ in range(SPINE_MAX):
+        pr_nodes.append(fetch_by_position([v0_], pr_nodes[-1])[0])
+    pr_arity = _app_arity(SA, SPINE_MAX)             # get_app_num_args
+    pr_head = _head_of(SA, SPINE_MAX)                # get_app_fn
+    pr_hK = fetch_by_position([k_], pr_head)[0]
+    pr_hCid = _fv0(pr_head)
+    pr_hind = _struct_ind(pr_hCid)                   # induct cid of the head
+    pr_hind_ok = reglu(_is_ctor_any(pr_hCid),
+                       _eq_expr(_struct_nid(pr_hCid), pr_sname))
+    pr_np = fetch_by_position([v1_], _mhead(pr_hind))[0]   # nparams
+    pr_j = _to_expr(pr_np) + _to_expr(pr_idx)        # field slot in the args
+    pr_full = reglu(reglu(_kind_eq_raw(pr_hK, K_CONST, One), pr_hind_ok),
+                    _geq_expr(pr_arity, pr_j + One))
+    # args[j] sits on the app node (arity-1-j) V0-hops in from the root.
+    pr_field = fetch_by_position([v1_],
+                                 _pick(pr_nodes, pr_arity - One - pr_j))[0]
     def _value_eq_n(n, d0):
         """1 if a lit chain with n digits, digit0 = d0, has value 0."""
         return _eq_expr(n, Zero) + reglu(_eq_expr(n, One),
@@ -3109,10 +3203,23 @@ def build_step_graph():
                        fetch_by_position([v1_], head)[0] + One, Zero)
 
     # continuation-id gates
-    def gid(n):
-        return _kind_eq_raw(frF2, n, One)
+    # C-16.7 mode carrier (memo 023 §3, 3-甲): an ST continuation F2 encodes
+    # cont_id + 128*checker_mode (MODE_STRIDE); the decode strips it once
+    # here.  is_st_frame gates mode_st so a DEFEQ frame's F2 = s_env (a
+    # position that can exceed 128) never decodes as a mode (B3 audit);
+    # mode=0 restores frF2 value-for-value (legacy streams unchanged).
+    MODE_STRIDE = 128
+    mode_st = reglu(is_st_frame, _geq_expr(frF2, One * MODE_STRIDE))
+    fid = frF2 - mode_st * MODE_STRIDE
 
-    g = {n: gid(n) for n in range(1, 70)}
+    def gid(n):
+        return _kind_eq_raw(fid, n, One)
+
+    def mid(n, m):
+        """continuation id with the mode high slot (m is a 0/1 gate)"""
+        return Expression({_one_dim: n}) + m * MODE_STRIDE
+
+    g = {n: gid(n) for n in range(1, 71)}
     # CONT-tree gates must be mode-gated: frF2 on non-ST frames (e.g. the
     # DEFEQ frame's F2 = s_env) can collide with a continuation id.
     cg = {n: reglu(g[n], cont_mode) for n in g}
@@ -3159,7 +3266,7 @@ def build_step_graph():
     fr1_V1 = _select(cg[I_FN], Zero, fr1_V1)
     fr1_X = _select(cg[I_FN], Zero, fr1_X)
     fr1_E2 = _select(cg[I_FN], frE2, fr1_E2)
-    fr1_F2 = _select(cg[I_FN], Expression({_one_dim: I_PI}), fr1_F2)
+    fr1_F2 = _select(cg[I_FN], mid(I_PI, mode_st), fr1_F2)
     fr2_V2 = _select(cg[I_FN], c1, fr2_V2)
     D_c = _select(cg[I_FN], c2, D_c)
     # soft-infer cascade: the fn's type infer failed (A=0 marker landed on
@@ -3186,11 +3293,13 @@ def build_step_graph():
     # soft chains peel to I_ARG_S (kernel infer_only spine: no arg-vs-domain
     # DEFEQ, K/type_checker.cpp:189-205); hard chains keep I_ARG (:174-188).
     fr1_F2 = _select(cg[I_PI],
-                     _select(soft_flag, Expression({_one_dim: I_ARG_S}),
-                             Expression({_one_dim: I_ARG})), fr1_F2)
+                     _select(soft_flag, mid(I_ARG_S, mode_st),
+                             mid(I_ARG, mode_st)), fr1_F2)
     fr2_task = _select(cg[I_PI], Expression({_one_dim: TASK_INFER}), fr2_task)
     fr2_V2 = _select(cg[I_PI], c1, fr2_V2)
-    fr2_E2 = _select(cg[I_PI], One, fr2_E2)
+    # C-16.7: the arg infer inherits the mode from this ST's own F2
+    fr2_E2 = _select(cg[I_PI], One + reglu(mode_st, One * CHECK_E2_STRIDE),
+                     fr2_E2)
     # inherit the soft-infer flag from the task frame (walk STs: V2 = task)
     fr2_F2 = _select(cg[I_PI], soft_flag, fr2_F2)
     D_c = _select(cg[I_PI], c2, D_c)
@@ -3236,7 +3345,7 @@ def build_step_graph():
     fr1_V1 = _select(cg[I_ARG], frV1, fr1_V1)
     fr1_X = _select(cg[I_ARG], frX, fr1_X)
     fr1_E2 = _select(cg[I_ARG], frE2, fr1_E2)
-    fr1_F2 = _select(cg[I_ARG], Expression({_one_dim: I_CHK}), fr1_F2)
+    fr1_F2 = _select(cg[I_ARG], mid(I_CHK, mode_st), fr1_F2)
     fr2_task = _select(cg[I_ARG], Expression({_one_dim: TASK_DEFEQ}), fr2_task)
     fr2_V1 = _select(cg[I_ARG], SA, fr2_V1)     # t = arg type
     fr2_X = _select(cg[I_ARG], SB, fr2_X)
@@ -3306,7 +3415,7 @@ def build_step_graph():
     fr1_V1 = _select(chk_ok, tV1, fr1_V1)
     fr1_X = _select(chk_ok, c1, fr1_X)
     fr1_E2 = _select(chk_ok, _select(i_more, paV2, Zero), fr1_E2)
-    fr1_F2 = _select(chk_ok, Expression({_one_dim: I_PI}), fr1_F2)
+    fr1_F2 = _select(chk_ok, mid(I_PI, mode_st), fr1_F2)
     fr2_V2 = _select(chk_ok, c2, fr2_V2)
     E_c = _select(chk_ok, _select(i_more, Zero, One), E_c)
     D_c = _select(chk_ok, _select(i_more, c3, frV2), D_c)
@@ -3351,7 +3460,7 @@ def build_step_graph():
     fr1_V1 = _select(args_walk, SA, fr1_V1)
     fr1_X = _select(args_walk, c1, fr1_X)
     fr1_E2 = _select(args_walk, paV2, fr1_E2)
-    fr1_F2 = _select(args_walk, Expression({_one_dim: I_ARG_S}), fr1_F2)
+    fr1_F2 = _select(args_walk, mid(I_ARG_S, mode_st), fr1_F2)
     fr2_task = _select(args_walk, Expression({_one_dim: TASK_WHNF}), fr2_task)
     fr2_V2 = _select(args_walk, c2, fr2_V2)
     fr2_E2 = _select(args_walk, Zero, fr2_E2)
@@ -3366,7 +3475,7 @@ def build_step_graph():
     fr1_V1 = _select(cg[I_LAMDOM], frV1, fr1_V1)
     fr1_X = _select(cg[I_LAMDOM], frX, fr1_X)
     fr1_E2 = _select(cg[I_LAMDOM], frE2, fr1_E2)
-    fr1_F2 = _select(cg[I_LAMDOM], Expression({_one_dim: I_LAMSORT}), fr1_F2)
+    fr1_F2 = _select(cg[I_LAMDOM], mid(I_LAMSORT, mode_st), fr1_F2)
     fr2_V2 = _select(cg[I_LAMDOM], c1, fr2_V2)
     C_c = _select(cg[I_LAMDOM], Zero, C_c)
     F_c = _select(cg[I_LAMDOM], Zero, F_c)
@@ -3404,11 +3513,13 @@ def build_step_graph():
     fr1_V1 = _select(cg[I_LAMSORT], frV1, fr1_V1)
     fr1_X = _select(cg[I_LAMSORT], frX, fr1_X)
     fr1_E2 = _select(cg[I_LAMSORT], frE2, fr1_E2)
-    fr1_F2 = _select(cg[I_LAMSORT], Expression({_one_dim: I_LAMBODY}), fr1_F2)
+    fr1_F2 = _select(cg[I_LAMSORT], mid(I_LAMBODY, mode_st), fr1_F2)
     fr2_task = _select(cg[I_LAMSORT], Expression({_one_dim: TASK_INFER}),
                        fr2_task)
     fr2_V2 = _select(cg[I_LAMSORT], c2, fr2_V2)
-    fr2_E2 = _select(cg[I_LAMSORT], One, fr2_E2)
+    # C-16.7: the lam-body infer inherits the mode from this ST's own F2
+    fr2_E2 = _select(cg[I_LAMSORT],
+                     One + reglu(mode_st, One * CHECK_E2_STRIDE), fr2_E2)
     fr2_F2 = _select(cg[I_LAMSORT], soft_flag, fr2_F2)
     A_c = _select(cg[I_LAMSORT], frE2, A_c)     # body pos
     B_c = _select(cg[I_LAMSORT], c1, B_c)       # marker env
@@ -3575,7 +3686,7 @@ def build_step_graph():
     fr1_V1 = _select(cg[I_LETV], frV1, fr1_V1)
     fr1_X = _select(cg[I_LETV], frX, fr1_X)
     fr1_E2 = _select(cg[I_LETV], frE2, fr1_E2)       # keep the LET token pos
-    fr1_F2 = _select(cg[I_LETV], Expression({_one_dim: I_LETD}), fr1_F2)
+    fr1_F2 = _select(cg[I_LETV], mid(I_LETD, mode_st), fr1_F2)
     fr2_task = _select(cg[I_LETV], Expression({_one_dim: TASK_DEFEQ}), fr2_task)
     fr2_V1 = _select(cg[I_LETV], SA, fr2_V1)
     fr2_X = _select(cg[I_LETV], SB, fr2_X)
@@ -3612,7 +3723,9 @@ def build_step_graph():
     fr2_V1 = _select(cg[I_LETD], let_body, fr2_V1)   # LET body
     fr2_X = _select(cg[I_LETD], c1, fr2_X)           # marker env
     fr2_V2 = _select(cg[I_LETD], frV2, fr2_V2)
-    fr2_E2 = _select(cg[I_LETD], One, fr2_E2)
+    # C-16.7: the let-body infer inherits the mode from this ST's own F2
+    fr2_E2 = _select(cg[I_LETD], One + reglu(mode_st, One * CHECK_E2_STRIDE),
+                     fr2_E2)
     fr2_F2 = _select(cg[I_LETD], soft_flag, fr2_F2)
     A_c = _select(cg[I_LETD], let_body, A_c)         # body
     B_c = _select(cg[I_LETD], c1, B_c)
@@ -3683,6 +3796,41 @@ def build_step_graph():
                        reglu(_lvl_eq(a, b, LVL_DEPTH),
                              _lvl_chain_eq(a_nx, b_nx, depth - 1))))
         return reglu(a_end, b_end) + step
+
+    # ── normalizes_to_zero circuit (D8, K/level.cpp:174-186) ────────────────
+    # Single-tree recursion (unlike _lvl_eq's paired compare): 1 iff the level
+    # tree rooted at `pos` normalizes to zero.  Kernel rules verbatim:
+    #   Zero→1; Param/MVar/Succ→0; Max→n2z(lhs) ∧ n2z(rhs); IMax→n2z(rhs)
+    # only (`mk_imax` returns its rhs whenever the rhs is zero, so the lhs
+    # contributes nothing, K/level.cpp:112-123 + :174-186).
+    # The recursion is a full binary unroll over the depth cap: a Max node
+    # branches into both children at RUNTIME, so every build-time subtree must
+    # exist; the per-node kind gates keep the verdict 0/1 and mutually
+    # exclusive (kinds are disjoint), so a Succ/Param/MVar node (or a NULL
+    # position past the tree edge) yields 0.  Depth cap 8: measured level
+    # trees are depth ≤ 3; the kernel has no depth notion, and a capped path
+    # yields 0 (not-prop) — the sound-incomplete direction (never an unsound
+    # accept), the same policy _lvl_eq documents for Max/IMax pairing.
+    LVL_N2Z_DEPTH = 8
+
+    def _n2z(pos, depth):
+        if depth <= 0:
+            return Zero
+        k = fetch_by_position([k_], pos)[0]
+        v0 = fetch_by_position([v0_], pos)[0]
+        v1 = fetch_by_position([v1_], pos)[0]
+        is_zero = _eq_expr(k, One * KL_ZERO)
+        is_max = _eq_expr(k, One * KL_MAX)
+        is_imax = _eq_expr(k, One * KL_IMAX)
+        # share the child subtrees: each node unrolls TWO children (the v1
+        # subtree feeds both the Max AND-gate and the IMax rhs rule), so a
+        # depth-d circuit is 2^d - 1 nodes (d=8 → 255), not a per-kind
+        # tripling.
+        nz_v0 = _n2z(v0, depth - 1)
+        nz_v1 = _n2z(v1, depth - 1)
+        return (reglu(is_zero, One)
+                + reglu(is_max, reglu(nz_v0, nz_v1))
+                + reglu(is_imax, nz_v1))
 
     # ── card 014 P1: is_def_eq positive cache (ADR 017; K/type_checker.cpp) ──
     # Kernel contract: the is_def_eq WRAPPER caches SUCCESS of every True
@@ -4466,12 +4614,16 @@ def build_step_graph():
     E_c = _select(cg[PI_TY], Zero, E_c)
     D_c = _select(cg[PI_TY], c2, D_c)
     # PI_LVL: ty_sort in (A,B); t_ty in (frV1,frX). is_prop ⇔ ty_sort is a
-    # K_SORT whose level root is KL_ZERO (level 0; the toy env's only Prop).
+    # K_SORT whose level normalizes to zero (D8, K/type_checker.cpp:383-389:
+    # `is_prop = normalizes_to_zero(sort_level(s))` — `Sort (imax 1 0)` is
+    # Prop without being syntactically `zero`).  The level judge is the n2z
+    # circuit over the level ROOT (single tree, sound-incomplete at depth
+    # cap), not a syntactic root-kind vs KL_ZERO compare: that rejected
+    # imax(succ 0,0)/max(0,0) with code 8 where the kernel accepts.
     pl_sk = fetch_by_position([k_], SA)[0]
     pl_lv = _fv0(SA)
-    pl_lvK = fetch_by_position([k_], pl_lv)[0]
     pl_prop = reglu(cg[PI_LVL], reglu(_kind_eq_raw(pl_sk, K_SORT, One),
-                                      _kind_eq_raw(pl_lvK, KL_ZERO, One)))
+                                      _n2z(pl_lv, LVL_N2Z_DEPTH)))
     pl_fall = reglu(cg[PI_LVL], One - pl_prop)
     # Prop → infer ns → s_ty (PI_D carries t_ty); focus = ns (from caller).
     fr1_V1 = _select(pl_prop, frV1, fr1_V1)       # t_ty pos
@@ -4919,7 +5071,7 @@ def build_step_graph():
     # NAT/ST arg frames of an in-flight nat-op argument, stranding the arg2
     # ST; a TASK frame popped by pop_task gives the same "proj ends the
     # whnf" effect without stranding).
-    pr_field = _select(_eq_expr(pr_idx, Zero), pr_iV1, pr_oV1)
+    # (pr_field is computed with the I_PROJ reads in the M3 peel section.)
     # P7.5c-M5: restore the enclosing pend saved in frE2 by proj_setup.  A
     # projection in FUNCTION position — `(P2.fst ih) k` in Nat.choose — must
     # apply its pending args after reducing to the field: the field may be a
@@ -5398,15 +5550,54 @@ def build_step_graph():
     E_c = _select(ck_next + ck_accept, Zero, E_c)
     F_c = _select(ck_next, Zero, F_c)
 
+    # ── card 011 G9: duplicate universe level parameters ───────────────────
+    # check_constant_val (K/environment.cpp:127-135) runs check_name (:128,
+    # driver-side G8) then check_duplicated_univ_params (:129, kernel :111-121
+    # — each param compared against the REST of the list, O(n²) pairwise, on a
+    # hit throwing a plain kernel_exception "duplicate universe level
+    # parameter" → class .other) BEFORE check_no_metavar_no_fvar (:130) and
+    # the checker.  The graph has no names: the declaration's lparams ride a
+    # T_ENV_LIST(role=2) chain (the §12.1 univparams shape) whose head enters
+    # on the TASK_CHECK anchor's F2 slot (legacy drivers write 0 → arm inert).
+    # The scan is a resume-mode continuation loop (D_SP1/LITL peel style): the
+    # focus carries A = OUTER cell, B = INNER cell, one cell-fetch pair per
+    # micro-step, nid equality on V1 (interred name ids are stream data, no
+    # name branch — acceptance rule 3); a hit rejects with new code 10.  The
+    # loop frame also carries the declaration (V1/X/V2/E2 = type/value/next/
+    # kind, identical to the ordinary kickoff ST), so on exhaustion the arm
+    # re-emits the kickoff pair from the frame — and g7's fvar/mvar root check
+    # (kernel order: AFTER the dup scan) defers to that same done step.
+    g9_armed = _geq_expr(frF2, One)                  # anchor F2 = chain head
+    ck_kick0 = reglu(ck_kick, One - g9_armed)        # legacy (byte-old) kick
+    g9_headnx = fetch_by_position([x_], frF2)[0]     # head cell's next
+    g9_step = reglu(resume_mode, g[CK_G9])           # scan loop frame
+    g9_oN = fetch_by_position([v1_], SA)[0]          # outer param (nid)
+    g9_oX = fetch_by_position([x_], SA)[0]           # outer next
+    g9_iN = fetch_by_position([v1_], SB)[0]          # inner param (nid)
+    g9_iX = fetch_by_position([x_], SB)[0]           # inner next
+    g9_hasin = _geq_expr(SB, One)                    # inner chain non-empty
+    g9_hit = reglu(g9_step, reglu(g9_hasin, _eq_expr(g9_oN, g9_iN)))
+    g9_inn = reglu(g9_step, reglu(g9_hasin, One - g9_hit))  # advance inner
+    g9_oon = reglu(g9_step, reglu(One - g9_hasin, g9_oX))   # next outer cell
+    g9_done = reglu(g9_step, reglu(One - g9_hasin, One - g9_oX))
+    g9_onx = fetch_by_position([x_], g9_oX)[0]       # that cell's next
+    g9_run = g9_inn + g9_oon + g9_done
+    rej_r = rej_r + g9_hit
+
     # ── WP7-G7 / G1: declaration well-formedness in the CHECK channel ──────
-    # G7 (K/environment.cpp:87-95, declHasMVars/declHasFVars run BEFORE
-    # check_constant_val): a root K_FVAR/K_MVAR token on either the declared
+    # G7 (K/environment.cpp:87-95, declHasMVars/declHasFVars — inside
+    # check_constant_val :130, so AFTER the G9 dup-univ scan and before the
+    # checker): a root K_FVAR/K_MVAR token on either the declared
     # type or the value rejects with code 6 ("declaration has free
     # variables", plain kernel_exception → .other class). Root-only is a
     # documented approximation; nested leaks into the infer-path rejects.
+    # Card 011 G9: when the anchor armed the lparams scan (g9_armed), the
+    # check DEFERS to the scan's done step (the same frV1/frX roots re-read
+    # from the scan frame) — preserving the kernel's name → dup-univ → fvar
+    # order without re-walking the anchor.
     g7_k_t = fetch_by_position([k_], frV1)[0]
     g7_k_v = fetch_by_position([k_], frX)[0]
-    g7 = reglu(ck_kick, _kind_eq_raw(g7_k_t, K_FVAR, One)
+    g7 = reglu(ck_kick0 + g9_done, _kind_eq_raw(g7_k_t, K_FVAR, One)
                + _kind_eq_raw(g7_k_t, K_MVAR, One)
                + _kind_eq_raw(g7_k_v, K_FVAR, One)
                + _kind_eq_raw(g7_k_v, K_MVAR, One))
@@ -5451,29 +5642,19 @@ def build_step_graph():
     # is_prop = ensure_sort(infer(e)) ∧ normalizes_to_zero(sort_level)
     # (K/type_checker.cpp:383-389), so the only test missing above is the
     # level-zero one, and it MUST use the same judge as the proof-irrelevance
-    # chain's pl_prop (level root kind vs KL_ZERO) — one level judge, not two
-    # (ADR 020 B).
-    # KNOWN DIVERGENCE (ADR 020 B; asserted in
-    # tests/test_decl_injection_vs_lean.py KNOWN_GAPS): the kernel's
-    # normalizes_to_zero (K/level.cpp:174-186) also accepts the NON-normalized
-    # forms imax(_,0) and max(0,0), which the syntactic root compare rejects →
-    # a theorem on such a stored type is a false code-8 reject. Universe
-    # normalization = matrix D1/D2 (card 012). Measured scope of the gap: the
-    # frontend never STORES an un-normalized level (a source-written
-    # `Sort (imax 1 0)` reaches the env as `Sort zero`), and the graph's INFER
-    # of a Pi whose body is a Prop already yields a KL_ZERO-root sort like
-    # infer_pi's mk_imax folding does (K/type_checker.cpp:163, K/level.cpp:112
-    # — differential case thm_arrow), so only env-stored raw levels diverge.
+    # chain's pl_prop — one level judge, not two (ADR 020 B).  Both judges are
+    # the n2z circuit over the level ROOT (single tree, sound-incomplete at
+    # depth cap), which also accepts the kernel's non-normalized forms
+    # imax(_,0) and max(0,0) (K/level.cpp:174-186; ADR 022 component 1).
     # Kind is DATA from the anchor E2 slot (ENV_FORMAT §2.8), decoded
     # mode-independently: add_theorem always builds a SAFE checker
     # (K/environment.cpp:196), so is_prop must not depend on the checker mode.
     g3_mode = _geq_expr(frE2, Expression({_one_dim: CHECK_E2_STRIDE}))
     g3_kind = frE2 - reglu(Expression({_one_dim: CHECK_E2_STRIDE}), g3_mode)
-    g3_lvK = fetch_by_position([k_], _fv0(SA))[0]
     g3 = reglu(reglu(ck_g1_ok,
                      _eq_expr(g3_kind,
                               Expression({_one_dim: CHECK_KIND_THEOREM}))),
-               One - _kind_eq_raw(g3_lvK, KL_ZERO, One))
+               One - _n2z(_fv0(SA), LVL_N2Z_DEPTH))
     rej_c = rej_c + g3
     rej_code_c = rej_code_c + reglu(g3, One * 8)
     # WP7-G5 (K/environment.cpp:152-158, add_axiom → check_constant_val
@@ -5525,11 +5706,46 @@ def build_step_graph():
     ck_mode_k = _geq_expr(frE2, Expression({_one_dim: CHECK_E2_STRIDE}))
     fr1_task_k, fr1_V1_k, fr1_V2_k, fr1_X_k, fr1_E2_k, fr1_F2_k = \
         Expression({_one_dim: TASK_ST}), frV1, frV2, frX, frE2, \
-        Expression({_one_dim: CK_G0})
+        _select(g9_armed, Expression({_one_dim: CK_G9}),
+                Expression({_one_dim: CK_G0}))
     fr2_task_k, fr2_V1_k, fr2_V2_k, fr2_X_k, fr2_E2_k, fr2_F2_k = \
         Expression({_one_dim: TASK_INFER}), Zero, c1, Zero, \
         One + reglu(ck_mode_k, One * CHECK_E2_STRIDE), Zero
-    A_k, B_k, C_k, D_k, E_k, F_k = frV1, Zero, Zero, c2, Zero, Zero
+    # card 011 G9: an armed kickoff launches the scan instead of the value-
+    # infer (frame1 = the scan ST carrying the declaration, D = c1, focus =
+    # (chain head, head's next) — the loop registers below).  The fr2 payload
+    # is untouched: em_frame2 gates the plain kick with ck_kick0, so on the
+    # armed beat the INFER slot writes a dead token.
+    A_k = _select(g9_armed, frF2, frV1)
+    B_k = _select(g9_armed, g9_headnx, Zero)
+    C_k, E_k, F_k = Zero, Zero, Zero
+    D_k = _select(g9_armed, c1, c2)
+
+    # G9 resume-tree transitions (the scan loop re-pushes its own frame with
+    # the declaration payload — defaults fr1_V2_r = frV2 and fr1_F2_r = frF2
+    # already carry next-anchor and loop id; the done step relaunches the
+    # ordinary kickoff pair off the frame: same values, F2 → CK_G0).
+    fr1_task_r = _select(g9_run, Expression({_one_dim: TASK_ST}), fr1_task_r)
+    fr1_V1_r = _select(g9_run, frV1, fr1_V1_r)
+    fr1_X_r = _select(g9_run, frX, fr1_X_r)
+    fr1_E2_r = _select(g9_run, frE2, fr1_E2_r)
+    fr1_F2_r = _select(g9_done, Expression({_one_dim: CK_G0}), fr1_F2_r)
+    fr2_task_r = _select(g9_done, Expression({_one_dim: TASK_INFER}),
+                         fr2_task_r)
+    fr2_V1_r = _select(g9_done, Zero, fr2_V1_r)
+    fr2_X_r = _select(g9_done, Zero, fr2_X_r)
+    fr2_E2_r = _select(g9_done, One + reglu(ck_mode_k, One * CHECK_E2_STRIDE),
+                       fr2_E2_r)
+    A_r = _select(g9_oon, g9_oX, A_r)
+    A_r = _select(g9_done, frV1, A_r)
+    B_r = _select(g9_inn, g9_iX, B_r)
+    B_r = _select(g9_oon, g9_onx, B_r)
+    B_r = _select(g9_done, Zero, B_r)
+    C_r = _select(g9_run, Zero, C_r)
+    D_r = _select(g9_inn + g9_oon, c1, D_r)
+    D_r = _select(g9_done, c2, D_r)
+    E_r = _select(g9_run, Zero, E_r)
+    F_r = _select(g9_run, Zero, F_r)
 
     # ── INFER frame dispatch (task=6; focus = (A,B), phase in E2) ───────────
     A_i = SA
@@ -5603,7 +5819,7 @@ def build_step_graph():
     C_i = _select(peel_end, Zero, C_i)
     F_i = _select(peel_end, Zero, F_i)
     fr1_E2_i = _select(peel_end, c1, fr1_E2_i)       # args chain head
-    fr1_F2_i = _select(peel_end, Expression({_one_dim: I_FN}), fr1_F2_i)
+    fr1_F2_i = _select(peel_end, mid(I_FN, inf_mode), fr1_F2_i)
     fr2_task_i = _select(peel_end, Expression({_one_dim: TASK_INFER}),
                          fr2_task_i)
     fr2_V2_i = _select(peel_end, c2, fr2_V2_i)
@@ -5618,7 +5834,7 @@ def build_step_graph():
     fr1_V1_i = _select(lam_i, fV0, fr1_V1_i)
     fr1_X_i = _select(lam_i, SB, fr1_X_i)
     fr1_E2_i = _select(lam_i, fV1, fr1_E2_i)
-    fr1_F2_i = _select(lam_i, Expression({_one_dim: I_LAMDOM}), fr1_F2_i)
+    fr1_F2_i = _select(lam_i, mid(I_LAMDOM, inf_mode), fr1_F2_i)
     fr2_task_i = _select(lam_i, Expression({_one_dim: TASK_INFER}), fr2_task_i)
     fr2_V2_i = _select(lam_i, c1, fr2_V2_i)
     # card 010 G03: the lam-DOMAIN infer inherits the mode bit
@@ -5633,7 +5849,7 @@ def build_step_graph():
     fr1_V1_i = _select(pi_i, fV0, fr1_V1_i)
     fr1_X_i = _select(pi_i, SB, fr1_X_i)
     fr1_E2_i = _select(pi_i, fV1, fr1_E2_i)
-    fr1_F2_i = _select(pi_i, Expression({_one_dim: I_PIDOM}), fr1_F2_i)
+    fr1_F2_i = _select(pi_i, mid(I_PIDOM, inf_mode), fr1_F2_i)
     fr2_task_i = _select(pi_i, Expression({_one_dim: TASK_INFER}), fr2_task_i)
     fr2_V2_i = _select(pi_i, c1, fr2_V2_i)
     # card 010 G03: the pi-DOMAIN infer inherits the mode bit.
@@ -5647,7 +5863,7 @@ def build_step_graph():
     fr1_V1_i = _select(let_i, fV0, fr1_V1_i)         # declared type pos
     fr1_X_i = _select(let_i, SB, fr1_X_i)
     fr1_E2_i = _select(let_i, SA, fr1_E2_i)          # LET token pos (for I_LETD body fetch)
-    fr1_F2_i = _select(let_i, Expression({_one_dim: I_LETV}), fr1_F2_i)
+    fr1_F2_i = _select(let_i, mid(I_LETV, inf_mode), fr1_F2_i)
     fr2_task_i = _select(let_i, Expression({_one_dim: TASK_INFER}), fr2_task_i)
     fr2_V2_i = _select(let_i, c1, fr2_V2_i)
     # card 010 G03: the let-VALUE infer inherits the mode bit.
@@ -5732,7 +5948,7 @@ def build_step_graph():
     # frame is the only frame pushed (no LEVEL sub-task), so it lands at c1;
     # its V1 carries the Sort token position for I_SORTEM to read V0 from.
     sort_i = reglu(ph1, _kind_eq_raw(fK, K_SORT, One))
-    fr1_F2_i = _select(sort_i, Expression({_one_dim: I_SORTEM}), fr1_F2_i)
+    fr1_F2_i = _select(sort_i, mid(I_SORTEM, inf_mode), fr1_F2_i)
     fr1_V1_i = _select(sort_i, SA, fr1_V1_i)        # Sort token pos
     A_i = _select(sort_i, SA, A_i)
     B_i = _select(sort_i, SB, B_i)
@@ -5751,7 +5967,7 @@ def build_step_graph():
     proj_i = reglu(ph1, is_proj)
     fr1_V1_i = _select(proj_i, fV0, fr1_V1_i)       # proj sname nid
     fr1_X_i = _select(proj_i, fV1, fr1_X_i)         # field idx
-    fr1_F2_i = _select(proj_i, Expression({_one_dim: IP_TY}), fr1_F2_i)
+    fr1_F2_i = _select(proj_i, mid(IP_TY, inf_mode), fr1_F2_i)
     fr2_task_i = _select(proj_i, Expression({_one_dim: TASK_INFER}),
                          fr2_task_i)
     fr2_V2_i = _select(proj_i, c1, fr2_V2_i)
@@ -5863,7 +6079,15 @@ def build_step_graph():
     wV2 = fetch_by_position([v2_], wpos)[0]
     nat_soft = reglu(natbad, _eq_expr(wE2, One))
     nat_hard = reglu(natbad, One - _eq_expr(wE2, One))
-    rej_n = nat_hard
+    # C-16.7 pred shape rule (memo 023 §2 item 3): `Nat.pred (Nat.succ X) → X`.
+    # The kernel reduces this by delta-unfolding Nat.pred and iota-matching
+    # the ctor-app major (K/inductive.h:100) — NOT via reduce_nat — so the
+    # rule fires in soft and hard contexts alike, ahead of the nat_soft
+    # original-closure delivery.  The declined succ arg completed peeled:
+    # focus = Const(Nat.succ), field entry = pend top (its env rides pX).
+    pred_ctor_r = reglu(reglu(natbad1, _kind_eq_raw(frV1, OP_PRED, One)),
+                        ctor_succ_head)
+    rej_n = reglu(nat_hard, One - pred_ctor_r)
     rej_code_n = reglu(nat_hard, One)
 
 
@@ -5941,7 +6165,8 @@ def build_step_graph():
                  _select(fire2, A_fire2,
                  _select(fire1, A_fire1,
                  _select(d12, A_d12,
-                 _select(nat_soft, A_ns,
+                 _select(pred_ctor_r, A_predctor,
+             _select(nat_soft, A_ns,
                  _select(d23, A_d23,
                  _select(dn1, A_dn1,
                  _select(fire_rec, A_fire_rec,
@@ -5952,6 +6177,7 @@ def build_step_graph():
                  _select(fire_caseson, A_fire_cs,
                  _select(cs_zero_r, A_zero_cs,
                  _select(cs_succ_r, A_succ_cs,
+                 _select(cs_ctor_r, A_ctor_cs,
                  _select(cs_stuck_r, A_stuck_cs,
                  _select(cs_sd, A_sd_cs,
                  _select(fire_p2, A_fire_p2,
@@ -5964,12 +6190,13 @@ def build_step_graph():
                  _select(bool_stuck_r, A_stuck_bool,
                  _select(bool_sd, A_sd_bool,
                  _select(whnf_deliver, A_done,
-                         A_main)))))))))))))))))))))))))))
+                         A_main)))))))))))))))))))))))))))))
     B_main_all = _select(proj_setup, SB,
                  _select(fire2, B_fire2,
                  _select(fire1, B_fire1,
                  _select(d12, B_d12,
-                 _select(nat_soft, B_ns,
+                 _select(pred_ctor_r, B_predctor,
+             _select(nat_soft, B_ns,
                  _select(d23, B_d23,
                  _select(dn1, B_dn1,
                  _select(fire_rec, B_fire_rec,
@@ -5980,6 +6207,7 @@ def build_step_graph():
                  _select(fire_caseson, B_fire_cs,
                  _select(cs_zero_r, B_zero_cs,
                  _select(cs_succ_r, B_succ_cs,
+                 _select(cs_ctor_r, B_ctor_cs,
                  _select(cs_stuck_r, B_stuck_cs,
                  _select(cs_sd, B_sd_cs,
                  _select(fire_p2, B_fire_p2,
@@ -5992,12 +6220,13 @@ def build_step_graph():
                  _select(bool_stuck_r, B_stuck_bool,
                  _select(bool_sd, B_sd_bool,
                  _select(whnf_deliver, SB,
-                         B_main)))))))))))))))))))))))))))
+                         B_main)))))))))))))))))))))))))))))
     C_main_all = _select(proj_setup, Zero,
                  _select(fire2, C_fire2,
                  _select(fire1, C_fire1,
                  _select(d12, C_d12,
-                 _select(nat_soft, C_ns,
+                 _select(pred_ctor_r, C_predctor,
+             _select(nat_soft, C_ns,
                  _select(d23, C_d23,
                  _select(dn1, C_dn1,
                  _select(fire_rec, C_fire_rec,
@@ -6008,6 +6237,7 @@ def build_step_graph():
                  _select(fire_caseson, C_fire_cs,
                  _select(cs_zero_r, C_zero_cs,
                  _select(cs_succ_r, C_succ_cs,
+                 _select(cs_ctor_r, C_ctor_cs,
                  _select(cs_stuck_r, C_stuck_cs,
                  _select(cs_sd, C_sd_cs,
                  _select(fire_p2, C_fire_p2,
@@ -6020,12 +6250,13 @@ def build_step_graph():
                  _select(bool_stuck_r, C_stuck_bool,
                  _select(bool_sd, C_sd_bool,
                  _select(whnf_deliver, SC,
-                         C_main)))))))))))))))))))))))))))
+                         C_main)))))))))))))))))))))))))))))
     D_main_all = _select(proj_setup, c2,
                  _select(fire2, D_fire2,
                  _select(fire1, D_fire1,
                  _select(d12, D_d12,
-                 _select(nat_soft, D_ns,
+                 _select(pred_ctor_r, D_predctor,
+             _select(nat_soft, D_ns,
                  _select(d23, D_d23,
                  _select(dn1, D_dn1,
                  _select(fire_rec, D_fire_rec,
@@ -6036,6 +6267,7 @@ def build_step_graph():
                  _select(fire_caseson, D_fire_cs,
                  _select(cs_zero_r, D_zero_cs,
                  _select(cs_succ_r, D_succ_cs,
+                 _select(cs_ctor_r, D_ctor_cs,
                  _select(cs_stuck_r, D_stuck_cs,
                  _select(cs_sd, D_sd_cs,
                  _select(fire_p2, D_fire_p2,
@@ -6048,12 +6280,13 @@ def build_step_graph():
                  _select(bool_stuck_r, D_stuck_bool,
                  _select(bool_sd, D_sd_bool,
                  _select(whnf_deliver, frV2,
-                         D_main)))))))))))))))))))))))))))
+                         D_main)))))))))))))))))))))))))))))
     E_main_all = _select(proj_setup, Zero,
                  _select(fire2, E_fire2,
                  _select(fire1, E_fire1,
                  _select(d12, E_d12,
-                 _select(nat_soft, E_ns,
+                 _select(pred_ctor_r, E_predctor,
+             _select(nat_soft, E_ns,
                  _select(d23, E_d23,
                  _select(dn1, E_dn1,
                  _select(fire_rec, E_fire_rec,
@@ -6064,6 +6297,7 @@ def build_step_graph():
                  _select(fire_caseson, E_fire_cs,
                  _select(cs_zero_r, E_zero_cs,
                  _select(cs_succ_r, E_succ_cs,
+                 _select(cs_ctor_r, E_ctor_cs,
                  _select(cs_stuck_r, E_stuck_cs,
                  _select(cs_sd, E_sd_cs,
                  _select(fire_p2, E_fire_p2,
@@ -6076,12 +6310,13 @@ def build_step_graph():
                  _select(bool_stuck_r, E_stuck_bool,
                  _select(bool_sd, E_sd_bool,
                  _select(whnf_deliver, One,
-                         E_main)))))))))))))))))))))))))))
+                         E_main)))))))))))))))))))))))))))))
     F_main_all = _select(proj_setup, Zero,
                  _select(fire2, F_fire2,
                  _select(fire1, F_fire1,
                  _select(d12, F_d12,
-                 _select(nat_soft, F_ns,
+                 _select(pred_ctor_r, F_predctor,
+             _select(nat_soft, F_ns,
                  _select(d23, F_d23,
                  _select(dn1, F_dn1,
                  _select(fire_rec, F_fire_rec,
@@ -6092,6 +6327,7 @@ def build_step_graph():
                  _select(fire_caseson, F_fire_cs,
                  _select(cs_zero_r, F_zero_cs,
                  _select(cs_succ_r, F_succ_cs,
+                 _select(cs_ctor_r, F_ctor_cs,
                  _select(cs_stuck_r, F_stuck_cs,
                  _select(cs_sd, F_sd_cs,
                  _select(fire_p2, F_fire_p2,
@@ -6104,7 +6340,7 @@ def build_step_graph():
                  _select(bool_stuck_r, F_stuck_bool,
                  _select(bool_sd, F_sd_bool,
                  _select(whnf_deliver, SF,
-                         F_main)))))))))))))))))))))))))))
+                         F_main)))))))))))))))))))))))))))))
 
     # WP3 general iota branches (mutually exclusive with the hardcoded iota /
     # casesOn branches above, so precedence is irrelevant).
@@ -6320,7 +6556,7 @@ def build_step_graph():
                    + proj_same + bind_k + deq_xpi + deq_sw0 + lvl_succ
                    + de_prj_f + deq_refl + deq_hargs + de_att_f
                    + ck_g0 + ck_g1_ok
-                   + cg[CK_TY] + ck_kick
+                   + cg[CK_TY] + ck_kick + g9_run
                    + proj_i + cg[IP_TY] + ip_setup + ip_more
                    # WP5-E5: pr_str re-pushes [ST(I_PROJ), WHNF(expansion)].
                    # WP5-E3b: es_str converts the ST frame into a DEFEQ frame.
@@ -6343,7 +6579,7 @@ def build_step_graph():
                     + cg[PI_T] + cg[PI_TY] + pl_prop
                     + et_app + cg[ETA_T] + et_spi
                     + es_app + cg[ES_T] + es_domok + es_next0
-                    + cg[CK_TY] + ck_kick
+                    + cg[CK_TY] + ck_kick0 + g9_done
                     + proj_i + cg[IP_TY]
                     + pr_str
                     + cg[ST_UL] + cg[UL_W] + ul_yes)
@@ -6595,7 +6831,8 @@ def build_step_graph():
                _select(is_iota_build, gi_pend_env, pend_env))
 
     em_frame = (walk_more - walk_fail + em_frame_bvar + fire1 + fire2
-                + d12 + d23_work + dn1 + em_frame_c + em_frame_m2 + proj_setup
+                + d12 + d23_work + dn1 - pred_ctor_r + em_frame_c
+                + em_frame_m2 + proj_setup
                 + fire_rec + build_r + fire_caseson + cs_succ_r
                 + fire_p2 + fire_bool + fire_iota + iota_build_r
                 + iota_str_r + fire_quot)
@@ -6614,11 +6851,18 @@ def build_step_graph():
     # (g1_fail needs !ck_g1_ok, g3 needs ck_g1_ok), and 7 fires on an INFER
     # step the machine only reaches after this arm accepted, so the chain
     # order records the kernel's check order rather than resolving a tie.
-    reject_code = _select(safety_i, One * 7,
+    # Card 011 G9 adds 10 = duplicate universe level parameter (kernel
+    # check_duplicated_univ_params throw, K/environment.cpp:111-121 →
+    # .other class).  The scan arms fire strictly BEFORE the deferred g7
+    # (6) and the CK_G0/CK_G1 chain (5/8) on the same declaration, so the
+    # placement records the kernel's check order; no arm can co-fire with
+    # g9_hit anyway (disjoint continuation modes).
+    reject_code = _select(g9_hit, One * 10,
+                  _select(safety_i, One * 7,
                   _select(g7, One * 6,
                   _select(g1_fail, One * 5,
                   _select(g3, One * 8,
-                  _select(bad_i + lvl_bad, One * 4, One)))))
+                  _select(bad_i + lvl_bad, One * 4, One))))))
 
     # head/gap/dig/const emission merge (main + compute)
     head_V0 = _select(d23_work, n_out_d23,

@@ -23,24 +23,37 @@ Sections
         B).  Row set = every judgment surface this beat added.
   g03   unsafe-mode checker arm (card 010 G3): self-reference accepted, later
         safe reference rejected with 7, whole-add rollback, unsafe mutual
-        block; app-arg/lam-body self-references are registered known gaps
-        (XFAIL — the mode bit cannot cross an ST-continuation hop).
+        block; app-arg/lam-body self-references were registered known gaps
+        until card 016 carried the mode across the ST hops (F2 = cont_id +
+        128*mode) — they now accept and left KNOWN_GAPS.
   g04   driver-side run_whnf continuation loop (card 010 G04, ADR016-B plan
         B): G1/a1 carriers (nat/lst/mu/iv/tree) + direct-Proj carriers
-        (proj family, rounds>=2/stop coverage, c2) re-launched TASK_WHNF until
+        (proj family, rounds>=2/stop coverage, c2) + ctor-major continuation
+        carriers (csctor family, card 016) re-launched TASK_WHNF until
         the focus stops advancing; FINAL result diffed verbatim against the
         live #ORACLE WHNF channel (Meta.whnf).  Environments are minimized
         per family (theorem values dropped + extras carrier-root closure;
         nat/proj keep the full toy base) so the
         Python evaluator stays inside the 6GB RSS discipline; delivery mode
-        runs one subprocess per family (handoff 006 G04).  iv/eG4IV2 is a
-        registered known gap (XFAIL — stuck Nat.casesOn whose major the
-        graph does not whnf; needs a graph-side fix, the loop cannot help).
+        runs one subprocess per family (handoff 006 G04).  iv/eG4IV2 was
+        resolved by card 016 (closure seeds + the graph's I_CASE ctor-major
+        continuation) and left KNOWN_GAPS.
+
+  g8    card 011 G8 duplicate-name injection: InjectionEnv bookkeeping
+        rejects with code 11 (kernel class alreadyDeclared, the dedicated
+        constructor — the oracle leg maps 1:1) before any graph pass; accept
+        and reject legs on all three kinds, plus the ordering legs (name
+        wins over declTypeMismatch / thmTypeIsNotProp).
+  g9    card 011 G9 duplicate universe level parameters: graph-side O(n²)
+        pairwise scan of the declaration's lparams chain (kernel
+        check_duplicated_univ_params, K/environment.cpp:111-121, class
+        "other") — new reject code 10, anchor F2 carrier.
 
 Run:  OMP_NUM_THREADS=3 python3 -u tests/test_decl_injection_vs_lean.py
 Dev subset (one graph case ≈ 16 s on this box; a full run is canary-class):
   G02_ONLY=guard G02_GUARD_LIMIT=2  python3 -u tests/... (first 2 guard cases)
-  G02_ONLY=guard                    python3 -u tests/test_decl_injection_vs_lean.py
+  G02_ONLY=g8                       python3 -u tests/test_decl_injection_vs_lean.py
+  G02_ONLY=g9,g9axm_dup             python3 -u tests/test_decl_injection_vs_lean.py
   G02_ONLY=bcd,thm_nat      python3 -u tests/test_decl_injection_vs_lean.py
   G04_FAMILY=nat            python3 -u tests/... (dev loop: run one G04
                             family IN-PROCESS; unset = delivery mode = one
@@ -149,9 +162,23 @@ def injRawG03 : Lean.Declaration := .defnDecl { name := `g03r_f, levelParams := 
 run_cmd do
   liftCoreM <| Lean.addDecl injRawG03
 """
-ALL_DEFS = TARGET_DEFS + "\n" + RAW_DEFS + INJ_DEFS + RAW_MUTUAL + RAW_G03
+# Card 011 G8: three base constants whose NAMES the G8 rows re-add through
+# add_{axiom,definition,theorem} — on the oracle side the #KDECL addDecl hits
+# environment.cpp check_name (class alreadyDeclared), on the driver side the
+# InjectionEnv name table rejects with code 11.  The graph leg must see the
+# same base environment, so these ride ALL_DEFS/MY_ROOTS like the G6/G03
+# preinjections above.  The base KIND is deliberately irrelevant (check_name
+# is a pure name lookup) and must stay `def`: import_env's M4 slice admits
+# only def/ctor/ind (reference/olean_export.py:572).
+G8_BASE_DEFS = """\
+def g8b_a : Nat := 2
+def g8b_d : Nat := 2
+def g8b_t : Nat := 2
+"""
+ALL_DEFS = (TARGET_DEFS + "\n" + RAW_DEFS + INJ_DEFS + RAW_MUTUAL + RAW_G03
+            + "\n" + G8_BASE_DEFS)
 MY_ROOTS = ROOTS + ["injX_imax", "injX_max", "injD_imax", "injD_max",
-                    "g06v_f", "g06v_g", "g03r_f"]
+                    "g06v_f", "g06v_g", "g03r_f", "g8b_a", "g8b_d", "g8b_t"]
 
 # Lean-side declaration constructors.  The name is per case so addDecl never
 # sees a duplicate.
@@ -184,10 +211,15 @@ E_X_MAX00 = "(mkConst ``injX_max)"
 # K/environment.cpp:78-85), 9 = mutual well-formedness (driver bookkeeping;
 # its oracle class is "other" — CODE_OF_CLASS is NOT extended with "other"
 # because that class also carries the unsafe-use message = code 7).
+# Card 011 adds: 10 = duplicate universe level parameters (G9, graph arm;
+# oracle class "other" again — plain kernel_exception, K/environment.cpp:
+# 111-121), 11 = alreadyDeclared (G8, driver bookkeeping; the kernel's
+# DEDICATED constructor, K/kernel_exception.h:32-37 → .alreadyDeclared at
+# :168-169; message text per src/Lean/Message.lean:896).
 CLASS_OF_CODE = {0: "accept", 1: "declTypeMismatch", 2: "unknownConstant",
                  4: "typeMismatch", 5: "typeExpected", 6: "declHasFVars",
                  7: "unsafeConstUse", 8: "thmTypeIsNotProp",
-                 9: "mutualWF"}
+                 9: "mutualWF", 10: "dupUnivParams", 11: "alreadyDeclared"}
 CODE_OF_CLASS = {"OK": 0, "typeExpected": 5, "thmTypeIsNotProp": 8,
                  "declTypeMismatch": 1}
 
@@ -196,17 +228,6 @@ CODE_OF_CLASS = {"OK": 0, "typeExpected": 5, "thmTypeIsNotProp": 8,
 # fail the run; a registered case that starts AGREEING reports [XPASS] and
 # fails the run (the entry must then be removed — no silent drift either way).
 KNOWN_GAPS = {
-    # G3 on a non-normalized level (ADR 020 B).  The kernel's
-    # normalizes_to_zero (K/level.cpp:174-186) accepts imax(_,0) and max(0,0);
-    # the graph reuses the syntactic root-vs-KL_ZERO judge (pl_prop,
-    # build_vm.py:4451-4457), so the theorem is falsely rejected with code 8.
-    # Universe normalization = matrix D1/D2, card 012.
-    "thm_imax": "kernel normalizes_to_zero(imax(succ 0, 0))=true → accept; "
-                "graph syntactic KL_ZERO root compare → reject 8 "
-                "(D2 gap, card 012; ADR 020 B)",
-    "thm_max00": "kernel normalizes_to_zero(max(0,0))=true → accept; graph "
-                 "syntactic KL_ZERO root compare → reject 8 "
-                 "(D1/D2 gap, card 012; ADR 020 B)",
     # G03 (card 010): the anchor E2's mode bit rides the TASK_INFER frames
     # launched by the CHECK chain (kickoff/ck_g1_val) and inside the INFER
     # dispatch (app fn, lam/pi/let domains+values, proj child), but NOT
@@ -215,31 +236,12 @@ KNOWN_GAPS = {
     # self-reference reached as an app ARGUMENT or under a lam/let BODY is
     # re-inferred mode-less and the G10 gate false-fires (code 7).  Measured
     # 2026-09-20 (handoff 006 G03 H2): kernel OK / graph 7 at 11 steps.
-    "g03g_arg_selfref": "kernel unsafe-mode checker accepts the self-reference "
-                        "as an application argument (K/environment.cpp:172-177); "
-                        "the graph loses the anchor's mode bit across the "
-                        "I_FN→I_PI ST hop → G10 gate false-fires, code 7 "
-                        "(VM_SPEC §16.6, card 010 G03)",
-    "g03h_lam_selfref": "kernel unsafe-mode checker accepts the self-reference "
-                        "under a binder (K/environment.cpp:172-177); the graph "
-                        "loses the anchor's mode bit across the "
-                        "I_LAMDOM→I_LAMSORT ST hop → G10 gate false-fires, "
-                        "code 7 (VM_SPEC §16.6, card 010 G03)",
-    # G04 (card 010): the IV index peeler delivers
-    # `Nat.casesOn (Nat.add 0 1) ...` as a halt (spine-root delivery, head
-    # not delta'd — the 005 F7-01 §10.2 family).  The kernel's whnf
-    # continues through the caseOn major (`K/inductive.h:93` major whnf;
-    # oracle Meta.whnf on 4.33.1 = LitNat 6), so the deliverable is not
-    # head-normal.  The caller-side loop cannot fix it: re-whnf on the stuck
-    # focus halts on itself (minimized env: raw halt 120 steps, round-1
-    # re-whnf same focus after 34 — g04b_diag.log); the full-closure env
-    # does not halt at all within 2000 (probe7).  Fix = graph-side
-    # I_CASE-major continuation (build_vm), card 011+; VM_SPEC §16.7.
-    "g04iv_eG4IV2": "kernel whnf descends the stuck Nat.casesOn major "
-                    "(Nat.add 0 1 → 1) and delivers LitNat 6; graph halts "
-                    "non-head-normal and run_whnf's re-whnf is idempotent "
-                    "on that focus (loop cannot continue) — graph-side fix "
-                    "required (K/inductive.h:93 major whnf; VM_SPEC §16.7)",
+    # Resolved by card 016 (memo 023 §3, 3-甲): the ST F2 carries
+    # cont_id + 128*mode across the hops and the I_PI/I_LAMSORT/I_LETD
+    # body/arg infers decode it from the frame's own F2 — both entries
+    # removed 2026-09-26 (the remaining registered approximations: the pi
+    # codomain chain and the DEFEQ soft emissions still ride mode-less,
+    # VM_SPEC §16.6).
 }
 
 # ── corpus rows ─────────────────────────────────────────────────────────────
@@ -335,18 +337,23 @@ def _load_graph_builder():
     return _GRAPH_BUILDER[0], _GRAPH_BUILDER[1]
 
 
-def _graph_check(consts, ctors, items, kinds):
+def _graph_check(consts, ctors, items, kinds, lps=None):
     """One graph run over a declaration list.  items: [(type, value|None)]
     (value None = anchor X = 0, the G5 no-value convention).
+    lps (card 011 G9): optional per-declaration lparams name lists — the
+    chain heads ride the anchors' F2 slots; `None` keeps the legacy
+    byte-exact behaviour (every head 0, the scan arm inert).
     Returns (accepted, reject code (0 when accepted), micro-steps)."""
     build_step_graph, _ = _load_graph_builder()
     graph, outputs = build_step_graph()
     enc = Encoder(consts, is_ctor=ctors)
     decls = [(enc.encode_term(t), enc.encode_term(v) if v is not None else 0)
              for t, v in items]
+    heads = [enc.emit_univparams(lp) if lp else 0
+             for lp in (lps or [None] * len(items))]
     drv = StepDriver(enc.b, graph, outputs)
     try:
-        drv.run_check(decls, kinds=kinds)
+        drv.run_check(decls, kinds=kinds, lparams=heads)
         return True, 0, drv.steps
     except VMError as ex:
         return False, ex.code, drv.steps
@@ -777,10 +784,12 @@ def section_g6(fails, lines, consts, ctors):
 # checker mode as DATA: the TASK_CHECK anchor's E2 = kind + STRIDE*mode
 # (ENV_FORMAT §2.8), decoded by the G10 gate; InjectionEnv hands the
 # declarations' ConstantInfo (kind/safety) to the encoder, which precomputes
-# the anchor F2 use_reject bit.  Known gaps (VM_SPEC §16.6): a self-reference
-# reached as an app argument or under a lam/let body crosses an
-# ST-continuation hop that cannot carry the mode bit → false code 7
-# (g03g/g03h, XFAIL below).
+# the anchor F2 use_reject bit.  Card 016 (memo 023 §3): the mode now also
+# crosses the ST-continuation hops (I_FN→I_PI, I_LAMDOM→I_LAMSORT,
+# I_LETV→I_LETD) via the ST F2 = cont_id + 128*mode carrier, so the
+# app-argument and lam/let-body self-references (g03g/g03h) accept — the
+# registered approximations left: the pi codomain chain and the DEFEQ soft
+# emissions still ride mode-less (VM_SPEC §16.6).
 G3_ROW_IDS = {"g03a_selfref", "g03b_later_ref", "g03b2_unsafe_ref",
               "g03c_body_fail", "g03e_mutual_xref", "g03g_arg_selfref",
               "g03h_lam_selfref"}
@@ -1011,17 +1020,33 @@ def section_g03(fails, lines, consts, ctors):
 # carriers (g04proj_*) fire the loop's second round — the round-2
 # no-advance check is what stops them (the graph's raw whnf delivers
 # head-normal even here; a plain run() reaches the SAME literal in one
-# round, g04b_c2_probe4 RAW lines).  Negative finding from exhaustive
-# c2 probing: on the current graph NO closed carrier shape forces a
-# semantically NECESSARY continuation — every raw halt is already
-# head-normal (§16.7), and the only >1-round advance ever observed is
-# IV2's (env 3599->3827, then idempotent), which ends stuck, not normal
-# — that row is the XFAIL.  The proj rows keep the round-2/stop path
+# round, g04b_c2_probe4 RAW lines).  Card 016 (memo 023) resolved the
+# IV2 row: the seed fix (Nat.pred/Nat.rec into the iv closure) plus the
+# graph's I_CASE ctor-major continuation let it reach LitNat 6 — the
+# entry left KNOWN_GAPS.  The proj rows keep the round-2/stop path
 # covered while the raw-field delta stays latent; universe-polymorphic
 # accessor DEFS (a `PProd.fst …` spine) livelock on the current
 # univ_arity=0 encoding (B13/WP1 debt, g04b_c2_probe1.log: 2000 steps
 # no halt, 4GB), so proj carriers are encoded as direct Proj nodes in
 # the toy P2 convention, the same mapping every brec-era suite uses.
+#
+# csctor family (card 016 拍 B, memo 023 §2): the I_CASE ctor-major
+# continuation rows.  A `Nat.succ <field>` major whose field is a stuck
+# leaf survives whnf head-normal (the graph's nat-op decline under NAT
+# frames) and the kernel matches the succ rule on the ctor head
+# (K/inductive.h:100), passing the field into the rhs — eG4CSC (casesOn,
+# direct delivery), eG4RECC (Nat.rec, the 15-step build loop), eG4PRED
+# (the `Nat.pred (Nat.succ k) → k` shape rule).  Residual registered
+# debt (VM_SPEC §11.7, NOT rowed here): a minor body that ADDS a stuck
+# leaf (`fun n => n + 1000`) still diverges — the kernel unfolds
+# `Nat.add k 1000` one rec step to `Nat.succ (Nat.add k 999)`, the
+# graph's nat-arg gate hard-rejects (the offset/stuck-arg milestone).
+G04_CSCTOR_DEFS = r'''
+opaque k : Nat
+def eG4CSC : Nat := Nat.casesOn (Nat.succ k) 100 (fun _ => 42)
+def eG4RECC : Nat := Nat.rec (motive := fun _ => Nat) 100 (fun _ _ => 999) (Nat.succ k)
+def eG4PRED : Nat := Nat.pred (Nat.succ k)
+'''
 G04_MUTUAL_DEFS = r'''
 mutual
 inductive G04A where
@@ -1069,6 +1094,29 @@ noncomputable def eG4W : Nat :=
 G04_PROJECT_DEFS = (
     "def eG4C2Ref : Nat := (PProd.mk (Nat.add 1 3) Nat.zero).1\n")
 _G04_PP = "PProd PProd.mk PProd.casesOn PProd.rec PUnit PUnit.unit"
+G04_UPROD_DEFS = r'''
+structure UProd (α : Type u) (β : Type u) where
+  fst : α
+  snd : β
+'''
+_G04_UPROD_ROOTS = ("UProd UProd.mk UProd.fst UProd.snd UProd.rec "
+                    "UProd.casesOn Nat").split()
+# Fully-elaborated use sites (`@UProd.fst u Nat Nat …`): the implicit type
+# args are real spine entries in the kernel term, so the whnf proj must skip
+# the ctor's nparams=2 to reach the field (reduce_proj_core,
+# K/type_checker.cpp:420-441) — the shape the graph's accessor-def whnf
+# livelocked on at univ_arity=0 (g04b_c2_probe2.log, 2000 steps / 4GB;
+# B13/WP1 debt, card 015 component 3).
+def _uprod_mk(a, b):
+    return App(App(App(App(Const("UProd.mk", (LZero(),)), Const("Nat")),
+                       Const("Nat")), a), b)
+
+
+def _uprod_acc(name, arg):
+    return App(App(App(Const(name, (LZero(),)), Const("Nat")), Const("Nat")),
+               arg)
+
+
 # family → (defs, dump roots, [(row id, carrier def name)])
 G04_GROUPS = {
     "nat": (NAT_DEFS, list(NAT_ROOTS),
@@ -1081,9 +1129,19 @@ G04_GROUPS = {
             "G04FMA G04FMB eG4MU1 eG4MU2 " + _G04_PP).split(),
            [("g04mu_eG4MU1", "eG4MU1"), ("g04mu_eG4MU2", "eG4MU2")]),
     "iv": (G04_IV_DEFS,
-           ("Nat G04I G04I.rec G04I.brecOn G04FIV eG4IV1 eG4IV2 "
+           # Nat.pred rides the roots so the dump carries it: the iota
+           # succ-rule build loop synthesizes `Nat.pred` / `Nat.rec` by
+           # NAME at reduction time (VM_SPEC §16.7 stage C, memo 023 §1.2
+           # D2/D3) — the stored trees never mention them, so the closure
+           # walk alone cannot see them (bisect g04b) and the graph's
+           # rec_ids_ok gate would false-stick the succ rule.  Seeded into
+           # the frontier below instead of pinning the toy base (keep_toy):
+           # the faithful Nat.below/brecOn trees inflate the evaluator
+           # beyond the 6GB line (g04b_full3).
+           ("Nat Nat.pred G04I G04I.rec G04I.brecOn G04FIV eG4IV1 eG4IV2 "
             + _G04_PP).split(),
-           [("g04iv_eG4IV1", "eG4IV1"), ("g04iv_eG4IV2", "eG4IV2")]),
+           [("g04iv_eG4IV1", "eG4IV1"), ("g04iv_eG4IV2", "eG4IV2")],
+           ["eG4IV1", "eG4IV2", "Nat.pred", "Nat.rec"]),
     "tree": (G04_TREE_DEFS,
              ("Nat G04W G04W.rec G04W.brecOn G04FW eG4W " + _G04_PP).split(),
              [("g04tree_eG4W", "eG4W")]),
@@ -1110,6 +1168,28 @@ G04_GROUPS = {
                                     LitNat(5))), LitNat(0))))),
                "(PProd.mk Nat.zero (PProd.mk (Nat.add 4 5) Nat.zero)).2.1")],
              ["eG4C2Ref"]),
+    # universe-polymorphic accessor DEFS through the real 2-param ctor app:
+    # `UProd.fst (UProd.mk 3 4 : UProd Nat Nat)` whnfs to the field literal 3
+    # (oracle #ORACLE WHNF) once I_PROJ extracts args[nparams+idx] of the
+    # full ctor spine (kernel reduce_proj_core); before that the proj
+    # re-stuck and the accessor whnf diverged (card 015 component 3).
+    "uprod": (G04_UPROD_DEFS, list(_G04_UPROD_ROOTS),
+              [("g04uprod_fst",
+                _uprod_acc("UProd.fst", _uprod_mk(LitNat(3), LitNat(4))),
+                "UProd.fst (UProd.mk 3 4 : UProd Nat Nat)"),
+               ("g04uprod_snd",
+                _uprod_acc("UProd.snd", _uprod_mk(LitNat(3), LitNat(4))),
+                "UProd.snd (UProd.mk 3 4 : UProd Nat Nat)")],
+              ["UProd.fst", "UProd.snd", "UProd.mk", "Nat"]),
+    # card 016 拍 B: I_CASE ctor-major continuation rows (see the csctor
+    # header note).  Nat.pred/Nat.rec ride the seeds per C-16.7.x-1: the
+    # succ-rule rhs synthesizes them by name at reduction time.
+    "csctor": (G04_CSCTOR_DEFS,
+               ("Nat Nat.pred Nat.casesOn Nat.rec k eG4CSC eG4RECC eG4PRED "
+                + _G04_PP).split(),
+               [("g04cs_eG4CSC", "eG4CSC"), ("g04cs_eG4RECC", "eG4RECC"),
+                ("g04cs_eG4PRED", "eG4PRED")],
+               ["eG4CSC", "eG4RECC", "eG4PRED", "Nat.pred", "Nat.rec"]),
 }
 G04_ROW_IDS = {r[0] for _grp in G04_GROUPS.values() for r in _grp[2]}
 # families that must keep the full TOY base (bisect g04b: the brecOn peel
@@ -1323,6 +1403,234 @@ def section_g04(fails, lines, want_rows):
             lines.append(f"  [FAIL] G04 {fam}: child rc={r.returncode}")
 
 
+# ── card 011 G8: duplicate-name rejection (driver bookkeeping, code 11) ─────
+# Kernel: check_name (K/environment.cpp:102-105) runs inside check_constant_val
+# (:128) on EVERY add_* path — BEFORE is_prop (add_theorem :200-202), before
+# the value checks, and before check_duplicated_univ_params (:129, G9 below).
+# A duplicate name throws the dedicated `already_declared_exception` (class
+# alreadyDeclared, K/kernel_exception.h:32-37, catch at :168-169); the Lean-side
+# rendering is "constant has already been declared '<n>'"
+# (src/Lean/Message.lean:896).  Driver side: InjectionEnv._check_name raises
+# VMError(ERR_ALREADY_DECLARED) BEFORE any graph pass — the graph has no name
+# space, so like the code-9 mutual-WF family this is environment bookkeeping.
+# The oracle environment already carries g8b_a/g8b_d/g8b_t (G8_BASE_DEFS, all
+# so a #KDECL re-add hits the kernel's check_name for real.
+G8_ROW_IDS = {"g8axm_new", "g8axm_dup", "g8def_new", "g8def_dup",
+              "g8def_dup_badbody", "g8thm_new", "g8thm_dup",
+              "g8thm_dup_nonprop"}
+# class → graph code for the G8 rows (a dedicated class name — no "other"
+# ambiguity: alreadyDeclared maps 1:1)
+G8_CODE_OF_CLASS = {"OK": 0, "alreadyDeclared": 11}
+
+G8_ORACLE_CASES = [
+    # accept legs: fresh names on all three kinds (also the graph-check
+    # positive — the driver must still RUN the check for a new name)
+    ("g8axm_new", _AXM.format("g8f_ax", E_NAT)),
+    ("g8def_new", _DEF.format("g8f_df", E_NAT, E_TWO)),
+    ("g8thm_new", _THM.format("g8f_th", E_TRUE, E_TRIVIAL)),
+    # reject legs: the three kinds' base names
+    ("g8axm_dup", _AXM.format("g8b_a", E_NAT)),
+    ("g8def_dup", _DEF.format("g8b_d", E_NAT, E_TWO)),
+    ("g8thm_dup", _THM.format("g8b_t", E_TRUE, E_TRIVIAL)),
+    # ordering legs: a duplicate name whose payload would ALSO fail
+    # independently — the kernel reports alreadyDeclared, not 1/8
+    # (measured probe p2/p3, 2026-09-21: name check precedes is_prop and
+    # the value check)
+    ("g8def_dup_badbody", _DEF.format("g8b_d", E_NAT, E_TRUE)),
+    ("g8thm_dup_nonprop", _THM.format("g8b_t", E_NAT, E_TWO)),
+]
+
+
+def build_g8_oracle() -> dict[str, str]:
+    cls = lean_ref.run_kdecl_oracle(ALL_DEFS, G8_ORACLE_CASES,
+                                    lean_cmd=LEAN_CMD)
+    return dict(zip([c for c, _ in G8_ORACLE_CASES], cls))
+
+
+def section_g8(fails, lines, consts, ctors):
+    """Duplicate-name injection vs the live #KDECL oracle."""
+    oracle = build_g8_oracle()
+    for cid, cls in oracle.items():
+        print(f"  oracle[{cid}] = {cls}")
+
+    def want(cid):
+        cls = oracle.get(cid)
+        return None if cls is None else G8_CODE_OF_CLASS.get(cls, -1)
+
+    # (row id, driver fn, registered name on the accept legs)
+    g8_rows = [
+        ("g8axm_new", lambda i: i.add_axiom("g8f_ax", NAT), "g8f_ax"),
+        ("g8axm_dup", lambda i: i.add_axiom("g8b_a", NAT), None),
+        ("g8def_new", lambda i: i.add_definition("g8f_df", NAT, LitNat(2)),
+         "g8f_df"),
+        ("g8def_dup", lambda i: i.add_definition("g8b_d", NAT, LitNat(2)),
+         None),
+        ("g8def_dup_badbody",
+         lambda i: i.add_definition("g8b_d", NAT, TRUE), None),
+        ("g8thm_new",
+         lambda i: i.add_theorem("g8f_th", TRUE, TRIVIAL), "g8f_th"),
+        ("g8thm_dup", lambda i: i.add_theorem("g8b_t", TRUE, TRIVIAL),
+         None),
+        ("g8thm_dup_nonprop",
+         lambda i: i.add_theorem("g8b_t", NAT, LitNat(2)), None),
+    ]
+    for cid, fn, reg_name in g8_rows:
+        inj = _inj_env(consts, ctors)
+        try:
+            fn(inj)
+            got, detail = 0, "accept"
+        except VMError as ex:
+            got, detail = ex.code, str(ex)
+        wantc = want(cid)
+        ok = wantc is not None and got == wantc
+        extra = ""
+        if ok and reg_name is not None:
+            # accept leg: the declaration must actually register
+            if not inj.contains(reg_name):
+                ok, extra = False, " NOT REGISTERED"
+        elif ok:
+            # reject leg: pure bookkeeping — zero graph passes, and the
+            # driver message mirrors the kernel's text
+            if inj.steps_last != 0:
+                ok, extra = False, f" (graph ran: steps={inj.steps_last})"
+            elif "constant has already been declared" not in detail:
+                ok, extra = False, " (message does not mirror the kernel)"
+        lines.append(f"  [{'PASS' if ok else 'FAIL'}] G8 {cid}: "
+                     f"oracle={oracle.get(cid)} graph=code={got}"
+                     f"({CLASS_OF_CODE.get(got, '?')}) steps={inj.steps_last}"
+                     f"{extra}")
+        if not ok:
+            fails.append(f"[G8 {cid}] oracle={oracle.get(cid)} "
+                         f"graph=code={got} detail={detail}")
+
+
+# ── card 011 G9: duplicate universe level parameters (graph arm, code 10) ──
+# Kernel: check_duplicated_univ_params (K/environment.cpp:111-121) runs inside
+# check_constant_val at :129 — AFTER check_name (:128, G8) and BEFORE
+# check_no_metavar_no_fvar (:130) and the type checker (:131-133).  A hit
+# throws a plain kernel_exception ("failed to add declaration to environment,
+# duplicate universe level parameter: '<p>'") → class .other.  The graph has
+# no name space (rule 3): each declaration's lparams ride a
+# T_ENV_LIST(role=2) chain (emit_univparams, VM_SPEC §12.1) whose head enters
+# on the TASK_CHECK anchor's F2 slot; the O(n²) pairwise scan compares
+# interred nids (V1) and rejects with new code 10.  Driver bookkeeping
+# (check_name → code 11) runs BEFORE any graph pass, so a duplicate NAME with
+# duplicate lparams reports alreadyDeclared, not 10 — kernel order (:128 <
+# :129).  The class map is unambiguous per section: every row is either a
+# clean accept (OK→0) or a dup-univ declaration (other→10); the "other"→7
+# leg belongs to g03 and lives in that section.
+_AXM_LP = (".axiomDecl {{ name := `{}, levelParams := [{}], type := {}, "
+           "isUnsafe := false }}")
+_DEF_LP = (".defnDecl {{ name := `{}, levelParams := [{}], type := {}, "
+           "value := {}, hints := ReducibilityHints.regular 0, "
+           "safety := DefinitionSafety.safe }}")
+_THM_LP = (".thmDecl {{ name := `{}, levelParams := [{}], type := {}, "
+           "value := {} }}")
+
+G9_ROW_IDS = {"g9axm_new", "g9axm_dup", "g9def_new", "g9def_dup",
+              "g9def_dup_badbody", "g9thm_new", "g9thm_dup",
+              "g9thm_dup_nonprop", "g9name_lp"}
+G9_CODE_OF_CLASS = {"OK": 0, "other": 10, "alreadyDeclared": 11}
+
+G9_ORACLE_CASES = [
+    # accept legs: fresh names with a non-duplicate single lparam
+    ("g9axm_new", _AXM_LP.format("g9f_ax", "`u", E_NAT)),
+    ("g9def_new", _DEF_LP.format("g9f_df", "`u", E_NAT, E_TWO)),
+    ("g9thm_new", _THM_LP.format("g9f_th", "`u", E_TRUE, E_TRIVIAL)),
+    # reject legs: the same name twice in levelParams
+    ("g9axm_dup", _AXM_LP.format("g9f_ax2", "`u, `u", E_NAT)),
+    ("g9def_dup", _DEF_LP.format("g9f_df2", "`u, `u", E_NAT, E_TWO)),
+    ("g9thm_dup", _THM_LP.format("g9f_th2", "`u, `u", E_TRUE, E_TRIVIAL)),
+    # ordering legs: the dup-univ scan (:129) precedes the value check
+    # (:132-133) and is_prop (add_theorem :200-202) — measured probe
+    # 2026-09-21: class "other" on all three
+    ("g9def_dup_badbody", _DEF_LP.format("g9f_df3", "`u, `u", E_NAT, E_TRUE)),
+    ("g9thm_dup_nonprop", _THM_LP.format("g9f_th3", "`u, `u", E_NAT, E_TWO)),
+    # ordering leg vs G8: a duplicate NAME (+ duplicate lparams) reports
+    # alreadyDeclared — check_name (:128) runs before the dup-univ scan (:129)
+    ("g9name_lp", _AXM_LP.format("g8b_a", "`u, `u", E_NAT)),
+]
+
+
+def build_g9_oracle() -> dict[str, str]:
+    cls = lean_ref.run_kdecl_oracle(ALL_DEFS, G9_ORACLE_CASES,
+                                    lean_cmd=LEAN_CMD)
+    return dict(zip([c for c, _ in G9_ORACLE_CASES], cls))
+
+
+def section_g9(fails, lines, consts, ctors):
+    """Duplicate universe level parameters vs the live #KDECL oracle."""
+    oracle = build_g9_oracle()
+    for cid, cls in oracle.items():
+        print(f"  oracle[{cid}] = {cls}")
+
+    def want(cid):
+        cls = oracle.get(cid)
+        return None if cls is None else G9_CODE_OF_CLASS.get(cls, -1)
+
+    # (row id, driver fn, registered name on the accept legs, must be a
+    #  GRAPH reject).  The dup-univ reject is a graph verdict (the scan ran,
+    #  steps > 0), unlike G8's pure-bookkeeping rejects — except g9name_lp,
+    #  which IS driver bookkeeping (code 11, zero graph passes).
+    g9_rows = [
+        ("g9axm_new", lambda i: i.add_axiom("g9f_ax", NAT, lparams=["u"]),
+         "g9f_ax", False),
+        ("g9axm_dup",
+         lambda i: i.add_axiom("g9f_ax2", NAT, lparams=["u", "u"]),
+         None, True),
+        ("g9def_new",
+         lambda i: i.add_definition("g9f_df", NAT, LitNat(2), lparams=["u"]),
+         "g9f_df", False),
+        ("g9def_dup",
+         lambda i: i.add_definition("g9f_df2", NAT, LitNat(2),
+                                    lparams=["u", "u"]),
+         None, True),
+        ("g9def_dup_badbody",
+         lambda i: i.add_definition("g9f_df3", NAT, TRUE, lparams=["u", "u"]),
+         None, True),
+        ("g9thm_new",
+         lambda i: i.add_theorem("g9f_th", TRUE, TRIVIAL, lparams=["u"]),
+         "g9f_th", False),
+        ("g9thm_dup",
+         lambda i: i.add_theorem("g9f_th2", TRUE, TRIVIAL, lparams=["u", "u"]),
+         None, True),
+        ("g9thm_dup_nonprop",
+         lambda i: i.add_theorem("g9f_th3", NAT, LitNat(2), lparams=["u", "u"]),
+         None, True),
+        ("g9name_lp",
+         lambda i: i.add_axiom("g8b_a", NAT, lparams=["u", "u"]),
+         None, False),
+    ]
+    for cid, fn, reg_name, want_graph in g9_rows:
+        inj = _inj_env(consts, ctors)
+        try:
+            fn(inj)
+            got, detail = 0, "accept"
+        except VMError as ex:
+            got, detail = ex.code, str(ex)
+        wantc = want(cid)
+        ok = wantc is not None and got == wantc
+        extra = ""
+        if ok and reg_name is not None:
+            # accept leg: the declaration must actually register
+            if not inj.contains(reg_name):
+                ok, extra = False, " NOT REGISTERED"
+        elif ok and got != 0:
+            # reject leg: the scan must have actually RUN (graph arm) — except
+            # the G8×G9 ordering row, which is driver bookkeeping
+            if want_graph and inj.steps_last == 0:
+                ok, extra = False, " (graph never ran)"
+            if not want_graph and inj.steps_last != 0:
+                ok, extra = False, f" (graph ran: steps={inj.steps_last})"
+        lines.append(f"  [{'PASS' if ok else 'FAIL'}] G9 {cid}: "
+                     f"oracle={oracle.get(cid)} graph=code={got}"
+                     f"({CLASS_OF_CODE.get(got, '?')}) steps={inj.steps_last}"
+                     f"{extra}")
+        if not ok:
+            fails.append(f"[G9 {cid}] oracle={oracle.get(cid)} "
+                         f"graph=code={got} detail={detail}")
+
+
 def main() -> int:
     t0 = time.perf_counter()
     only = {s.strip() for s in os.environ.get("G02_ONLY", "").split(",")
@@ -1344,6 +1652,8 @@ def main() -> int:
     g6_rows = {c for c in only if c in G6_ROW_IDS}
     g3_rows = {c for c in only if c in G3_ROW_IDS}
     g4_rows = {c for c in only if c in G04_ROW_IDS}
+    g8_rows = {c for c in only if c in G8_ROW_IDS}
+    g9_rows = {c for c in only if c in G9_ROW_IDS}
     want_rows = g2_rows | g6_rows
     fails: list[str] = []
     lines: list[str] = []
@@ -1390,6 +1700,14 @@ def main() -> int:
         print("g04   driver-side run_whnf (ADR016-B): G1/a1 carriers, "
               "final result vs live #ORACLE WHNF")
         section_g04(fails, lines, g4_rows)
+    if run_all or "g8" in only or g8_rows:
+        print("g8    duplicate-name injection: code 11 (alreadyDeclared), "
+              "three kinds + name-first ordering vs live #KDECL oracle")
+        section_g8(fails, lines, consts, ctors)
+    if run_all or "g9" in only or g9_rows:
+        print("g9    duplicate universe level parameters: graph O(n²) scan "
+              "(code 10, anchor F2 carrier) vs live #KDECL oracle")
+        section_g9(fails, lines, consts, ctors)
     for ln in lines:
         print(ln)
     n_gap = sum(1 for ln in lines if "XFAIL-KNOWN-GAP" in ln)

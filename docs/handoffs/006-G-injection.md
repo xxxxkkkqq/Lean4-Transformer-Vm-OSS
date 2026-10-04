@@ -1246,3 +1246,734 @@ artifact：`model/step_vm_010g03_scratch.sbin`（登记由总控做；真值
   规程复测。
 - 本拍无 artifact 变更：`step_vm_010g03_scratch.sbin` 即卡 010 终验证件；
   晋升与否归卡 011 开工拍决策（真值表已同步注记）。
+
+---
+
+## 执行记录：卡 015 拍 2（图逻辑工程师，2026-09-21）——n2z 电路 + I_PROJ 通用抽取
+
+本文档末尾追加本拍执行记录（落盘板，per AGENTS.md §八.4）。全拍在
+`tests/test_decl_injection_vs_lean.py` 两个子集 + G04 uprod 差分行上验收，
+全量回归与 23 套件归拍 3。改动文件：`lean_vm/build_vm.py` +
+`tests/test_decl_injection_vs_lean.py`（图侧唯一触点）。
+
+### 组件 1：is_prop 的 n2z 电路（D8，K/level.cpp:174-186）
+
+- 复现（`G02_ONLY=thm_imax,thm_max00`，comp1_repro_imax_max00.log）：
+  `oracle[thm_imax]=OK or oracle[thm_max00]=OK`、graph `code=8`，
+  stored type 实测 `injX_imax=Sort(LIMax(LSucc(LZero),LZero))`、
+  `injX_max=Sort(LMax(LZero,LZero))`——与 P1 探针逐字一致。
+- **两处判据**（不是一处）都改接 n2z 电路，替换 syntactic 根比
+  `_kind_eq_raw(★, KL_ZERO, One)`：
+  ① `pl_prop`（PI_LVL 证明不可约链，build_vm.py ~4498-4507）；
+  ② CHECK 链 `g3`（code-8 拒绝臂，~5495-5500）——拍 2 探针发现 code 8 正是
+  `g3` 抛的，仅改 pl_prop 不改 g3 是无效修（首轮实测仍 XFAIL）。
+- 电路形态：单树递归 `_n2z(pos, depth)`，深度帽 8，逐 kind 按内核规则
+  Zero→1；Param/MVar/Succ→0；Max→两子树∧；IMax→只看 rhs。共享 v1 子树
+  （`nz_v1` 同时喂 Max 的 AND 门和 IMax 的 rhs 支，build_vm.py ~3688-3707）。
+  **共享是关键**：初版 `max_v` 与 imax 支各现建一次 `_n2z(v1,·)`，递归树按
+  3^d 展开（d=8 → 3,280 节点/电路），dims 爆到 130,975(+403%)/lookups
+  22,579(+678%)；共享后按 2^d-1=255 节点展开，回落 34,175/4,429
+  （实测，D 行子集 2194s→197s）。
+- 验收（`G02_ONLY=thm_imax,thm_max00,def_imax,thm_sortraw_imax,thm_sortraw_max00`，
+  197s，comp1_drows_all_v2.log）：
+```
+  [PASS] D thm_imax: oracle=OK graph=accept=True code=0(accept) steps=15
+  [PASS] D thm_max00: oracle=OK graph=accept=True code=0(accept) steps=15
+  [PASS] D def_imax: oracle=OK graph=accept=True code=0(accept) steps=15
+  [PASS] D thm_sortraw_imax: oracle=thmTypeIsNotProp graph=accept=False code=8(thmTypeIsNotProp) steps=6
+  [PASS] D thm_sortraw_max00: oracle=thmTypeIsNotProp graph=accept=False code=8(thmTypeIsNotProp) steps=6
+```
+- KNOWN_GAPS 摘除 thm_imax/thm_max00（XPASS 协议：转绿后仍留册即判 FAIL，
+  实测首绿即 XPASS-FAIL，摘除后 PASS）。
+- bcd 全节（comp1_bcd_full.log，647s）：`21/21 checks pass, 0 fail`——含
+  gate_off_kind0、thm_arrow（Pi-body-Prop 证明不可约链走 pl_prop n2z）无回归。
+- 全量增量（`--sparse`，step_vm_015_full_scratch.sbin，compile 42s）：
+  基线 26,023/2,901/192,867 → **34392/4489/235030**，即 dims +8,369(+32%)、
+  lookups +1,588(+55%)、nnz +42,163(+22%)。ADR 022 预估 +500-1500 dims 偏
+  乐观（per-node 成本在该图代数下 ~16 dims + 3 lookups）；O(1)、图深度不增
+  成立。**风险注记：dims/lookups 增大会使 decl_injection 全量回归延长，
+  bcd 全节已 647s（基线全文件 ~2000s），拍 3 全量须盯 2700s 回归帽。**
+
+### 组件 3：univ 多态 accessor whnf（B13 活锁）
+
+- 复现（G04 uprod 差分行，comp3_upd_probe*.log）：主链 env（_instantiate_dump
+  后无 LParam），`UProd.fst` delta → Lam3 → body `Proj(UProd,0,BVar0)`，child
+  whnf 到 `@UProd.mk u Nat Nat 3 4`（2 参 + 2 域），随后 **pr_stuck**。
+  活锁/卡死的根因 = I_PROJ 的 `pr_full`（build_vm.py ~3095）只认
+  `App(App(Const(18),a),b)` 两参骨架；真实 ctor 载 4 参骨 + nparams=2，
+  永不匹配 → proj 反复 re-stick → 2000 步/4GB（g04b_c2_probe2.log 的历史
+  活锁记录）。**LParam 不是阻塞点**（ADR 候选① unfold-级实例化不适用）；
+  阻塞点是 field 抽取本身。ADS 候选②（try_unfold_proj_app 式快捷）也不绕开
+  抽取。按内核规格修：`reduce_proj_core`（K/type_checker.cpp:420-441：
+  get_app_args 全骨架 + head 必须是目标结构 ctor + `args[nparams+idx]`）。
+- 修法（build_vm.py ~3086-3117）：`_app_arity`/`_head_of` 剥全骨 +
+  `_is_ctor_any`（metadata ctor 判据，legacy P2.mk 回退）+ `_struct_ind` 取
+  induct cid（**不是 `_struct_nid`**——首实现用 nid 当 cid 读 nparams=0，
+  field 错取 args[0]）+ nparams=INDVAL.V1 + 守卫 `nparams+idx<arity` +
+  `_pick(V0-链, arity-1-j)` 读 V1。P2 玩具案（nparams=0, 2 参）同规则不变。
+- 验收（G04_FAMILY=uprod，comp3_g04_uprod.log）：
+```
+  [PASS] G04 uprod/UProd.fst (UProd.mk 3 4 : UProd …: oracle=LitNat(value=3) run_whnf=LitNat(value=3) steps=16 rounds=2
+  [PASS] G04 uprod/UProd.snd (UProd.mk 3 4 : UProd …: oracle=LitNat(value=4) run_whnf=LitNat(value=4) steps=32 rounds=2
+```
+  oracle=4.33.1 #ORACLE WHNF（probe_015 P2 原文 `{'k':10,'nat':3}`）。
+  G04 全 family（comp3_g04_all.log，873s）：**15/15 pass + 1 xfail
+  （iv/eG4IV2, steps=346 与基线逐字一致）, 0 fail**——nat/lst/mu/iv/tree/
+  proj 全部无回归（proj 两行 steps 仍 14/33）。
+- 探针选案记录：两候选（unfold 单步 level 实例化 / accessor 快捷）均经
+  探针定性为不适用（见上），落定方案 = 通用 reduce_proj_core 抽取，是
+  两候选之外第三条、由内核规格直接钉死（拍 2 探针证据在 /tmp/upd_probe*）。
+- 回归面：直接 Proj 节点编码的地址族（proj family、brec 套件）仍走
+  nparams=0 分支，逐字不变。
+
+### 组件 2：deq_sort/A18 Max/IMax 比较扩展 —— **NOT-VERIFIED（预算）**
+
+- 未做。依据 ADR 022：sound-incomplete 的 `_lvl_eq`（Max/IMax 非同一闭包
+  即不等）不算判定错误、宁可拒不误收；「仅当组件 1 验收后预算有余再扩展」。
+- 本拍预算已在组件 1 耗尽且方向已被n2z 实证：Max/IMax 递归配对需要同样的
+  2^depth 二进制展开（n2z 的实测 +8k dims 就是单位成本），deq_sort + A18 +
+  chain 四处接点会让图再涨 ~2x 组件 1 的开销，且 `_lvl_eq` 在每个 DEFEQ
+  微步热路径上。**留给拍 3+（或单独卡）**，不掩盖。
+- VERIFIED 清单（本拍子集）：组件 1（两 G02 子集绿 + sortraw 回 8 + bcd
+  21/21）+ 组件 3（uprod 差分行绿 + G04 全 15/15）。level 通道套件
+  test_level_vs_lean.py 37/37 无涉。全量 23 套件回归归拍 3。
+- 未提交 git（子代理禁 git；总控执笔）。py_compile 每编辑即过。
+
+---
+
+## 卡 011 拍 1 续接（2026-09-21）
+
+接手代理死于模型限流，**实现已完成在 git 工作树（未提交）**，本代理只做
+验证 + 落盘，不改实现逻辑。计划清单（万一再死，本板是交接态）：
+1. 读 diff 现状（build_vm.py G9 dupUnivParams 臂 / step_driver.py G8
+   alreadyDeclared 簿记 / tokens.py 新 token / 测试 g8,g9,g9axm_dup 行）。
+2. 三个改动文件 py_compile 复跑。
+3. `--sparse model/step_vm_011_scratch` 重编译，记 dims/lookups/nnz 与
+   015 基线（34,392/4,489/235,030）增量。
+4. 差分行集 `G02_ONLY=g8,g9,g9axm_dup` 跑 oracle 4.33.1 通道，期望全 PASS。
+5. 引擎对拍 `SBIN=...011_scratch.sbin verify_engine_vs_refvm.py` 预期 34/34。
+6. 硬编码扫描（CID/cid 写死）零新增或列例外。
+7. 完工报告：四步输出原文 + dims 增量 + 机械缺陷（如有）+ NOT-VERIFIED。
+禁止：git commit、动 engine/ 与 model/ 既有件、改 ARCHITECTURE.md。
+
+### 执行记录（续接代理，2026-09-21/23，核段 0-5，PY=/home/xkq/miniconda3/envs/train/bin/python，日志 /home/xkq/logs/011G89/）
+
+接手时发现：**section_g9（差分测试段）缺件**——前代理在 build_vm.py（G9
+图内查重臂）与 step_driver.py（G8 簿记）已实现，测试文件头注释也写了 g9
+行名与 G02_ONLY 用法，但 tests/ 里只有 section_g8，无 G9_ROW_IDS /
+G9_ORACLE_CASES / section_g9，`G02_ONLY=g9,g9axm_dup` 会空跑（0/0 假绿）。
+本代理补写 section_g9（9 行，格式对齐 section_g8；属测试补全，非实现逻辑
+改动）。其余验证全部复跑：
+
+#### 1. py_compile（三改动文件 + 测试，每编辑后即过）
+```
+$PY -m py_compile lean_vm/build_vm.py lean_vm/step_driver.py \
+   expr/tokens.py tests/test_decl_injection_vs_lean.py
+PY_COMPILE OK
+```
+
+#### 2. 重编译 step_vm_011_scratch（--sparse，compile_011.log）
+```
+$ OMP_NUM_THREADS=3 taskset -c 0-5 $PY -u model/compile_vm.py \
+    --sparse model/step_vm_011_scratch
+rc=0
+graph: 34468 dims, 4495 lookups (3.3s)
+schedule: 114 layers, d_model=6150 (18.2s)
+build_weights(sparse): d_model=8366 heads_global=830 ffn=2721 nnz=235,424 (18.9s)
+saved model/step_vm_011_scratch.sbin (235,424 nnz)
+```
+增量 vs 015 基线（34,392/4,489/235,030，23,306,042B）：
+**dims +76(+0.22%) / lookups +6(+0.13%) / nnz +394(+0.17%)**，
+sbin 23,389,686B(+83,644B)。G9 扫描臂 = 常数量级电路（无按名字/链长展开），
+与 ADR 022 的 O(1) 预算一致。新旧 sbin 均保留。
+
+#### 3. 差分行集（G02_ONLY=g8,g9,g9axm_dup，declinj_g8g9.log，312s）
+```
+$ G02_ONLY=g8,g9,g9axm_dup OMP_NUM_THREADS=3 taskset -c 0-5 \
+    $PY -u scripts/run_mem_guarded.py --max-rss-mb 6000 -- \
+    $PY -u tests/test_decl_injection_vs_lean.py
+  [PASS] G8 g8axm_new: oracle=OK graph=code=0(accept) steps=4
+  [PASS] G8 g8axm_dup: oracle=alreadyDeclared graph=code=11(alreadyDeclared) steps=0
+  [PASS] G8 g8def_new: oracle=OK graph=code=0(accept) steps=8
+  [PASS] G8 g8def_dup: oracle=alreadyDeclared graph=code=11(alreadyDeclared) steps=0
+  [PASS] G8 g8def_dup_badbody: oracle=alreadyDeclared graph=code=11(alreadyDeclared) steps=0
+  [PASS] G8 g8thm_new: oracle=OK graph=code=0(accept) steps=8
+  [PASS] G8 g8thm_dup: oracle=alreadyDeclared graph=code=11(alreadyDeclared) steps=0
+  [PASS] G8 g8thm_dup_nonprop: oracle=alreadyDeclared graph=code=11(alreadyDeclared) steps=0
+  [PASS] G9 g9axm_new: oracle=OK graph=code=0(accept) steps=5
+  [PASS] G9 g9axm_dup: oracle=other graph=code=10(dupUnivParams) steps=1
+  [PASS] G9 g9def_new: oracle=OK graph=code=0(accept) steps=9
+  [PASS] G9 g9def_dup: oracle=other graph=code=10(dupUnivParams) steps=1
+  [PASS] G9 g9def_dup_badbody: oracle=other graph=code=10(dupUnivParams) steps=1
+  [PASS] G9 g9thm_new: oracle=OK graph=code=0(accept) steps=9
+  [PASS] G9 g9thm_dup: oracle=other graph=code=10(dupUnivParams) steps=1
+  [PASS] G9 g9thm_dup_nonprop: oracle=other graph=code=10(dupUnivParams) steps=1
+  [PASS] G9 g9name_lp: oracle=alreadyDeclared graph=code=11(alreadyDeclared) steps=0
+=== card 010 G02 decl-injection differential: 17/17 checks pass, 0 xfail known-gap, 0 fail (312s) ===
+=== OK ===
+[mem-guard] wall 312.8s peak RSS 1655MB rc=0
+```
+oracle 通道 = `~/.elan/toolchains/leanprover--lean4---v4.33.1` #KDECL 现跑
+（禁预置答案）。观测要点：G9 拒绝行 steps=1（扫描首对即中）、accept 行
+steps>0（扫描跑满后回 kickoff）；G8/G9 顺序行 g9name_lp code=11 steps=0
+（name 检查先于 dup-univ，K/environment.cpp:128<129）。行名 g9axm_dup 在
+G02_ONLY 里的用法见文件头注释（已含 g8/g9 两例）。
+
+#### 4. 引擎对拍（engine_011.log）
+```
+$ SBIN=$PWD/model/step_vm_011_scratch.sbin OMP_NUM_THREADS=3 \
+    taskset -c 0-5 $PY -u scripts/verify_engine_vs_refvm.py
+rc=0
+=== H3 engine vs RefVM: 34/34 verdicts correct ===
+    argmax vs softmax streams identical: 34/34
+    known-value checks: 3/4
+    total engine wall time: argmax 136.8s, softmax 259.7s
+```
+known 3/4 与 015 基线逐字一致（succ_zero 的 known 字面量在 015 即为 BAD，
+非本拍回归；verdict 门 = 34/34 rc=0 与基线持平）。
+
+#### 5. 硬编码扫描（验收铁律 3）
+```
+$ git diff -U0 lean_vm/build_vm.py lean_vm/step_driver.py expr/tokens.py \
+    | grep -E "^\+" | grep -nE "CID_[A-Z0-9_]+\s*[+=]|== *[0-9]+ *(#.*)?$"
+rc=1（零匹配）——同样扫了测试文件新增行，零匹配。
+```
+G9 臂只比较 frF2/F2/链 nid（fetch_by_position v1_/x_），reject 码 10/11、
+续体 id CK_G9/CK_G0 均为协议常量，无新 cid/常量名写死分支。
+
+#### 机械缺陷 / 补全
+- **缺件（已补）**：section_g9 未实现（见上）——补写 9 行测试，全部过。
+- 其余改动未发现语法/机械错误；py_compile 每次编辑后即过。
+- 未提交 git；未动 engine/、model/ 既有件、ARCHITECTURE.md。
+- NOT-VERIFIED：G9 的 fvar/mvar 顺序行（dup-univ :129 先于 fvar :130）未
+  加测试行——oracle 端需构造 FVar 表达式，非本拍验证必需（扫描先于 g7
+  的顺序已由 defer 设计与 kernel :129<:130 覆盖，拍 3 可按需补）；全量
+  23 套件回归归拍 3。
+
+---
+
+## 卡 011 拍 2 全量回归（2026-09-23，测试工程师，独立 verifier）
+
+计划清单（万一限流死，本板是交接态；回归已脱管，证据不随代理死）：
+1. 启动全量 23 套件回归：`setsid nohup env OMP_NUM_THREADS=3
+   REGRESSION_CORES=14-19 REGRESSION_LOG_DIR=$HOME/logs/011G89/reg
+   bash scripts/run_cpu_regression.sh > $HOME/logs/011G89/reg/run.log
+   2>&1 < /dev/null &`（SUITE_FILTER 不设=全量），起完记 pid。
+2. 每 ~20 分钟轮询 `$HOME/logs/011G89/reg/*.rc` 进度。
+3. 逐套件定性：rc=0 → PASS；rc≠0 → 先定性再上报——帽顶穿（wall/RSS）
+   对照 a0d18cb 校准帽（decl_injection 5000|7000、brec_drec_iota 1200|8000、
+   defeq_cache 2700|8000、quot 1500|6500、reducenat 1500|7000、
+   stepgraph_vs_lean 1500、stepgraph_infer_defeq 3300、mutation 1200、
+   olean_export 900、string_graph 1500|7500、defeq_branches 1800|3000、
+   stepgraph_vs_refvm 900、check_e2e 900、datadriven_* 900、kernel_oracle
+   900、engine_vs_refvm 1200…脚本头注释为全表）→ 按 015 先例单项重跑
+   （`SUITE_FILTER=<label> bash scripts/run_cpu_regression.sh`）转绿才算过；
+   真语义 FAIL（verdict/判定不一致）立刻在报告高亮，不与帽顶穿混。
+4. 每套件结果（rc、wall、RSS 峰值、FAIL/重跑史）逐行写进本节。
+5. 完工报告：23 套件 rc 表 + 语义零 FAIL 声明 + 重跑清单 + 帽异常 + 总时长。
+
+开工时机器姿态：`free -g` 总 30 / 可用 ~20；无本项目大 env 求值在跑
+（顶 RSS 为无关进程 /tmp/ms/dl.py 1.7GB）。HEAD=`7a50d99`（拍 1 验收提交），
+工作树改动=拍 1 实现（build_vm.py G8/G9 + step_driver + tokens + tests，
+未提交属总控 git 执笔）。pinned oracle `~/.elan/toolchains/
+leanprover--lean4---v4.33.1/bin/lean` 在位。真值 sbin =
+`model/step_vm_new_sparse.sbin`（回归引擎套件用它；拍 1 只编 scratch
+`step_vm_011_scratch.sbin`，未覆盖真值）。
+
+### 回归启动（2026-09-23）
+
+**pid=2927181**（`bash scripts/run_cpu_regression.sh`；setsid 脱离会话，
+工作树 cwd=/home/xkq/Lean4-Transformer-Vm-OSS，05:10 起）。启动命令原文：
+```
+cd /home/xkq/Lean4-Transformer-Vm-OSS && setsid nohup env OMP_NUM_THREADS=3 \
+  REGRESSION_CORES=14-19 REGRESSION_LOG_DIR=$HOME/logs/011G89/reg \
+  bash scripts/run_cpu_regression.sh > $HOME/logs/011G89/reg/run.log 2>&1 < /dev/null &
+```
+注意：脚本开头自清 `rm -f "$LOG_DIR"/*.log "$LOG_DIR"/*.rc`，把自留的
+run.log inode 一并删了（fd 仍在、文件已 unlink）——脚本自己的进度/汇总
+echo 进死 fd，**证据以每套件 .log/.rc 为准**，汇总表由我按 .rc 逐条重建。
+oracle 钉 4.33.1 由脚本自检行证明（写在各 .log 首行）。
+
+### 回归结果（逐套件，2026-09-26 lane 1 回填完毕；wall/RSS 全部取 [mem-guard] 行实测原文，非推算）
+
+| # | 套件 | rc | wall | RSS 峰值 | 定性 | 证据源与备注 |
+|---|---|---|---|---|---|---|
+| 1 | ref_vs_lean | 0 | 1.0s | 1323MB | PASS | reg1；34/34 |
+| 2 | ref_infer_defeq | 0 | 1.0s | 1327MB | PASS | reg1；82/82（2 brec-sum 跳过=登记基线） |
+| 3 | stepgraph_vs_refvm | 0 | 1002.5s | 1812MB | PASS | reg2（09-23 前代理采信，S1-f 验真）；37/37 (0 pinned)。reg1 在旧帽 900s 顶穿（900.2s/1815MB）→ 帽 900→1200 被本跑证实充分 |
+| 4 | stepgraph_vs_lean | 0 | 1139.3s | 1811MB | PASS | reg1；34/34 |
+| 5 | stepgraph_infer_defeq | 0 | 3174.1s | 2242MB | PASS | reg1；84/84 |
+| 6 | check_e2e | 0 | 670.9s | 1390MB | PASS | reg1；A 15/15, B 15/15 |
+| 7 | mutation_reject | 0 | 1079.9s | 2001MB | PASS | reg2（S1 采信）；A 16/16, B 8/8。reg1 在 3-pool 内 1200s 顶穿（1200.4s/1958MB），单跑 1079.9s < 1200 帽 → 争用性顶穿，帽不动 |
+| 8 | olean_export | 0 | 621.7s | 1563MB | PASS | reg1；A 21/21, B 17/17 |
+| 9 | datadriven_env | 0 | 259.4s | 1561MB | PASS | reg1；32/32 |
+| 10 | datadriven_bool | 0 | 64.4s | 1595MB | PASS | reg1；12/12 |
+| 11 | level_vs_lean | 0 | 7.1s | 1457MB | PASS | reg1；37/37 |
+| 12 | level_encoding | 0 | 1.5s | 1503MB | PASS | reg1；0 failures |
+| 13 | env_meta | 0 | 1.5s | 1324MB | PASS | reg1；0 failures |
+| 14 | env_meta_import | 0 | 2.0s | 1525MB | PASS | reg1；0 failures / 259 checks |
+| 15 | kernel_oracle | 0 | 3.5s | 1401MB | PASS | reg1；A 10/10 agree, B 3 capacity |
+| 16 | quot_graph_vs_lean | 0 | 278.8s | 5377MB | PASS | reg1；7/7 corpus |
+| 17 | string_graph_vs_lean | 0 | 903.5s | 4493MB | PASS | reg1；B 30/30, C 3/3 |
+| 18 | reducenat_graph_vs_lean | 0 | 1567.9s | 6067MB | PASS | reg2_r2（本拍验证跑）；A=31, B=16, 0 failures。史：reg1 在 3-pool 内 1500s 顶穿 → 单项复跑（reg2/reducenat_graph_vs_lean，09-26）仍 1500.1s/6068MB 顶穿（两次杀点 RSS 几乎全同=合法耗时长非负载）→ 帽 1500→2400（a0d18cb 格式注释）→ 验证跑 rc=0，真实 wall 1567.9s 回填脚本注释 |
+| 19 | defeq_branches_vs_lean | 0 | 1466.4s | 2436MB | PASS | reg1；ALL OK |
+| 20 | brec_drec_iota_vs_lean | 0 | 1060.4s | 7266MB | PASS | reg1；0 divergences |
+| 21 | defeq_cache_vs_lean | 0 | 2029.0s | 7310MB | PASS | reg2（S1 采信）；`[all]: ALL OK (2028s)`，P2/whnf 两相 SKIP=ADR 019 休眠既有登记，非新增跳过 |
+| 22 | decl_injection_vs_lean | 0 | 4411.3s | 6637MB | PASS | reg2（S1 采信）；103/103 checks + 3 xfail known-gap, 0 fail（=015 后基线 86+拍 1 新增 17，账目吻合；3 xfail=g03g/g03h/eG4IV2 存量） |
+| 23 | engine_vs_refvm | 0 | 569.1s | 164MB | PASS | reg2（S1 采信）；34/34 verdicts + 双流一致 34/34 + known 3/4（基线持平），artifact sbin-before==sbin-after（2026-09-18 18,888,194B）无漂移 |
+
+**23/23 rc=0，语义零 FAIL**（全部 23 行的套件输出汇总行逐个验真为真 PASS，
+非仅 rc=0；无一处 verdict 判定不一致，无一处为绿灯放宽断言或删用例）。
+
+- reg1 链条：09-23 05:10–06:27（3-pool，20/23 后代理死亡），证据
+  `~/logs/011G89/reg/`。
+- reg2 链条（前代理段）：09-23 07:48–10:19（串行单项，5/6 完成后死亡），证据
+  `~/logs/011G89/reg2/<label>/` + `run2.log`。
+- reg2 链条（本拍）：09-26 00:09–01:07，reducenat 两跑（1500.1s 顶穿证实 + 帽校准后
+  1567.9s 验证 PASS），证据 `~/logs/011G89/reg2/reducenat_graph_vs_lean{,_r2}/`。
+
+### 拍 2 完工段（2026-09-26，lane 1 测试工程师）
+
+1. **verifier 集（卡 011 拍 2）**：全量 23 套件回归 23/23 rc=0（上表）；其中
+   拍 1 新增 g8/g9 行随 decl_injection 全集跑过（103/103 含 17 行 G8/G9）。
+   语义零 FAIL 声明如上。
+2. **改动面**：本拍只触及 `docs/handoffs/006-G-injection.md`（本板）与
+   `scripts/run_cpu_regression.sh`（reducenat 帽行 + 注释；stepgraph 900→1200
+   系前代理在途产物，本拍保留未再动）。tests/、lean_vm/、engine/、model/
+   零触碰；真值 `model/step_vm_new_sparse.sbin` mtime 09-18 未动（engine 行
+   artifact 前后一致旁证）。工作树中的 `docs/plans/016-*`、
+   `docs/decisions/023-*` 为 lane 2 语义设计师触碰面，与本拍无关。
+3. **帽变更清单**（本拍新增变更仅 1 项）：
+   - `reducenat_graph_vs_lean` timeout 1500→2400（RSS 7000 不动）。依据：
+     两次独立杀点 wall/RSS 全同（1500.1s/6069MB 与 1500.1s/6068MB，均未触
+     RSS 帽）+ 杀点位置（B 相 14/16）+ 完整跑实测 1567.9s/6067MB → 2400
+     保持 ~1.5x。注释已按 a0d18cb 格式落进脚本。
+   - （在途保留）`stepgraph_vs_refvm` 900→1200：reg2 单跑 1002.5s 证实充分。
+   - `mutation_reject` 1200 帽不动：单跑 1079.9s，reg1 顶穿定性为 3-pool
+     争用性。
+4. **偏差申报 / 待总控追认**：S1 采信前代理 reg2 残留 5 套件证据（依据 a–f
+   六条，见上文）；简报三波方案作废的原因是总控 09-25 审计未覆盖 reg2/
+   残留，非对简报的静默偏离。若总控对采信有异议，重跑清单=decl_injection
+   （~74min）+ defeq_cache（~34min）+ engine（~10min）+ mutation（~18min）+
+   stepgraph（~17min）。
+5. **NOT-VERIFIED**：无（23/23 全部有实测证据；跳过为零——defeq_cache 的
+   P2/whnf 两相 SKIP 是 ADR 019 登记的休眠相，非本拍跳过）。
+6. **总时长**：reg1 ≈77min（并行 3-pool，20/23）+ reg2 前代理段 ≈151min
+   （串行 5 套件）+ 本拍 ≈60min（reducenat 顶穿跑 25min + 校准落盘 5min +
+   验证跑 26min）。三段日历跨度 09-23 05:10 → 09-26 01:07（中间 48h 停滞为
+   代理死亡，非机器时间）。
+
+---
+
+## 总控续接段（2026-09-25，总控）
+
+**卡点诊断**：拍 2 回归链条（pid 2927181）09-23 06:27:48 后死亡，测试工程师
+代理同死（限流事故序列第 4 起），此后 48h 无进程在跑——项目停滞 2 天的
+直接原因，非技术阻塞。工作树未提交改动 = 本板子 + `run_cpu_regression.sh`
+stepgraph_vs_refvm 帽 900→1200（合法在途产物，保留随拍 2 收口提交）。
+拍 1 实现已随 7a50d99 入库；回归所跑代码 = HEAD 代码，无语义漂移。
+
+**证据现状（总控 09-25 核对 .rc 原文）**：`~/logs/011G89/reg1/`（即 reg/ 目录）
+20 套件在位。rc=0 十七个；rc=124 三个：stepgraph_vs_refvm（900s 旧帽，脚本
+已改 1200）、mutation_reject（1200s）、reducenat_graph_vs_lean（1500s）。
+未跑三个：defeq_cache_vs_lean、decl_injection_vs_lean、engine_vs_refvm。
+
+**续派（并行 2，面不重叠）**：
+- lane 1｜测试工程师｜拍 2 续接：reg2 目录 6 套件补跑/复跑（三批），核 14-19，
+  执行记录续写本节之下。
+- lane 2｜语义设计师｜卡 016 拍 A（只读 + 文档，与 lane 1 零文件交集），
+  核 0-5，执行记录写 `docs/plans/016-*.md` 执行段。
+
+收口：lane 1 全绿 → 总控五道门 → git（本板 + 脚本帽 + 卡 011 状态行 +
+真值表 011 scratch 行如缺）。
+
+---
+
+## 卡 011 拍 2 续接执行（lane 1 测试工程师，2026-09-25 深夜–09-26，核段 14-19）
+
+### 执行计划清单（先落盘后起跑——防线 §1.16①）
+
+开工姿态实测：HEAD=`7a50d99`；工作树改动=本板 + `run_cpu_regression.sh` 帽
+900→1200 + lane 2 文件（`docs/plans/016-*`、`docs/decisions/023-*`，非本拍
+触碰面，零交集）；`free -g` 总 30/可用 20；`ps --sort=-rss` 无项目内大 env
+求值（顶 RSS 为 zcode 客户端 1.5GB 等无关进程）；`pgrep -af
+"run_cpu_regression|run_mem_guarded"` 零命中（前代理进程确认死透，非 G03 式
+"假死"）；`command -v python3` = `/home/xkq/miniconda3/envs/train/bin/python3`
+（numpy+torch 自检过，与 reg1 同解析）；钉定 oracle
+`~/.elan/toolchains/leanprover--lean4---v4.33.1/bin/lean` 在位（--version 实测
+4.33.1/819816b2e0a3）。真值 sbin=`model/step_vm_new_sparse.sbin`（mtime
+09-18 05:39:52、18,888,194B）未动。回归所跑代码=HEAD 代码。
+
+**S1【已完成】reg2 残留盘点与采信裁决**：
+
+简报未知的事实——前代理 09-23 07:48–10:19 已按本卡模板（SUITE_FILTER 单套件、
+`REGRESSION_LOG_DIR=reg2/<label>` 全新子目录、串行逐个）跑完 6 个补跑套件中的
+5 个，全部 rc=0：`run2.log` 逐段有 launch 行（含帽参）+ oracle 4.33.1 自检行 +
+results 段；stepgraph_vs_refvm 的 unit 于 10:19 写完 .rc/.log 后父进程死，
+results 段缺但证据件齐全。采信依据（逐条核过原文）：
+
+- a. 代码态=HEAD `7a50d99`（拍 1 提交在 09-23 前；其后工作树仅文档+脚本帽，
+  无语义漂移）。
+- b. 脚本 mtime 09-23 07:47:48 早于全部 5 次运行 → 跑的即当前工作树脚本
+  （stepgraph 已是 1200 帽；其余 4 项帽参 a0d18cb 未动）。
+- c. `run2.log` 每段首行 oracle 自检 `Lean (version 4.33.1, …, commit
+  819816b2e0a3…, Release)`。
+- d. 帽参与现脚本逐项一致（run2.log launch 行原文：decl 5000s|7000MB、
+  defeq_cache 2700s|8000MB、engine 1200s|0MB、mutation 1200s|4000MB、
+  stepgraph 1200s|4000MB）。
+- e. 串行无双链互踩（相邻运行起止时刻首尾相接），每套件独立子目录。
+- f. 语义判定行逐个验真（非仅 rc=0）：
+  - decl_injection：`103/103 checks pass, 3 xfail known-gap, 0 fail (4411s)`——
+    =015 摘 2 xfail+增 2 proj 行后基线 86 + 拍 1 新增 17，账目吻合；
+  - defeq_cache：`defeq cache vs lean [all]: ALL OK (2028s)`（P2/whnf 两相
+    SKIP = ADR 019 休眠既有登记行为，非新增跳过）；
+  - engine：`34/34 verdicts correct` + 双流一致 34/34 + known 3/4（基线持平），
+    artifact `sbin-before==sbin-after`（2026-09-18 18,888,194B）无漂移；
+  - mutation：`A 16/16, B 8/8 === OK`；
+  - stepgraph_vs_refvm：`37/37 (0 pinned M3-pending)`，wall 1002.5s < 1200
+    新帽——帽修正被证实必要且充分。
+
+裁决：5 套件采信 reg2 残留证据，不再重跑（重跑 ~2.5h 机器时零信息增量；
+G03 双链事故教训：已完成且证据完整的运行不作废）。偏差申报：总控三波方案
+基于 09-25 只核 reg1 .rc 的事实，reg2 残留未在其视野内；本裁决照实落板待
+总控追认。
+
+**S2【已完成】reducenat_graph_vs_lean 单项补跑**（reg2 唯一缺件；reg1 在
+3-pool 并行下 1500s 帽顶穿，本跑即简报定义的"单项复跑"）：
+
+- 启动命令（与 reg1 逐字同参只换 LOG_DIR/SUITE_FILTER，全新子目录
+  `reg2/reducenat_graph_vs_lean`，不传 PYTHON=裸 python3）：
+
+```
+cd /home/xkq/Lean4-Transformer-Vm-OSS && setsid nohup env OMP_NUM_THREADS=3 \
+  REGRESSION_CORES=14-19 \
+  REGRESSION_LOG_DIR=$HOME/logs/011G89/reg2/reducenat_graph_vs_lean \
+  SUITE_FILTER=reducenat bash scripts/run_cpu_regression.sh \
+  > $HOME/logs/011G89/reg2/reducenat_graph_vs_lean.launch.log 2>&1 < /dev/null &
+```
+
+- pid=2205412（2026-09-26 00:09 起，launch.log 首行 oracle 自检 4.33.1/819816b2e0a3
+  在位，launch 行原文 `timeout 1500s, cap 7000MB`）。参考基线：G04 验收期单项
+  rc=0 wall 1012.0s/3951MB（09-21 图）；reg1 在 3-pool 内被杀时 1500.1s/6069MB
+  且仍在增长；015+011 后图 dims +32%，RSS 会高于 G04 期，帽 7000 是否够由本跑
+  实测定。
+- 判定：rc=0 → PASS；rc=124/137 → 复跑一次确认后按 015 先例（a0d18cb 格式：
+  帽值+实测依据注释）校准帽；语义 FAIL → 停手原文上报。
+- 简报波 1/波 2 其余 5 套件不重跑（S1 采信），三波并行方案作废（单套件
+  串行即足，机器纪律负担最小）。
+
+**S2 结果（2026-09-26）：rc=124 复现 → 帽校准 1500→2400**：
+
+- 第一跑（reg2/reducenat_graph_vs_lean/）：rc=124，`[mem-guard] wall 1500.1s
+  peak RSS 6068MB rc=-9 KILLED: wall 1500s > timeout`。被杀点=14/16 B 相例已过
+  （10 ACC 全过 + 4 REJ：r_add_op/r_succ_op/r_mul_res/r_pow_res 全 OK），
+  只剩 2 个廉价 reject 例（r_pow_cap_tie/r_shl_res）+ 汇总；A 相 31/31 全 OK。
+- 与 reg1 对照：reg1 在 3-pool 内被杀 1500.1s/6069MB，本跑单跑 1500.1s/6068MB
+  ——两次独立杀点 wall/RSS 几乎全同且未触 RSS 帽 7000 → 合法耗时长，非负载
+  漂移（reg1 的 124 不是并行争用假象）。外推真实 wall ≈ 1650–1750s。
+- 处置：按简报判定规则（单项复跑仍顶穿→校准帽）改
+  `scripts/run_cpu_regression.sh` reducenat 行 `1500|7000` → `2400|7000`，
+  注释记两次杀点实测与外推依据（a0d18cb 格式）；RSS 帽不动（实测 6068 < 7000，
+  余量由验证跑确认）。**验证复跑**（全新子目录 reg2/reducenat_graph_vs_lean_r2，
+  同参同模板）pid=2327716，期望 rc=0 并回填真实 wall 进脚本注释。
+
+**S3【已完成】23 行表回填**：reg1 17 个 rc=0 行保留原证据、wall/RSS 从 reg1
+.log 的 `[mem-guard]` 行提取；3 个 reg1 rc=124 行与 5 个 reg2 采信行 +
+reducenat 用 reg2 证据。wall/RSS 全部取 guard 行实测原文，非推算。
+
+**S4【已完成】完工交付**：23 行完整表 + 语义零 FAIL 声明（或 FAIL 报告）+
+帽变更清单（本拍零新变更；stepgraph 900→1200 系前代理在途产物，S1-f 证实
+充分）+ 总时长（reg1 05:10–06:27 + reg2 07:48–10:19 + reducenat 本拍）。
+
+---
+
+## 总控五道门验收（2026-09-26，总控）——卡 011 拍 2 收口 CLOSED
+
+1. **机械门**：lead canary 亲跑（核 8-13，`~/logs/011G89/lead2/`）：
+   `ref_vs_lean` **34/34 rc=0**（wall 1.5s/1315MB）；`engine_vs_refvm`
+   **34/34 verdicts correct + argmax/softmax 双流一致 34/34 rc=0**（585.1s/164MB，
+   known-value 3/4 = 卡 006 起 harness 既有报表项）。23 行表另经审核工程师
+   与 .rc/.log 逐行对照（含全部语义汇总行），无虚报。
+2. **语义门**：23 套件全为真 lean 4.33.1 差分（各 .log 首行 oracle 自检行；
+   reg2 残留段 5 处自检行验真）。
+3. **架构门**：本拍零代码改动（仅 handoff + 帽行）；真值
+   `step_vm_new_sparse.sbin` mtime 09-18 未动，engine artifact 前后一致。
+4. **测试门**：断言零放宽、用例零删除、NOT-VERIFIED=0（defeq_cache SKIP =
+   ADR 019 既有休眠登记）。
+5. **诚实门**：审核工程师独立复核 **PASS**（报告在案：逐 .rc 对照、采信链
+   a–f 验真、帽变更格式合规、触碰面恰 2 文件）；2 处记账缺陷（日期 4 处 +
+   "14:46"、S3/S4 状态行滞留待办）由总控当场勘正；**reg2 残留采信被追认**
+   （重跑清单留档 handoff 上文第 4 条，如后续存疑可执行）。
+
+**裁决**：卡 011 **CLOSED**（拍 1+拍 2 全绿）。落账：卡状态行 + verifier 集
+勾选（docs/plans/011）、真值表新增 `step_vm_011_scratch.sbin` 行
+（ARCHITECTURE）、reducenat 帽 2400（脚本）。
+
+**同会话邻接收口（lane 2，卡 016 拍 A）**：语义设计师交付 memo
+`docs/decisions/023-reduction-continuation-family-memo.md` + 卡 016 执行段；
+审核工程师独立复核 **PASS**（file:line 抽查 ~60 处 + 探针独立复跑逐字复现 +
+被拒案实证核查 + 铁律 3 合规）；7 处行引/2 处措辞勘误已由总控按审核指令
+当场落盘（结论不变）。拍 B 待派（次序：先 C-16.7.x-1 两名入 iv 族闭包种子
+→ 2-乙 摘 eG4IV2 → 3-甲 摘 g03g/g03h；动手前 F2 写点合同审计）。
+
+**下一队列**：卡 016 拍 B（图逻辑工程师）→ 拍 C 回归；卡 012 M-B（011 已
+收口，011 scratch 可用）；里程碑快照 public-main 更新与 push 仍待人工按键。
+
+---
+
+## 总控进度追记（2026-09-26 晨，总控）
+
+- **卡 011 CLOSED 已提交**（142cea3）；**卡 016 拍 A ACCEPTED 已提交**（5f783bc，
+  memo docs/decisions/023 + 审核勘误已落）。
+- **卡 012 M-B 拍 1（内存画像）ACCEPTED 已提交**（f26cb07 checkpoint →
+  cc91977 验收）：审核 PASS + 勘误 E1-E5 落盘；关键裁定——3000+ cid 规模差分
+  改走引擎通道，P1（alm_p2.py history numpy 化）为拍 2 设计输入。
+- **卡 016 拍 B 断点接手**：实现代理死于额度（第 5 起限流事故），死前完成
+  B1-B5（闭包种子/2-乙/F2 审计/3-甲/scratch 重编 34,663 dims +195），WIP 已
+  checkpoint（17a0b82）。续接代理补 B4x 记账（g04 全节 18/18）后 **B6 引擎
+  对拍 FAIL（33/34，succ_delta REJECT）**：B2 新增 decline 门把非零 Const
+  实参一律当 stuck 叶，缺 delta 可展开性判别；基线对照（015 sbin 34/34）坐实
+  回归，Python 侧 18/18 不可见。收尾代理按纪律停手上报（正确）。
+- **总控修复裁决（已授权续接代理执行）**：decline 门 Const 子句收窄为
+  "无值常量"（复用主机器 delta 展开的既有有值信号）；先 dbg+oracle 双探针
+  定案再改；修复后 B6→B7→B8→B9 全链重验。卡 016 执行段为实时账本。
+- 待办：拍 B 修复验收 → 拍 C 独立全量回归（测试工程师）→ 拍 D 审核 →
+  卡 016 收口提交；卡 012 拍 2（P1）开卡排产。
+
+---
+
+## 卡 016 拍 C 全量回归（测试工程师，2026-09-26）
+
+独立 verifier（干净上下文，与拍 B 实现者非同一会话）。触碰面：仅本板
+（handoff 006）；scripts/、tests/、lean_vm/、model/ 零触碰；禁 git。
+
+**S1【已完成】现场核对**（起跑前）：
+- HEAD=77f4b6e（拍 B 修复入库 commit），`git status --porcelain` 干净。
+- 真值 `model/step_vm_new_sparse.sbin` mtime 2026-09-18 05:39（18,888,194B，
+  未被拍 B 覆盖）；拍 B scratch `model/step_vm_016_scratch.sbin` mtime
+  09-26 06:59（23,235,098B，只读不覆盖）。
+- 回归脚本 23 套件清点无误；decl_injection 帽行 5000|9200 在位（脚本
+  SUITES 段 card 016 注释）；引擎套件走真值 sbin 且带 artifact drift 检查。
+- 核占用：14-19 无专属占用者；非本项目进程 `test_v2_equivalence.py`
+  （~1.2GB，亲和 0-19 未钉核）与总控 8-13 canary（verify_engine_vs_refvm
+  + vm_run on 016 scratch）在跑——只记录不干预；引擎套件走 unit PrivateTmp
+  互不污染。
+- oracle 钉 4.33.1 由脚本自检（`L4TVM_LEAN` 指向 v4.33.1 toolchain）。
+
+**S2【已完成】计划落盘 + 起跑**：全新 LOG_DIR，起跑后每 ~15-20min 轮询
+`.rc`；decl_injection 是长尾（预计 ~3800s），最后回填。判定规则：
+rc=0→PASS；rc≠0 先定性（帽顶穿 vs 语义 FAIL），语义 FAIL 立刻停手原文
+上报；帽顶穿按先例记录（帽改动决定权在总控，本拍只记实测）。跳过记
+NOT-VERIFIED，不放宽断言。已知：脚本开头自清 LOG_DIR 的 .log/.rc（run.log
+fd 会死）——证据以每套件 .log/.rc 为准，run.log 仅作启动确认。
+
+启动命令（与 011 拍 2 同构，REGRESSION_CORES=14-19，OMP_NUM_THREADS=3，
+JOBS 默认 3）：
+```
+cd /home/xkq/Lean4-Transformer-Vm-OSS && setsid nohup env OMP_NUM_THREADS=3 \
+  REGRESSION_CORES=14-19 REGRESSION_LOG_DIR=$HOME/logs/016C/reg \
+  bash scripts/run_cpu_regression.sh > $HOME/logs/016C/reg.run.log 2>&1 < /dev/null &
+```
+**pid=551211**（真驱动进程；起跑 2026-09-26 10:57（run.log mtime 10:57:12），
+oracle 自检行见 run.log 首行 Lean 4.33.1；简报命令基础上显式补
+PYTHON=/home/xkq/miniconda3/envs/train/bin/python 钉绝对解释器（AGENTS 机器
+纪律，裸 python3 当前也解析到同一 conda train env，语义零差异）；run.log 放
+016C/ 父目录、LOG_DIR 自清不波及，证据以每套件 .log/.rc 为准）。
+
+**S3【进行中】轮询与定性**（进行中，逐次追记）。
+
+**S4【待办】交付回填**：23 行表（rc/wall/RSS 取 [mem-guard] 行实测）+
+decl_injection 账目（106 checks + 0 xfail = 摘 g03g/g03h/eG4IV2 3 xfail +
+csctor 3 行新增）+ 与 011 基线（handoff 上文 1499-1523 行表）逐行差异 +
+语义零 FAIL 声明 + 总时长。
+
+### 拍 C 续跑（2026-10-04，新 verifier 会话；前链 pid=551211 止于 8/23，机器闲置 8 天）
+
+**S1'【已完成】现场复核**（10-04 06:26–06:40）：
+- HEAD=df17d8b，工作树干净；真值 sbin mtime 2026-09-18 05:39 18,888,194B
+  未动；016 scratch 09-26 06:59 只读如旧。
+- `python3`→`/home/xkq/miniconda3/envs/train/bin/python3`（numpy 2.5.2 /
+  torch 2.13.0 导入通过）；oracle 钉 4.33.1 自检通过；systemd user manager
+  存活（degraded=历史残留，systemd-run 可用）。
+- 无关进程记录不干预：`/tmp/audit_m33` 链 pytest test_ctransform.py
+  （pid 2462374，RSS 3.5GB 且增长中，外层 timeout 7200，亲和未钉核）。
+  重波前重查 `free -g`。
+- 016C reg 8 行 [mem-guard] 原文已提取（见 S4' 表），证据目录保留未清。
+
+**S3'【进行中】任务一：mutation_reject 定性与帽校准**（reducenat 先例，
+a0d18cb 格式；总控预授权分支 b）。分支：
+- a) 复跑 rc=0（<1200s）→ 016C 的 124 定性为 3-pool 争用性顶穿（同 011
+  reg1 1200.4s 先例），帽不动；
+- b) 复跑仍 ~1200s 顶穿且 RSS 远低于帽（两次独立杀点 wall 全同）→ 按预授权
+  改脚本 mutation_reject 行 `1200|4000`→`2000|4000`，注释记两次杀点实测
+  （016C reg 1200.3s/1930MB + mut2 实测）与 011 solo 基线 1079.9s（增长
+  归因=016 图 dims +203），`bash -n` 过后验证跑（LOG_DIR=016C/mut3）应
+  rc=0，真实 wall 回填注释与本板；
+- c) rc=137（RSS 帽杀）或语义 FAIL → 停手原文上报。
+
+**mut2 结果（10-04 06:30:48 起跑，06:50:48 出局）**：rc=124，
+`[mem-guard] wall 1200.3s peak RSS 1930MB rc=-9 KILLED: wall 1200s > timeout`
+——与 016C reg 杀点 **wall/RSS 逐字全同**（1200.3s/1930MB），RSS 远低于帽
+4000，两次 Part A 16/16 均绿后于 Part B 被杀 → 确定性杀点=合法耗时长非
+负载/非语义（011 solo 基线 1079.9s/2001MB，增长归因 016 图 dims +203）。
+命中分支 b：已按预授权改 `scripts/run_cpu_regression.sh` mutation_reject 行
+`1200|4000`→`2000|4000`（a0d18cb 格式注释记两次杀点 + 011 基线 + mut3
+待回填），`bash -n` rc=0。
+
+**mut3 验证跑（帽 2000）**：起跑 10-04 06:53:44，**driver pid=2470881**
+（transient unit guard 2000s/4000MB，钉核 14-19；launch.log 确认
+`timeout 2000s, cap 4000MB` + Lean 4.33.1 自检）。**结果 rc=0**（07:24:07
+出局，实际墙 1814.3s）：`[mem-guard] wall 1814.3s peak RSS 2014MB rc=0`，
+Part A 16/16 + Part B 8/8。真实 wall 1814.3s 已回填脚本注释。**余量注记
+（上报总控）**：2000/1814.3 仅 ~10% solo 余量，低于脚本惯例 1.5x；预授权
+只覆盖 1200→2000，未再自行上调，后续图增长须先复测。任务一闭环：
+mutation_reject 终态 = rc=0 PASS（mut3），016C reg 的 124 定性为合法
+耗时长（两次独立杀点 wall/RSS 逐字全同），帽 1200→2000 落地。
+
+启动命令（同 S2 模板换 LOG_DIR/SUITE_FILTER；不传 PYTHON——裸 python3 已
+验解析到同一 conda train env，与 011/016C 同参可比）：
+```
+cd /home/xkq/Lean4-Transformer-Vm-OSS && setsid nohup env OMP_NUM_THREADS=3 \
+  REGRESSION_CORES=14-19 REGRESSION_LOG_DIR=$HOME/logs/016C/mut2 \
+  SUITE_FILTER=mutation_reject bash scripts/run_cpu_regression.sh \
+  > $HOME/logs/016C/mut2.launch.log 2>&1 < /dev/null &
+```
+**pid=2468149**（driver；起跑 10-04 06:30:48（launch.log mtime），transient
+unit 2468163，guard 1200s/4000MB，钉核 14-19；launch.log 首行 Lean 4.33.1
+自检过）。
+
+**S3'' 任务二：余 15 套件补跑（5 波，波内并行/波间串行，REGRESSION_CORES=14-19）**。
+简报波清单合计 14 套，缺 kernel_oracle（脚本第 120 行，余 15 之一，011
+基线第 15 行）——按「余 15 套件补跑 + 23 行全表」要求并入波 1 第 4 实例
+（w1d，900s/4000MB 轻套件），帽与波框架不动，此为对简报的唯一增补。
+
+**波 1【已完成 10-04 07:36】7/7 rc=0，语义输出与 011 基线一致**：
+（07:30:27 四实例并发起跑；setsid 启动器 pid 2474240-2474243，fork 后即退，
+真实 driver 未逐个钉死——三实例秒级完赛即退，证据以每套件 .rc/.log 为准，
+后续波单独跑时钉 driver pid。）
+- w1a level_vs_lean 2.1s/1539MB 37/37；level_encoding 1.0s/1326MB 0 failures。
+- w1b env_meta 1.5s/1333MB 0 failures（round-trip 35/35）；env_meta_import
+  2.6s/1560MB 0 failures/259 checks。
+- w1c datadriven_env 235.3s/1361MB 32/32；datadriven_bool 56.3s/1438MB 12/12。
+- w1d kernel_oracle 4.1s/1364MB Part A 10/10 agree + B 3 capacity 0 failures。
+
+**波 2【已完成 10-04 08:05】3/3 rc=0，判定行全验真**：
+- w2a quot_graph_vs_lean 339.9s/5472MB（011：278.8s/5377MB）— 7/7 corpus,
+  A=4 meta, C-stuck=y, 0 failures。
+- w2b string_graph_vs_lean 948.6s/4482MB（011：903.5s/4493MB）— B 30/30,
+  C 3/3, 0 failures。
+- w2c defeq_branches_vs_lean 1637.7s/2388MB（011：1466.4s/2436MB）— ALL OK。
+
+**波 3【已完成 10-04 08:35】2/2 rc=0**：
+- w3a brec_drec_iota_vs_lean 1072.9s/7352MB（011：1060.4s/7266MB）—
+  0 divergences。
+- w3b reducenat_graph_vs_lean 1659.4s/6110MB（011 solo：1567.9s/6067MB）—
+  A=31, B=16, 0 failures（与 011 逐字同）。
+
+**波 4【已完成 10-04 09:11】2/2 rc=0**：
+- w4a defeq_cache_vs_lean 2139.1s/7361MB（011：2029.0s/7310MB）— ALL OK；
+  d6 P1+P2 arm 与 whnf phase 两相 SKIP=ADR 019 休眠既有登记（VM014_ALLOW_P2/
+  VM014_WMEMO 未开），与 011 同账非新增跳过。
+- w4b engine_vs_refvm 624.0s/164MB（011：569.1s/164MB）— 34/34 verdicts
+  correct + known 3/4（基线持平）+ 0 条意外 FAIL；artifact sbin-before==
+  sbin-after（2026-09-18 05:39:52, 18,888,194B）无漂移。
+
+**波 5【进行中 09:12 起跑】**：decl_injection_vs_lean（w5，driver
+pid=2506764，帽 5000s/9200MB，长尾单跑）。预期 106/106 + 0 xfail
+（=011 基线 103/103+3 xfail 摘 g03g/g03h/eG4IV2 + csctor 3 新行）。
+- 波 1（轻，4 实例并行）：level_（w1a：level_vs_lean+level_encoding）、
+  env_meta（w1b：两件）、datadriven（w1c：两件）、kernel_oracle（w1d）。
+- 波 2（中，3 并行）：quot_graph_vs_lean（w2a，帽 6500）+
+  string_graph_vs_lean（w2b，帽 7500）+ defeq_branches_vs_lean（w2c，帽 3000）。
+- 波 3（重，2 并行）：brec_drec_iota_vs_lean（w3a，帽 8000）+
+  reducenat_graph_vs_lean（w3b，帽 7000）。波前 `free -g`，可用 <14GB 改串行。
+- 波 4：defeq_cache_vs_lean（w4a，帽 8000）+ engine_vs_refvm（w4b）。
+- 波 5（长尾单跑）：decl_injection_vs_lean（w5，帽 5000|9200）；预期
+  106/106 + 0 xfail（=011 基线 103+3xfail 摘 3 + csctor 3 新行）。
+判定规则照 S2（rc=0→PASS；rc≠0 先定性，帽顶穿只记实测不自行改帽——
+mutation 分支 b 除外；语义 FAIL 停手原文上报；跳过记 NOT-VERIFIED）。
+各波启动后 pid 即回填本板。
+
+**S4'【已完成 10-04 10:40】交付回填：23 行完整表**（rc/wall/RSS 全部取
+[mem-guard] 行实测原文；011 基线=上文 1499-1523 行表；差异注记逐行给出）。
+
+| # | 套件 | rc | wall | RSS 峰值 | 定性 | 证据源与 011 差异注记 |
+|---|---|---|---|---|---|---|
+| 1 | ref_vs_lean | 0 | 1.0s | 1317MB | PASS | 016C reg；34/34（011：1.0s/1323MB 同账） |
+| 2 | ref_infer_defeq | 0 | 1.0s | 1320MB | PASS | 016C reg；82/82（2 brec-sum 跳过=登记基线；011：1.0s/1327MB 同账） |
+| 3 | stepgraph_vs_refvm | 0 | 1154.9s | 1826MB | PASS | 016C reg；37/37 (0 pinned)（011：1002.5s/1812MB；wall +15.2%） |
+| 4 | stepgraph_vs_lean | 0 | 1188.8s | 1826MB | PASS | 016C reg；34/34（011：1139.3s/1811MB；wall +4.3%） |
+| 5 | stepgraph_infer_defeq | 0 | 3106.9s | 2243MB | PASS | 016C reg；84/84（011：3174.1s/2242MB；wall -2.1%） |
+| 6 | check_e2e | 0 | 770.9s | 1344MB | PASS | 016C reg；A 15/15, B 15/15（011：670.9s/1390MB；wall +14.9%） |
+| 7 | mutation_reject | 0 | 1814.3s | 2014MB | PASS | 终态=mut3 验证跑（10-04，帽 2000）；A 16/16 + B 8/8。史：016C reg 3-pool rc=124（1200.3s/1930MB）→ mut2 solo 复跑 rc=124（1200.3s/1930MB，与 reg 杀点 wall/RSS 逐字全同=合法耗时长非负载）→ 帽 1200→2000（总控预授权，a0d18cb 格式）→ mut3 rc=0（011 solo：1079.9s/2001MB；wall +68%，归因 016 dims +203；2000 帽 solo 余量 ~10%） |
+| 8 | olean_export | 0 | 637.5s | 1447MB | PASS | 016C reg；A 21/21, B 17/17（011：621.7s/1563MB；wall +2.5%） |
+| 9 | datadriven_env | 0 | 235.3s | 1361MB | PASS | w1c；32/32（011：259.4s/1561MB） |
+| 10 | datadriven_bool | 0 | 56.3s | 1438MB | PASS | w1c；12/12（011：64.4s/1595MB） |
+| 11 | level_vs_lean | 0 | 2.1s | 1539MB | PASS | w1a；37/37（011：7.1s/1457MB） |
+| 12 | level_encoding | 0 | 1.0s | 1326MB | PASS | w1a；0 failures（011：1.5s/1503MB） |
+| 13 | env_meta | 0 | 1.5s | 1333MB | PASS | w1b；0 failures + round-trip 35/35（011：1.5s/1324MB 同账） |
+| 14 | env_meta_import | 0 | 2.6s | 1560MB | PASS | w1b；0 failures/259 checks（011：2.0s/1525MB 同账） |
+| 15 | kernel_oracle | 0 | 4.1s | 1364MB | PASS | w1d；A 10/10 agree, B 3 capacity（011：3.5s/1401MB 同账；简报波清单漏项，按「余 15 套件」补入波 1） |
+| 16 | quot_graph_vs_lean | 0 | 339.9s | 5472MB | PASS | w2a；7/7 corpus, A=4 meta, 0 failures（011：278.8s/5377MB；wall +21.9%） |
+| 17 | string_graph_vs_lean | 0 | 948.6s | 4482MB | PASS | w2b；B 30/30, C 3/3（011：903.5s/4493MB；wall +5.0%） |
+| 18 | reducenat_graph_vs_lean | 0 | 1659.4s | 6110MB | PASS | w3b；A=31, B=16, 0 failures（011 solo：1567.9s/6067MB；wall +5.8%） |
+| 19 | defeq_branches_vs_lean | 0 | 1637.7s | 2388MB | PASS | w2c；ALL OK（011：1466.4s/2436MB；wall +11.7%） |
+| 20 | brec_drec_iota_vs_lean | 0 | 1072.9s | 7352MB | PASS | w3a；0 divergences（011：1060.4s/7266MB；wall +1.2%, RSS +1.2%） |
+| 21 | defeq_cache_vs_lean | 0 | 2139.1s | 7361MB | PASS | w4a；ALL OK；d6-P2 与 whnf 两相 SKIP=ADR 019 休眠既有登记非新增（011：2029.0s/7310MB；wall +5.4%） |
+| 22 | decl_injection_vs_lean | 0 | 4888.0s | 7629MB | PASS | w5；106/106 checks + 0 xfail + 0 fail（=011 基线 103+3xfail 摘 g03g/g03h/eG4IV2 + csctor 3 新行，账目吻合）。**帽余量警报（上报总控）**：5000s 帽 solo 余量仅 2.2%（RSS 9200 余量 17%）；wall 较 016B reg4 solo 3798.0s（同 106 checks 同机）+28.7%，较 011 in-pool 4411.3s +10.8%——漂移超出 dims +203 的可解释面，是否上调帽由总控决定 |
+| 23 | engine_vs_refvm | 0 | 624.0s | 164MB | PASS | w4b；34/34 verdicts + known 3/4（基线持平）+ 0 条意外 FAIL；artifact sbin-before==sbin-after（2026-09-18 05:39, 18,888,194B）无漂移（011：569.1s/164MB） |
+
+**23/23 rc=0，语义零 FAIL**：每行套件输出汇总行逐一验真（34/34、82/82、
+37/37、34/34、84/84、A15/B15、A16/16+B8/8、A21/B17、32/32、12/12、37/37、
+0 failures、0 failures/259、10/10、7/7、30/30+3/3、A=31+B=16、ALL OK、
+0 divergences、ALL OK、106/106+0 xfail、34/34+known 3/4）；无一处判定
+不一致，无一处为绿灯放宽断言或删用例；唯一 rc≠0 记录（mutation 016C reg
+与 mut2 的 124）已定性为合法耗时长并经帽校准+mut3 rc=0 闭环。
+
+**帽变更清单**：
+- `mutation_reject`：1200\|4000 → 2000\|4000（总控预授权；两次独立杀点
+  wall/RSS 逐字全同；mut3 验证 rc=0，真实 wall 1814.3s 已回填脚本注释；
+  solo 余量 ~10% 注记在案，后续图增长先复测）。
+- `decl_injection_vs_lean`：5000\|9200 未动（本拍实测 4888.0s 顶到 2.2%
+  余量；无预授权不自行上调，是否上调由总控决定）。
+
+**总时长与峰值并发**：证据执行窗口 06:30:48（mut2 起）→ 10:33:46（w5 收）
+≈ 4h03m；23 行套件墙钟合计 23,488s（≈6h31m）经波内并行压缩（mutation
+另含弃跑 mut2 1200.3s）。峰值并发 = 波 1 四实例 7 套件进程（瞬时 RSS 需求
+~10GB）；峰值 RSS 需求 = 波 3（brec 7352 + reducenat 6110，峰不重叠，
+<13.4GB），全程无 OOM、无 RSS 帽杀（唯一杀点=mutation 旧 1200 帽）。机器
+可用内存最低 ~11GB（波 5 尾段，9200 帽内）。无关进程 /tmp/audit_m33
+test_ctransform.py（RSS 3.5GB，timeout 7200 包裹）于波 3 前自然退场，未
+干预未误杀。
+
+**证据目录**：016C/reg（8 行 09-26 链）、016C/mut2+mut3（任务一）、
+016C/w1a-w1d、w2a-w2c、w3a-w3b、w4a-w4b、w5（10-04 波 1-5）；各 .rc/.log
+均落盘。改动文件仅：本板 + scripts/run_cpu_regression.sh（mutation 帽行
+一处，预授权内）；tests/、lean_vm/、engine/、model/ 零触碰；未动 git。
+
+---
+
+## 总控五道门收口（2026-10-04，总控）——卡 016 CLOSED
+
+1. **机械门**：lead canary `ref_vs_lean` 34/34 rc=0（`~/logs/016D/lead/canary1/`，
+   核 8-13，HEAD df17d8b）；引擎 34/34 已三次独立（F7/F0y/016C w4b）；拍 C
+   23/23 rc=0 经拍 D 审核逐行对照（抽 6 行 .log 语义汇总逐字验真）。
+2. **语义门**：摘 3 XFAIL + csctor 3 行全部 oracle 现跑；拍 D 轻量探针复核
+   （修前计数器逐值全同 / 修后 succ_delta 79 步 AGREE / pre-B 逐值还原）。
+3. **架构门**：diff 逐块零新增具名 cid/常量分支（两轮自查 + 拍 D 复核）；
+   decline 取值电路与主机器 const_delta 同寻址；MODE_STRIDE=128 落地 B3
+   约束 (a)/(b)。
+4. **测试门**：断言零放宽、用例零删除（摘 xfail 标签 ≠ 删行，行仍判定）；
+   XPASS 协议在位（tests 三处 XPASS 计入 fails）。
+5. **诚实门**：拍 D 审核 PASS（五道门全过；4 minor 已由总控当场落：真值表
+   016 行、卡 checkbox、VM_SPEC memo 指针、B15 锚 + 脚本路径勘正）；两条
+   残余债如实登记；帽校准（mutation 2700 = 1814.3×1.49、decl_injection
+   7200 = 4888×1.47）a0d18cb 格式，实测依据注释在脚本。
+
+**裁决**：卡 016 **CLOSED**。落账：卡状态行 + verifier 勾选、ARCHITECTURE
+真值表 `step_vm_016_scratch.sbin` 行（md5 4d2564a27534065e9299d40c6383c1c1）、
+KERNEL_COVERAGE G2/B15、VM_SPEC §16.7.1/16.7.2、帽 2700/7200。
+
+**下一队列**：卡 012 拍 2（P1 history numpy 化，开卡时按 024 E5 把画像探针
+提升进 scripts/）→ 卡 012 M-C/M-D（规模差分走引擎通道，拍 1 裁定）；
+里程碑快照 public-main 更新与 push 仍待人工按键。
