@@ -99,7 +99,7 @@ ENGINE = os.environ.get("VM_ENGINE",
 SBIN = os.environ.get(
     "MC_SBIN",
     str(Path(__file__).resolve().parents[1] / "model"
-        / "step_vm_021_scratch.sbin"))
+        / "step_vm_022b_scratch.sbin"))
 # closures whose rows also run through the engine on the FULL closure env
 ENGINE_FULL = {s for s in os.environ.get("MC_ENGINE_FULL",
                                         "Quot_liftOn_mk").split(",") if s}

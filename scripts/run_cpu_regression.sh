@@ -125,7 +125,11 @@ SUITES=(
     # card 021 reg calibration (2026-10-15): post-fix pool killed at the wall
     # cap (1500.2s/1543MB); solo true wall 1180.6s/1540MB rc=0 (34/34,
     # ~/logs/021/reg_solo) -> 1500->1800 (1180.6 x 1.53).
-    "1800|4000|stepgraph_vs_lean|tests/test_stepgraph_vs_lean.py"
+    # card 022 reg calibration (2026-10-23): the 26-suite pool ran 1667.8s
+    # under the 1800 cap (7.9% margin) while solo truth is 1180.6s -> pool
+    # inflation x1.41; lifting to 2400 (1667.8 x 1.44) keeps a real slowdown
+    # visible instead of a cap kill.  Re-measure at every graph growth.
+    "2400|4000|stepgraph_vs_lean|tests/test_stepgraph_vs_lean.py"
     # card 018 B3 (2026-10-12, lead re-calibration): 3300->4500 — 016-era
     # solo wall 3106.9s; under concurrent neighbor GPU-training load the 018
     # graph killed at 3300s with 78/84 rows all PASS 0 FAIL (legit slow, not

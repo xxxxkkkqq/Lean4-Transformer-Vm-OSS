@@ -89,7 +89,11 @@ def main():
         "add_lits": LitNat(8),
         "delta_two": LitNat(2),
         "delta_beta": LitNat(42),
-        "succ_zero": App(Const("Nat.succ"), Const("Nat.zero")),
+        # `Nat.succ Nat.zero` normalises to the numeral literal 1 in the
+        # machine (kernel nat_lit <-> constructor conversion makes them
+        # definitionally equal); the old constructor-form expectation was a
+        # stale notation, not a value mismatch (card 022 reg audit).
+        "succ_zero": LitNat(1),
     }
     n_ok = n_stream_same = n_known_ok = n_skip = 0
     fails = []
