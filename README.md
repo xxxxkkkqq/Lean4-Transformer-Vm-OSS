@@ -6,6 +6,21 @@ normalization (WHNF), type inference, definitional equality — as one ALM
 weights from that graph in closed form (no training). The transformer's
 autoregressive forward pass executes the kernel's checking steps.
 
+## Status (2026-10-23)
+
+The current artifact is a 133-layer, d_model=11,888 sparse fp32 transformer
+(363,318 nonzeros in a 36,851,134-byte `L4SV v2` binary,
+`model/step_vm_022b_scratch.sbin`; the truth table in `ARCHITECTURE.md` lists
+which artifact is valid). The kernel-rule closure now covers the whole checked
+corpus: the mathlib closure differential — 35 declarations from three real
+Mathlib closures, judged on four channels (step graph, reference machine,
+compiled C++ engine, and the engine on the full closure environment) against a
+live `lean` 4.33.1 — passes with **zero registered gaps**. The 26-suite CPU
+regression is green (the two small mathlib segments are re-run solo under
+their recalibrated caps; see the comments in `scripts/run_cpu_regression.sh`).
+No semantic gap remains open on the checked corpus; remaining work is the
+scope noted under "What is not implemented".
+
 ## Acceptance criterion
 
 For the same input — an elaborated declaration together with its environment —
@@ -47,8 +62,12 @@ serialized into a token stream (`expr/tokens.py`).
   performed over autoregressive time: one micro-step produces one token, so
   the graph depth is constant and does not grow with the input.
 - **A reference machine** (`lean_vm/ref_vm.py`), a plain Python interpreter of
-  the same instruction-level specification (`docs/VM_SPEC.md`). It is used for
-  fast semantic iteration. It is not the judge.
+  the same instruction-level specification (`docs/VM_SPEC.md`), including the
+  kernel's quot reduction (`K/quot.h`) and a monomorphic `infer_proj` (spine
+  peel + parameter instantiation with the kernel's Prop guard). It is used for
+  fast semantic iteration and as one of the differential channels; it is not
+  the judge, and its subset boundaries are printed rather than silently
+  accepted.
 - **The real Lean binary as the only judge** (`reference/lean_ref.py`). Every
   semantic result is differential-tested against the installed `lean`
   (v4.33.1). The local `/home/xkq/lean4` tree is a 4.35 checkout and is used
@@ -58,12 +77,18 @@ serialized into a token stream (`expr/tokens.py`).
   constants) used to drive the differential tests.
 - **Weight compilation** (`model/compile_vm.py`, `compiler/`): MILP layer
   scheduling followed by closed-form weight construction. The current artifact
-  is a 109-layer, d_model=6222 sparse (CSR) transformer in fp32 — 186,892
-  nonzeros in an 18,027,726-byte `L4SV v2` binary (the old dense float64
+  is a 133-layer, d_model=11,888 sparse (CSR) transformer in fp32 —
+  363,318 nonzeros in a 36,851,134-byte `L4SV v2` binary (the old dense float64
   form, 511M parameters, was retired per `docs/decisions/005-*.md`: 19GB,
   OOM on this box; see `ARCHITECTURE.md` truth table).
 - **A C++17 executor** (`engine/vm.cpp`) that loads the compiled weight binary
-  and runs the WHNF slice without Python or torch.
+  and runs the graph's WHNF, INFER, DEFEQ and CHECK tasks without Python or
+  torch; its `check` channel is used as a judging leg by the mathlib closure
+  differential.
+- **A mathlib closure differential** (`tests/test_mathlib_closure_vs_lean.py`):
+  35 declarations from three real Mathlib closures (`Quot.liftOn_mk`,
+  `Vector3.cons_fz`, `Nat.testBit_land`), each judged on four channels against
+  a live Lean kernel run over the same per-case minimal environment.
 - **An `.olean` export path** (`reference/olean_export.py`) that dumps a
   constant subset from the real Lean `Environment` API for a restricted set of
   monomorphic declarations (definition / constructor / inductive; theorem,
@@ -83,10 +108,13 @@ is a release gate run only after a weight recompile):
 | end-to-end CHECK | real Lean binary (exit code) | `tests/test_check_e2e.py` |
 | mutation rejection + localization | real Lean binary | `tests/test_mutation_reject.py` |
 | exported `.olean` environment | real Lean binary | `tests/test_olean_export.py` |
-| compiled weights / C++ engine | reference machine | `scripts/verify_engine_vs_refvm.py` (WHNF slice only — the engine cannot drive INFER/DEFEQ/CHECK yet, see `docs/decisions/005-*.md`) |
+| compiled weights / C++ engine | reference machine (34-case WHNF corpus) | `scripts/verify_engine_vs_refvm.py` |
+| compiled weights / C++ engine, `check` mode | real Lean binary | `tests/test_mathlib_closure_vs_lean.py` (engine and full-closure engine legs) |
 
 Corpus sizes: WHNF 34 cases, INFER/DEFEQ 84 cases (82 have a real-Lean
-mirror), CHECK 15 cases, mutation 16 + localization 8.
+mirror), CHECK 15 cases, declaration injection 153 checks (+1 registered
+xfail), mutation 16 + localization 8, mathlib closure 35 declarations x 4
+channels.
 
 Why the kernel inside the weights instead of calling out to a Lean binary:
 the weights that write proofs and the weights that check proofs are one and
@@ -95,39 +123,35 @@ The further research line — a differentiable judge — is gated on an unsolved
 precision floor (fp32 is the usable minimum) and is not a current commitment
 (`docs/DESIGN.md` §1, motivation).
 
-## What is not implemented
+## What is not implemented / current boundaries
 
-- **Constant metadata is environment data, not code** — but only for the
-  scanned names: ids, structure layouts and `casesOn` arities come from the
-  `.olean` export + name scan (`build_vm.py` `_SCAN_OPS`, WP1/WP8). One
-  hardcoded cid remains as a known defect (`CID_P2MK + 1` in
-  `build_vm.py:4723`), and Mathlib has not been tried end-to-end.
-- **The compiled weights are verified for WHNF only.** INFER/DEFEQ/CHECK have
-  been validated through the graph and the reference machine against the real
-  Lean binary, but have not been exercised through the compiled weights, and
-  `model/runner.py` has no infer/defeq/check or reject handling.
-- **Kernel rules still missing**: general recursor iota for
-  `brecOn`/`drecOn` (card 009), full universe-level normalization (D1/D2
-  `mk_max`/`mk_imax`), and the declaration-injection checks that need the
-  step_driver protocol upgrade — theorem `is_prop` (G3), unsafe register-then-
-  check (G2), mutual-block visibility (G6), name reuse and duplicate-univ
-  rejection (G8/G9) — scheduled as cards 010/011 per `docs/decisions/014-*.md`.
-  Quot (WP4), string literals incl. `try_string_lit_expansion` (WP5), the
-  `reduce_nat` bit-op and size-bound family (WP6, card 006), the remaining
-  `is_def_eq` branches — reflection, cheap_proj whnf, lazy-delta hints,
-  offset literals, `try_unfold_proj_app` — plus the
-  `check_constant_val`/`add_axiom`/safety-gate error classes
-  (A14/A15/A17/A26/A30, G1/G2/G4/G5/G7/G10/G11; WP7, card 007) are
-  implemented, and the compiled engine channel passes the full 34-case WHNF
-  corpus incl. `Nat.pow` (the ±1000 ReGLU clamp that flattened stream
-  positions above 998 was raised to `REGLU_CLAMP = 1e6` in card 008).
+- **Mathlib coverage is an excerpt, not the library**: three closures (874
+  constants) are exercised per case on per-case minimal environments. The
+  whole library is out of reach today — the compiled engine's cost is
+  superlinear in stream length (45.6k-token full-environment checks exceed an
+  hour; `docs/VM_SPEC.md` §19), so scale evidence is per-case minimal
+  environments plus the Quot full-closure engine leg. The name-blind channels
+  (reference machine, engine) also cannot judge `alreadyDeclared` rows: they
+  carry no name space.
+- **Constant metadata is environment data, not code** — for the scanned names:
+  ids, structure layouts and `casesOn` arities come from the `.olean` export +
+  name scan (`build_vm.py` `_SCAN_OPS`, WP1/WP8). One hardcoded cid remains as
+  a known defect (`CID_P2MK` in `build_vm.py`), not as an implementation
+  technique.
+- **The Python weight runner** (`model/runner.py`) has no infer/defeq/check or
+  reject handling; the compiled channel's judging path is the C++ engine
+  (`vm_run <sbin> <stream> <pos> check ...`).
+- **Reference-machine subset boundaries** (printed, never silent): `infer_proj`
+  refuses dependent-field projections and indexed inductives (conservative),
+  has no theorem kind gate, and the machine is name-blind.
 - **No source-level input**: no parser, no elaborator, no tactics.
 - **`native_decide` / `Lean.reduceBool`**: the real kernel calls compiled code
   here and trusts it through the axiom `Lean.ofReduceBool`. This cannot be
   reproduced inside the graph; matching the verdict requires treating it the
   same way the kernel does, as an axiom.
 - **Performance at proof scale**: one token per micro-step, strictly serial.
-  The current numbers are for toy inputs.
+  The measured cost curves (Python evaluator and compiled engine) are in
+  `docs/VM_SPEC.md` §19.
 
 ## Structure
 
@@ -143,13 +167,15 @@ precision floor (fp32 is the usable minimum) and is not a current commitment
 ## Quick start
 
 ```bash
-# Differential suites (CPU only). Note: the test_*.py files are NOT pytest
-# suites (pytest collects 0 items — each file has its own main());
-# run_cpu_regression.sh is the single entry point.
+# Differential suites (CPU only, 26 entries). Note: the test_*.py files are
+# NOT pytest suites (pytest collects 0 items — each file has its own main());
+# run_cpu_regression.sh is the single entry point. The mathlib closure
+# differential runs as three per-closure segments (mathlib_quot / _vector3 /
+# _nat) because the full 35-row run takes hours.
 bash scripts/run_cpu_regression.sh
 
 # Compile the graph into transformer weights (sparse-native, never dense)
-python3 -u model/compile_vm.py --sparse model/step_vm_new_sparse   # -> .sbin
+python3 -u model/compile_vm.py --sparse model/step_vm_022b_scratch   # -> .sbin
 
 # C++ engine
 make -C engine && python3 scripts/verify_engine_vs_refvm.py
