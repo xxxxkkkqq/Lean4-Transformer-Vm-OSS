@@ -21,6 +21,7 @@ from expr.model import (
     K_LIT, K_MDATA, K_PROJ,
     KL_ZERO, KL_SUCC, KL_MAX, KL_IMAX, KL_PARAM, KL_MVAR,
     BI_DEFAULT, LIT_NAT, LIT_STR,
+    level_normalize,
 )
 
 # ── Non-expr token kinds (VM_SPEC §2-§7) ────────────────────────────────────
@@ -484,6 +485,62 @@ class Encoder:
             if rhs is not None:
                 self._collect_names(rhs)
 
+    def _min_field_ref(self, e: Expr, depth: int, np: int, acc: int) -> int:
+        """Card 019: min field-binder index (>= np) referenced anywhere in
+        the ctor type tree `e`, threaded through `acc` (cap 4094 = none).
+        Binder index of BVar(k) at depth d is d-1-k; a reference to binder b
+        only occurs at depth > b (a domain cannot reference its own binder),
+        so "referenced anywhere" is exactly the kernel's per-step
+        has_loose_bvars condition restated globally (K/type_checker.cpp:
+        277-281)."""
+        if acc <= np:
+            return acc
+        if isinstance(e, BVar):
+            b = depth - 1 - e.idx
+            if np <= b < acc:
+                return b
+            return acc
+        if isinstance(e, (Pi, Lam)):
+            acc = self._min_field_ref(e.domain, depth, np, acc)
+            return self._min_field_ref(e.body, depth + 1, np, acc)
+        if isinstance(e, App):
+            acc = self._min_field_ref(e.fn, depth, np, acc)
+            return self._min_field_ref(e.arg, depth, np, acc)
+        if isinstance(e, Let):
+            acc = self._min_field_ref(e.domain, depth, np, acc)
+            acc = self._min_field_ref(e.value, depth, np, acc)
+            return self._min_field_ref(e.body, depth + 1, np, acc)
+        if isinstance(e, (MData, Proj)):
+            return self._min_field_ref(e.child, depth, np, acc)
+        return acc  # Const / Sort / Lit / FVar / MVar: no binder refs
+
+    def _decl_sort_is_prop(self, e: Expr) -> int:
+        """Card 019: 1 iff the declared type `e` (Pi chain over the params,
+        then the result Sort) ends in a Sort whose level normalizes to zero
+        — the kernel's is_prop of a fully-applied inductive
+        (K/type_checker.cpp:383-389, normalizes_to_zero rules of
+        K/level.cpp:174-186: Zero->1, Succ/Param/MVar->0, Max->both,
+        IMax->rhs).  The graph reads this bit instead of re-walking the
+        tree (INDEXTRA.X); the graph-side n2z circuit stays the judge for
+        runtime-inferred sorts."""
+        while isinstance(e, Pi):
+            e = e.body
+        if not isinstance(e, Sort):
+            return 0
+        return 1 if self._lvl_norms_zero(e.level) else 0
+
+    def _lvl_norms_zero(self, lv: Level) -> bool:
+        if isinstance(lv, LZero):
+            return True
+        if isinstance(lv, (LSucc, LParam, LMVar)):
+            return False
+        if isinstance(lv, LMax):
+            return (self._lvl_norms_zero(lv.a)
+                    and self._lvl_norms_zero(lv.b))
+        if isinstance(lv, LIMax):
+            return self._lvl_norms_zero(lv.b)
+        return False
+
     def _emit_metadata(self, consts):
         """Emit the specialized metadata region per ENV_FORMAT §2.4-§2.7:
         scalar/extra tokens (24-28, 36-38), then rule chains (29), then list
@@ -530,9 +587,31 @@ class Encoder:
             elif kind == CK_INDUCTIVE:
                 np = int(m.get("nparams", 0)); ni = int(m.get("nindices", 0))
                 nn = int(m.get("nnested", 0))
-                pos = b.push(T_ENV_INDVAL, cid, np, ni, nn, 0, 0)
-                extra = b.push(T_ENV_INDEXTRA, cid, 0, 0, 0, 0, 0)
-                b.stream[pos] = (T_ENV_INDVAL, cid, np, ni, nn, 0, extra)
+                # Card 019 (ENV_FORMAT §2.4): two encoder-precomputed
+                # declaration scalars the graph cannot derive with bounded
+                # circuits.  INDVAL.E2 = dep-min + 1 with 0 reserved for
+                # legacy streams (gate off); dep-min = min field-binder
+                # index (>= nparams) referenced in the FIRST ctor's type
+                # (kernel head(cnstrs), K/type_checker.cpp:263-266), 4094
+                # = none.  A projection with field idx > dep-min is exactly
+                # the kernel's has_loose_bvars throw (:277-281), which the
+                # graph answers with the card 017 conservative reject.
+                # INDEXTRA.X = is_prop bit of the declared result sort.
+                dep_min = 0  # conservative: any idx >= 1 flags
+                ctors = m.get("ctors") or []
+                if ctors:
+                    ccid = b.cids.get(ctors[0])
+                    cty = self._const_type_expr.get(ccid) \
+                        if ccid is not None else None
+                    if cty is not None:
+                        dep_min = min(self._min_field_ref(cty, 0, np, 4094),
+                                      4094)
+                prop_bit = self._decl_sort_is_prop(
+                    self._const_type_expr.get(cid, Sort(LZero())))
+                pos = b.push(T_ENV_INDVAL, cid, np, ni, nn, 0, dep_min + 1)
+                extra = b.push(T_ENV_INDEXTRA, cid, 0, 0, prop_bit, 0, 0)
+                b.stream[pos] = (T_ENV_INDVAL, cid, np, ni, nn,
+                                 dep_min + 1, extra)
                 pending.append((extra, 2, "all", cid))     # V1 = all_head
                 pending.append((extra, 3, "ctors", cid))   # V2 = ctors_head
                 head = pos
@@ -843,7 +922,8 @@ class Encoder:
                 spec = self._specialize_type(cid, e.levels)
             cpos = b.push(K_CONST, V0=cid, V2=_p(parent))
             if e.levels:
-                roots = [self._enc_level(l, parent_pos=cpos) for l in e.levels]
+                roots = [self._enc_level(l, parent_pos=cpos, shadow=False)
+                         for l in e.levels]
                 for i, r in enumerate(roots):
                     nxt = roots[i + 1] if i + 1 < len(roots) else 0
                     t = b.stream[r]
@@ -920,19 +1000,74 @@ class Encoder:
             return pos
         raise TypeError(type(e))
 
-    def _enc_level(self, l: Level, parent_pos: Optional[int]) -> int:
+    def _enc_level(self, l: Level, parent_pos: Optional[int],
+                   shadow: bool = True) -> int:
+        # ADR 026 canonical-by-construction: every level entering the graph
+        # is the kernel's normalize form (one-shot, path-asymmetric — see
+        # expr/model.py), so graph-held level terms are exactly
+        # normalize(<kernel-side term>) and deq is structural.  The sort key
+        # is the nid table: same fixed total order the runtime fold's
+        # emission compare uses.  normalize runs ONCE, at the root; the
+        # whole tree is then encoded with the RAW recursion below — children
+        # of a normalize output are canonical, and re-normalizing them is
+        # the double-normalize class (imax-path children re-sort:
+        # normalize(max(u,1)) = max(1,u) differs from the pairwise form the
+        # kernel produced — review finding 1's second face).
+        source_l = l
+        l = level_normalize(l, self.b.nid)
+        pos = self._enc_level_raw(l, parent_pos)
+        # card 021 succ-canonical shadow: infer_sort wraps mk_succ over the
+        # SOURCE level root at runtime (K/type_checker.cpp:345-348), so the
+        # kernel's comparison form for the wrapped sort level is
+        # normalize(succ(L_source)) — computed FROM THE SOURCE (computing it
+        # from the normalized form re-normalizes and diverges on the
+        # non-idempotent imax class).  The graph's runtime wrap cannot
+        # re-normalize, so a Sort-term level root carries the precomputed
+        # shadow in the free E2 slot; I_SORTEM consumes the shadow instead
+        # of emitting a raw succ node.  Shadow=True ONLY for Sort-term
+        # level roots — I_SORTEM never reads a Const level-arg root, and
+        # shadows elsewhere would only bloat the stream against the
+        # 4096-token compile window (kernel_oracle Part B capacity).
+        if shadow:
+            b = self.b
+            try:
+                cache = self._lvl_shadow_cache
+            except AttributeError:
+                cache = self._lvl_shadow_cache = {}
+            # one shadow tree per DISTINCT SOURCE level term — the source
+            # term is a hashable frozen dataclass; the shadow root carries
+            # no parent pointer, so sharing is safe.  Keying on the SOURCE
+            # (not the normalized form) keeps distinct sources that share a
+            # normalized form from sharing a shadow — their succ-wraps
+            # normalize differently (the imax class).
+            spos = cache.get(source_l)
+            if spos is None:
+                sh = level_normalize(LSucc(source_l), b.nid)
+                spos = self._enc_level_raw(sh, None)
+                cache[source_l] = spos
+            t = b.stream[pos]
+            # E2 slot, not X: Const level-arg chains link roots through X
+            # (the sibling-chain write below runs after _enc_level and
+            # owns X).
+            b.stream[pos] = (t[0], t[1], t[2], t[3], t[4], spos, t[6])
+        return pos
+
+    def _enc_level_raw(self, l: Level, parent_pos: Optional[int]) -> int:
+        # RAW recursion: no normalize (the caller normalized the root;
+        # children of a normalize output are canonical), no shadows
+        # (Sort-term roots only, emitted by _enc_level above).
         b = self.b
         if isinstance(l, LZero):
             return b.push(KL_ZERO, V2=_p(parent_pos))
         if isinstance(l, LSucc):
-            c = self._enc_level(l.l, None)
+            c = self._enc_level_raw(l.l, None)
             pos = b.push(KL_SUCC, V0=c, V2=_p(parent_pos))
             _fix_parent(b.stream, c, pos)
             return pos
         if isinstance(l, (LMax, LIMax)):
             K = KL_MAX if isinstance(l, LMax) else KL_IMAX
-            a = self._enc_level(l.a, None)
-            c = self._enc_level(l.b, None)
+            a = self._enc_level_raw(l.a, None)
+            c = self._enc_level_raw(l.b, None)
             pos = b.push(K, V0=a, V1=c, V2=_p(parent_pos))
             _fix_parent(b.stream, a, pos)
             _fix_parent(b.stream, c, pos)
@@ -942,6 +1077,7 @@ class Encoder:
         if isinstance(l, LMVar):
             return b.push(KL_MVAR, V0=b.nid(l.name), V2=_p(parent_pos))
         raise TypeError(type(l))
+
 
 
 def _p(parent: Optional[int]) -> int:

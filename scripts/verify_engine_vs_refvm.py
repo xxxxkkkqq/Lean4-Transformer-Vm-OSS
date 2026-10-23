@@ -75,6 +75,7 @@ def run_engine(stream, term_pos, softmax=False, max_steps=3000):
 
 
 def main():
+    print(f"SBIN under test: {SBIN}", flush=True)
     # Daily-regression mode: `--skip-cases pow` excludes cases that are known
     # FAILING *and non-halting* under the engine F-channel off-by-one (card
     # 006): the skip is bound to the named verdict exemption, not to taste —

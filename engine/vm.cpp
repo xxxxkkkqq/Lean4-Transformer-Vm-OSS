@@ -653,6 +653,18 @@ int main(int argc, char** argv) {
                 const double xv = x[i] + fo[i];
                 x[i] = std::tanh(xv / TANH_C) * TANH_C;
             }
+            // Card 023: the position builtins (slots 1..3) are per-row
+            // constants -- "added once" by make_row above -- but the layer
+            // updates accumulate fp32-rounding residue on them.  That residue
+            // is what corrupts fetch_by_position's score 2*q*pos - pos^2:
+            // its adjacent-candidate margin is HARD_K while its magnitude is
+            // HARD_K*q^2, so a relative slot noise eps flips the argmax once
+            // eps*q^2 > 1 (measured cliff at q ~ 2900, card 023).  Restoring
+            // the exact builtins after each layer keeps the score the exact
+            // parabola for every stream position, with no format change.
+            x[1] = (double)T;
+            x[2] = k1log2 - 1.0 / std::log((double)T + 2.0);
+            x[3] = (double)T * (double)T;
         }
         ++T;
         last_residual = x;

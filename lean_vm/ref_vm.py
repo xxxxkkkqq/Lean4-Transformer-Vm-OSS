@@ -84,6 +84,19 @@ class RefVM:
             ci, cc = bundle.cids[ind], bundle.cids[ctor]
             self.struct_of_ctor[cc] = (ci, nparams, nfields)
             self.ctor_of_struct[ci] = (cc, nparams, nfields)
+        # WP4 quot recursor reduction (K/quot.h:39-75): the two quotInfo
+        # constants and their fixed kernel argument positions — Quot.lift
+        # mk_pos=5/arg_pos=3, Quot.ind mk_pos=4/arg_pos=3 (quot.h:45-50).
+        # Keyed by the bundle's own cids (name scan, no numeric cid); an
+        # environment without them models is_quot_initialized() == false
+        # (K/type_checker.cpp:394), so the rule never fires.
+        self.quot_rec: dict[int, tuple[int, int]] = {}
+        for _nm, _mk_pos, _arg_pos in (("Quot.lift", 5, 3),
+                                       ("Quot.ind", 4, 3)):
+            _cid = bundle.cids.get(_nm)
+            if _cid is not None:
+                self.quot_rec[_cid] = (_mk_pos, _arg_pos)
+        self.cid_quot_mk = bundle.cids.get("Quot.mk")
         # P7.2 casesOn recursors: recursor_cid -> (major_idx,
         # [(ctor_cid, nfields), ...] in minor order). Non-recursive case
         # analysis (inductive.h L77): whnf the major to a constructor, apply
@@ -131,6 +144,94 @@ class RefVM:
                 raise VMError(ERR_OVERFLOW, f"bvar {i} beyond env depth")
         return self.b.stream[cur]
 
+    def _mk_app_link(self, ops) -> tuple[int, int]:
+        """Materialise `f a1 .. ak` for operands carrying DIFFERENT captured
+        envs: one T_LINK per operand (the first operand is the outermost
+        binder, the last is BVar 0) and the App spine over those BVars — the
+        same encoding whnf's Nat.rec succ rule uses for its four closures."""
+        b = self.b
+        env = 0
+        for op in ops:
+            env = self._link(op[0], op[1], env)
+        n = len(ops)
+        bvs = [b.push(K_BVAR, V0=i) for i in range(n)]
+        pos = bvs[n - 1]                    # fn = BVar(n-1)
+        for j in range(1, n):
+            pos = b.push(K_APP, V0=pos, V1=bvs[n - 1 - j])
+        return pos, env
+
+    def _quot_reduce(self, cid: int, pend: list) -> Optional[tuple[int, int]]:
+        """quot_reduce_rec (K/quot.h:39-75): `Quot.lift f h (Quot.mk r a)`
+        reduces to `f a` (plus the args past the eliminator arity), `Quot.ind`
+        to `motive a`. `pend` is the Krivine stack at the head constant
+        (innermost first), so kernel args[j] = pend[n-1-j].  None = stuck
+        (quot.h:55-62), i.e. the caller keeps the unreduced spine."""
+        mk_pos, arg_pos = self.quot_rec[cid]
+        n = len(pend)
+        if n <= mk_pos:
+            return None
+        major_pos, major_env = pend[n - 1 - mk_pos]
+        wpos, wenv = self.whnf(major_pos, major_env)   # quot.h:58
+        (hpos, _henv), margs = self._spine(wpos, wenv)
+        row = self.b.stream[hpos]
+        if row[0] != K_CONST or row[1] != self.cid_quot_mk:
+            return None                                # quot.h:59-61
+        if len(margs) != 3:
+            return None
+        f = pend[n - 1 - arg_pos]                      # quot.h:64
+        app_arg = margs[0]                             # app_arg(mk), quot.h:65
+        # kernel args past the eliminator arity, in application order (pend is
+        # innermost-first, so reverse) — quot.h:66-68
+        extras = list(reversed(pend[:n - mk_pos - 1]))
+        return self._mk_app_link([f, app_arg] + extras)
+
+    def _is_prop(self, clo: tuple[int, int]) -> bool:
+        """kernel is_prop (K/type_checker.cpp:383-389): ensure_sort of the
+        type, then normalizes_to_zero on the sort level (the *normalized*
+        test, which is why imax 1 0 counts as Prop)."""
+        return self._level_normalizes_to_zero(
+            self._sort_level_of(self.infer(*clo)))
+
+    def _mentions_link(self, pos: int, env: int, target: int,
+                       depth: int = 0) -> bool:
+        """True iff the stream term at (pos, env) contains a BVar that
+        resolves to `target` — the token-VM form of the kernel's
+        has_loose_bvars over a pi body (K/type_checker.cpp:281-284). Purely
+        syntactic (no delta/whnf); binder bodies are walked under a fresh
+        marker link, so de Bruijn depth stays faithful. Conservative: an
+        unreadable shape counts as a hit."""
+        if depth > 64 or not pos:
+            return True
+        b = self.b
+        row = b.stream[pos]
+        K, V0, V1, X = row[0], row[1], row[2], row[4]
+        if K == K_BVAR:
+            cur = env
+            for _ in range(V0):
+                cur = b.stream[cur][3]
+                if not cur:
+                    return False
+            return cur == target
+        if K == K_APP:
+            return (self._mentions_link(V0, env, target, depth + 1)
+                    or self._mentions_link(V1, env, target, depth + 1))
+        if K in (K_PI, K_LAM):
+            if self._mentions_link(V0, env, target, depth + 1):
+                return True
+            inner = self._link(V0, env, env, flag=1)
+            return self._mentions_link(V1, inner, target, depth + 1)
+        if K == K_LET:
+            if (self._mentions_link(V0, env, target, depth + 1)
+                    or self._mentions_link(V1, env, target, depth + 1)):
+                return True
+            return self._mentions_link(X, self._link(V1, env, env),
+                                       target, depth + 1)
+        if K in (K_MDATA,):
+            return self._mentions_link(V0, env, target, depth + 1)
+        if K == K_PROJ:
+            return self._mentions_link(X, env, target, depth + 1)
+        return False
+
     # ── WHNF (VM_SPEC §7.1) ─────────────────────────────────────────────────
     def whnf(self, pos: int, env: int) -> tuple[int, int]:
         """Returns (result_pos, result_env) — a closure. A stuck App spine
@@ -158,6 +259,23 @@ class RefVM:
                     continue
                 return pos, env
             if K == K_CONST:
+                if V0 in self.quot_rec:
+                    # reduce_recursor runs quot_reduce_rec BEFORE the
+                    # inductive/delta work (K/type_checker.cpp:393-407), so
+                    # the quot test comes first here too — the kernel reaches
+                    # it only when whnf(head) did not change (whnf_core's App
+                    # case, :531-541), and a quotInfo constant carries no
+                    # value (declaration.h:426-434), so the ordering is
+                    # behaviour-identical to testing it after delta.  The
+                    # reduct already carries the eliminated argument and the
+                    # extras (quot.h:64-68), so the consumed args leave the
+                    # Krivine stack — same bookkeeping as the iota arm's
+                    # `del pend[-4:]`.
+                    red = self._quot_reduce(V0, pend)
+                    if red is not None:
+                        del pend[:]
+                        pos, env = red
+                        continue
                 if self.b.const_has_value.get(V0):
                     # delta. Kernel unfold_definition_core instantiates the
                     # value at the use-site levels (A28, VM_SPEC §12.3;
@@ -961,7 +1079,13 @@ class RefVM:
             self._sort_level_of(self.infer(V0, env))   # ensure_sort(domain)
             menv = self._link(V0, env, env, flag=1)    # binder marker
             b_t = self.infer(V1, menv)
-            ppos = b.push(T_PI_CLO, V0=V0, V1=b_t[0], X=env, E2=b_t[1])
+            # V2 (field 3) carries this lam's OWN binder marker position —
+            # infer_lambda creates exactly that local decl (K/type_checker
+            # .cpp:125), so the identity is constructive; the cross-kind-Pi
+            # defeq arm adopts it when the closure's body env chain never
+            # reaches a marker row. No other T_PI_CLO consumer reads row[3].
+            ppos = b.push(T_PI_CLO, V0=V0, V1=b_t[0], X=env, E2=b_t[1],
+                          V2=menv)
             return ppos, 0
         if K == K_PI:
             l1 = self._sort_level_of(self.infer(V0, env))
@@ -986,15 +1110,30 @@ class RefVM:
             l2 = self._sort_level_of(self.infer(V1, self.b.stream[pos][5]))
             return self._emit_sort_at(self._mk_imax(l1, l2))
         if K == K_PROJ:
-            # kernel infer_proj (type_checker.cpp L247), monomorphic
-            # non-rec subset: whnf(child type) must be the structure const
-            # matching the proj sname; field type = domain of the
-            # (nparams+idx)-th Pi of the ctor's type. Param'd structures
-            # (instantiate_type_lparams) and dependent fields (kernel
-            # instantiates later domains with mk_proj) are outside it; so
-            # is the Prop-guard (is_prop_type && !is_prop(field)).
+            # kernel infer_proj (K/type_checker.cpp:248-289): whnf the
+            # projected expression's type, peel its application spine with
+            # get_app_args (the structure NAME is the spine head, the
+            # arguments are the inductive's params + indices), require a
+            # single-constructor inductive with exactly nparams+nindices
+            # arguments, then instantiate the constructor type's first
+            # nparams Pi's with those arguments (:270-278) and peel `idx`
+            # fields (:279-288).  Two guards keep the subset sound:
+            #   * a field whose type depends on an earlier field (:281-284)
+            #     is REFUSED (ERR_UNSUPPORTED) instead of silently peeled —
+            #     the kernel substitutes mk_proj there, which this machine
+            #     does not build;
+            #   * a Prop-typed structure whose field is not a Prop (:284,
+            #     :288) is rejected as invalid_proj, exactly like the
+            #     kernel's soundness guard.
+            # Boundary (registered in docs/VM_SPEC.md): indexed inductives
+            # are refused by the arity test, because the `structures` bundle
+            # carries (ctor, nparams, nfields) and no nindices.
             s_ty = self.whnf(*self.infer(X, env))
-            sK, sV0 = b.stream[s_ty[0]][:2]
+            (hpos, _henv), sargs_rev = self._spine(*s_ty)
+            # _spine yields the args outermost-first; get_app_args order is
+            # application order, so reverse (same convention as _proj_core)
+            sargs = list(reversed(sargs_rev))
+            sK, sV0 = b.stream[hpos][:2]
             if sK != K_CONST:
                 raise VMError(ERR_TYPE, "infer_proj: structure type expected")
             if b.cids.get(b.id_names.get(V0)) != sV0:
@@ -1003,16 +1142,40 @@ class RefVM:
             if ent is None:
                 raise VMError(ERR_TYPE, "infer_proj: not a structure")
             ctor_cid, nparams, _ = ent
-            if nparams:
-                raise VMError(ERR_UNSUPPORTED,
-                              "infer_proj: structure params unsupported")
+            # kernel requires args.size() == nparams + nindices (:265-267);
+            # the `structures` bundle carries no nindices, so an indexed
+            # inductive lands here and is refused conservatively.
+            if len(sargs) != nparams:
+                raise VMError(ERR_TYPE, "infer_proj: structure arity")
+            # kernel :270-278 runs is_prop(type) once, after the params
+            is_prop_type = self._is_prop(s_ty)
             r = self.whnf(*self.infer(self._emit_const(
                 b.cid_names[ctor_cid]), 0))
-            for _ in range(V1):            # peel earlier fields (non-dep)
+            for i in range(nparams):      # instantiate the params (:270-278)
                 r = self.whnf(*r)
-                _, r = self._pi_parts(r)
+                if b.stream[r[0]][0] not in (K_PI, T_PI_CLO):
+                    raise VMError(ERR_TYPE, "infer_proj: expected a Pi")
+                _dom, body = self._pi_parts(r)
+                r = (body[0], self._link(sargs[i][0], sargs[i][1], body[1]))
+            for _ in range(V1):            # peel earlier fields
+                r = self.whnf(*r)
+                dom, body = self._pi_parts(r)
+                # :281-284 — the body mentions the binder being peeled ⇒ the
+                # kernel would instantiate it with mk_proj; refuse instead of
+                # returning a type with a dangling field reference.
+                cand = self._link(dom[0], dom[1], body[1], flag=1)
+                if self._mentions_link(body[0], cand, cand):
+                    if is_prop_type and not self._is_prop(dom):
+                        raise VMError(ERR_TYPE,
+                                      "infer_proj: invalid proj from a Prop")
+                    raise VMError(ERR_UNSUPPORTED,
+                                  "infer_proj: dependent field")
+                r = (body[0], cand)
             r = self.whnf(*r)
             dom, _ = self._pi_parts(r)
+            # :288 — extracting data out of a proof is invalid_proj
+            if is_prop_type and not self._is_prop(dom):
+                raise VMError(ERR_TYPE, "infer_proj: invalid proj from a Prop")
             return dom
         raise VMError(ERR_UNSUPPORTED, f"infer: token kind {K} at {pos}")
 
@@ -1130,6 +1293,19 @@ class RefVM:
                 lt = self._resolve(t_env, V0)
                 ls = self._resolve(s_env, W0)
                 if lt[5] == 1 and ls[5] == 1:
+                    # same-chain-node identity (kernel quick_is_def_eq `t == s`,
+                    # K/type_checker.cpp:837): both bvars resolving to the
+                    # SAME marker link row are one binder. Walks land on the
+                    # resolved rows — both _resolve calls succeeded, so
+                    # neither chain runs dry. Infer-created markers are
+                    # bid-less, so the bid test below alone misses them.
+                    pt, ps = t_env, s_env
+                    for _ in range(V0):
+                        pt = b.stream[pt][3]
+                    for _ in range(W0):
+                        ps = b.stream[ps][3]
+                    if pt == ps:
+                        return True
                     if lt[6] and lt[6] == ls[6]:
                         return True     # same fvar (kernel name equality)
                     # distinct fvars: STUCK pair — fall through to the
@@ -1174,6 +1350,14 @@ class RefVM:
                                          body_pos_t)
                 ms = self._binder_marker(clo_s, W0, dom_env_s, body_env_s,
                                          body_pos_s)
+                # V2 carrier fallback: a closure whose body env is a
+                # value-link chain never walks to its binder marker row; its
+                # V2 field (stamped at infer_lambda) carries that marker's
+                # position. Adopt only when _binder_marker found nothing.
+                if clo_t and tT[3] and mt is None:
+                    mt = tT[3]
+                if clo_s and sT[3] and ms is None:
+                    ms = sT[3]
                 if mt is not None and ms is not None:
                     bid = (self.b.stream[mt][6] or self.b.stream[ms][6] or mt)
                     self._stamp_bid(mt, bid)

@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from expr.model import Const, LMax, LSucc, LZero, LParam
+from expr.model import expr_normalize_levels, Const, LMax, LSucc, LZero, LParam
 from expr.tokens import (
     Encoder, decode_env_meta, decode_expr,
     T_ENV_LIST, T_ENV_UNIVPARAMS, T_ENV_META,
@@ -168,17 +168,22 @@ def main() -> int:
     print("B  T_ENV_UNIVPARAMS(K=39) + T_ENV_LIST(role=2) chain shape")
 
     # ── C: Const level-argument sibling chain round-trips exactly ───────────
-    #  (a) declaration types/values decoded == real dump Exprs
+    #  (a) declaration types/values decoded == real dump Exprs UP TO level
+    #  normalization (card 021 / ADR 026: the encoder emits canonical level
+    #  forms; normalize is kernel-meaning-preserving so the round-trip
+    #  contract is decode == expr_normalize_levels(source))
     for cid, n in enumerate(POLY_NAMES):
+        want_ty = expr_normalize_levels(dump[n]["ty"], b.nid)
         got_ty = decode_expr(b, b.const_type_pos[cid])
-        if got_ty != dump[n]["ty"]:
-            fails.append(f"[C {n}.type] {got_ty} != real {dump[n]['ty']}")
+        if got_ty != want_ty:
+            fails.append(f"[C {n}.type] {got_ty} != norm {want_ty}")
         vpos = b.const_value_pos[cid]
         real_val = dump[n]["val"]
         if real_val is not None:
+            want_val = expr_normalize_levels(real_val, b.nid)
             got_val = decode_expr(b, vpos)
-            if got_val != real_val:
-                fails.append(f"[C {n}.value] {got_val} != real {real_val}")
+            if got_val != want_val:
+                fails.append(f"[C {n}.value] {got_val} != norm {want_val}")
     #  (b) explicit use-site terms: A.{1} (B.value, ground) and
     #      A.{max 1 u} (D.value, param-bearing max), encoded standalone.
     for n, want in (("B", Const("A", (LSucc(LZero()),))),
@@ -188,8 +193,9 @@ def main() -> int:
             fails.append(f"[C {n}.real] real {real} != expected shape {want}")
         pos = enc.encode_term(real)
         got = decode_expr(b, pos)
-        if got != real:
-            fails.append(f"[C {n}.use-site] {got} != real {real}")
+        want = expr_normalize_levels(real, b.nid)
+        if got != want:
+            fails.append(f"[C {n}.use-site] {got} != norm {want}")
         # sibling-chain length == real level-arg count (the Const is interior
         # in B/D, so re-encode it standalone and read V1/X)
         cpos = enc.encode_term(real)
@@ -225,7 +231,7 @@ def main() -> int:
         if d0["kind"] != 0 or b0.stream[b0.env_anchor(cid)][0] != T_ENV_META:
             fails.append(f"[D {n}] default anchor changed")
     if decode_expr(b0, b0.const_type_pos[POLY_NAMES.index("D")]) != \
-            dump["D"]["ty"]:
+            expr_normalize_levels(dump["D"]["ty"], b0.nid):
         fails.append("[D] default encoder changed type encoding")
     print("D  default Encoder unchanged (arity 0, no K=39/K=35)")
 

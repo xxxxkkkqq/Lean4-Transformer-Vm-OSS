@@ -191,3 +191,12 @@ M-B/M-C 的闭包规模差分应以引擎通道（C++ `vm_run`）为规模载体
 > **P1 开卡前置指令（审核 E5）**：按 AGENTS §四"不在仓库里的 harness 等于
 > 不存在"，开 P1 优化卡时须把 footprint 复测探针（probe_struct.py 清理版）
 > 提升进 `scripts/`——本 ADR §7.2 验证面引用了它，不能长期留在 /tmp。
+>
+> **E5 已执行（2026-10-04，卡 012 拍 2）**：harness 落地
+> `scripts/profile_evaluator_memory.py`（checkpoint 3b8bf5c；static 结构节 +
+> warmup 检查点节 + 内部看门狗 + teardown 报告 + `--gc-top`；per_entry 采样
+> 修正为跨全部 lookup 步进，消除头部多值 lookup 偏置 388B→~260B）。
+> list 后端校准 6134MB 复现本 ADR §4 基线（现图 dims 34,671 / lookups
+> 4,527，entries 20,099,880）；numpy 后端复测 **warmup 峰值 840MB**、
+> history 44.5B/entry≈852MB、`_mir` 0MB、ms/pos 40.5@100→61.8@4440。
+> 详见卡 012 拍 2 执行段与 `docs/VM_SPEC.md` §19。

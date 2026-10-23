@@ -1977,3 +1977,640 @@ KERNEL_COVERAGE G2/B15、VM_SPEC §16.7.1/16.7.2、帽 2700/7200。
 **下一队列**：卡 012 拍 2（P1 history numpy 化，开卡时按 024 E5 把画像探针
 提升进 scripts/）→ 卡 012 M-C/M-D（规模差分走引擎通道，拍 1 裁定）；
 里程碑快照 public-main 更新与 push 仍待人工按键。
+
+---
+
+## 总控进度追记（2026-10-04 深夜，总控）
+
+- **GitHub 快照已推**：cf758f1（b55d1b0..cf758f1 快进，防线 §3.7 plumbing，
+  人工按键=用户 2026-10-04 授权）。内容=卡 011/016 CLOSED + 012 M-A/拍 1。
+- **卡 012 拍 2 ACCEPTED（d766e8a）**：P1 numpy history 后端（峰值 6091→840MB，
+  7.1x；时间律不劣化；消费测试 4/4，brec 提帽 1800 总控亲跑真值 rc=0
+  1387.2s，+29.3% 墙钟代价裁定接受，fork 物化登记后续优化）；VM_SPEC §19
+  双后端契约 + ~25-26k token 上限 + 引擎通道规模裁定。
+- **卡 017 分诊 ACCEPTED（提交见 log）**：49 非全绿行全分诊——P0=9 行两组
+  （①符号 level 运行期通道 D1-D5/D10+A8/A18；②INFER-PROJ 元数据化 A10）、
+  P1 8 行、P2 24 行、P3 关账 8 行；审核两轮（首轮 FAIL 两处文字层 → 修复
+  → 复核 PASS，A23 归级总控裁决维持 P2）。语料画像：288/779 常量带 univ
+  参数、非平凡 level 实参 13,892、111 Proj/31 结构全带参。
+- **派工（并行 2）**：lane 1｜P0-1 拍 A 语义设计师｜level 运行期通道编码
+  方案 + ADR（合并卡 015 组件 2/ADR 021/ADR 022），核 0-5；lane 2｜P0-2
+  图逻辑工程师｜INFER-PROJ 元数据化（A10），核 14-19。M-C/M-D 等 P0 收口。
+
+## 总控进度追记（2026-10-12/13，总控）——卡 018 拍 B 收口 CLOSED
+
+- **会话续接背景**：卡 017 收口派工后，拍 A（035a7ca）与卡 019（2caca84）
+  落地；B1 checkpoint 054407f（含第一任 B2 代理被取消时随树入库的全部
+  图侧实现）。此后 **7 天无会话续接**，工作树悬置三文件（B2.R3 import
+  清理、section lvl 差分节、卡续接计划）。本会话 10-12 总控续接收口，
+  10-13 完成复核修复与关账。
+- **B2 续接（95d2d78 前身）**：R1 改经常驻 `section lvl`（/tmp/018design
+  探针 scratch 已随 /tmp 清空，永久测试通道正好补位）；R2 行号回填；
+  R3 import 清理核验；R4 节验证 14/14+1xfail；R5 全语料 129/129+2xfail
+  零破线；R6 记录落卡。
+- **B3 收口（95d2d78/213a660）**：重编译 `step_vm_018_scratch.sbin`
+  （45,675/5,615/296,674，+9,073/+544 对 019 基线，预算窗内）；引擎
+  34/34+known 3/4+meta OK；level 37/37；stepgraph 84/84（帽 3300→4500
+  校准，首杀 78 行 0 FAIL 定性合法耗时长）；硬编码扫描零命中；
+  VM_SPEC §12.8/§16.10、KERNEL_COVERAGE A8/A18/D1-D5/D9/D10、
+  ARCHITECTURE 018 行同步；**019 真值表漏行一并补登**（019 结案时
+  ARCHITECTURE 漏更新，md5/增量按 ~/logs/019/reg 复核后落表）。
+- **独立复核（两轮）**：首轮 gate1-4 PASS、**gate5 FAIL**——§7 第 5 项把
+  lvl_p3_d0/m5_sb/nm/oi 错标成 deq_const/deq_hargs 链臂覆盖（实为
+  Sort-vs-Sort，只踩 deq_sort）；四链步实例约 6.5k dims 无差分行。
+  修复（85497c4）：section_lvl 新增 `lvl_cc`（同 cid 双 Const、链
+  [max (succ u) u] vs [succ u]，oracle 现跑 OK / 纯结构腿必拒）——
+  deq_const 链步 0 真差分（节 15/15+1xfail rc=0；全语料 130/130+2xfail
+  rc=0 6382.5s）；**deq_hargs 链步臂如实记差分 NOT-VERIFIED**（同
+  电路 :4462/:4352，卡 012 M-C 通道补）；minor 全清（level_018.log
+  落盘、引擎 harness SBIN 自证 echo + 复跑 34/34、`:3248`/`:3336` 注释
+  锚点、is_norm_lt 序键勘误为 interned level_id（ADR 025/VM_SPEC
+  §12.2/§12.8/卡三处同步，结论不变）、D8 锚点刷新）。复核确认
+  **gate5 PASS、接受 CLOSED**。
+- **事故记录（卡 018 §"事故记录"）**：10-12 09:32:55 本机 global OOM，
+  击杀对象为另一会话 20.2GB 训练任务（pid 375294，app-zcode scope），
+  本卡 stepgraph2（513MB，帽 5000MB）随客户端闪退连坐；处置 = 复跑 +
+  帽校准 + journal 原文落卡。**机器纪律提示**：与桌面 GPU 训练任务并跑
+  期间，回归 wall 普涨 ~10%（decl 6210s、stepgraph 3420s），后续排产
+  留意邻居负载。
+- **下一队列**：卡 012 M-C/M-D（规模差分走引擎通道，拍 2 已裁定）；
+  deq_hargs 链步差分行随 M-C 语料通道补；卡 015 组件 2 NOT-VERIFIED
+  摘记已随本卡清偿（§3.2 canonical 比较即清偿）。23 套件全量回归与
+  发布快照仍待里程碑出口。
+
+## 总控进度追记（2026-10-13 下午，总控）——卡 020 拍 A：level canonical 残余收口
+
+- **用户指令**（当面）："最后的剩余内容必须解决；研究机制、查文献、
+  工程取巧或数学解都行，必须完成"——据此立卡 020，总控亲执图侧
+  （角色偏离：图逻辑工程师职责由总控承担，收口经独立复核五门
+  PASS 补偿）。
+- **研究结论**（卡 020 §2）：Coq/Rocq kernel `kernel/univ.ml` Universe
+  模块把 "non empty, sorted and without duplicates" 作为**构造不变量**
+  （hash-consed，比较只发生在规范形上）；Lean kernel 走智能构造
+  （构造期归一）+ normalize（比较期懒归一，`level.cpp:454-516`）。
+  两者共同点：**等价 ⟺ 规范形相等，规范形对排序键选择不敏感**
+  （ACI 代数，multiset 相等 ⟺ 任意固定全序下 sorted 相等）。
+- **落地两件（拍 A，6f8467d）**：
+  1. **deq_hargs 链步臂 NOT-VERIFIED 收口**：新增 `lvl_hd`（正向，
+     Regular-hints def 头 k18W.{max (succ u) u} vs k18W.{succ u}）
+     + `lvl_hd_sn`（负向，max 1 u 类防过收）；消融取证臂因果性
+     （25 步 vs struct-only 变体 33 步，负向 55/55 同拒）。
+  2. **ADR 025 残余 1（imax 子形归一）收口**：`_lvl_max_canon` imax 臂
+     子比较加 zero-elim 腿（`max(x,0)≡x`，kernel :461-467/:487-499），
+     6 实例共享电路一次部署；`lvl_isb` 翻 PASS、KNOWN_GAPS 摘除
+     （XPASS 协议）。dims +3,672/+504（窗内）。
+- **验证**（~/logs/020/）：lvl 17/17+0 xfail、decl 全语料 132/132+1xfail
+  （6942s）、level 37/37、stepgraph 84/84（3738.6s）、引擎 34/34+
+  known 3/4+meta、硬编码零命中。独立复核**五门全 PASS**（含
+  zero-elim 腿对 kernel 的逐行 soundness 核验、sn 类不可过收的
+  kind==KL_ZERO 门确认、臂无泄漏 grep）。
+- **ADR 026 草案**（canonical-by-construction，拍 B 独立卡）：encoder
+  全量 normalize + fold 规范发射 → 图内 level 全规范 → canonical 臂
+  退役（残余 2-5 的结构性解）。**复核时定案 xc 机制**：normalize
+  逐路径一次——imax 路径经 mk_imax→mk_max 裸构造**不重跑**
+  explicit-subsumption，max 路径摊平吸收 → `imax (succ u) 1` 与
+  `max (succ u) 1` 的 normalize 产物**结构不等**（核拒）→ **拍 B 硬
+  约束：encoder normalize 必须是 level.cpp 的忠实移植（含不对称），
+  不是理想化 ACI 形**；xc 行为其回归测试。
+- **23 套件里程碑回归**：in flight（`~/logs/020/reg/`，REGRESSION_SBIN
+  钉 020 scratch——脚本加了 `REGRESSION_SBIN` 覆盖口，一行机械改）。
+  已知池杀 2 例（非语义）：brec_drec RSS 8022>8000（012 校准余量
+  2.3%，邻居训练负载 +269MB）、stepgraph_vs_refvm wall 1200.1>1200
+  （016 校准余量 3.8%）——solo 重跑已由 /tmp/solo_rerun_020.sh 看守
+  器在 reg 结束后自动串行排队；若 solo 复现越帽，按 mutation 先例
+  校准脚本帽。decl_injection 池帽 7200 余量 3.6%（solo 实测 6942s）
+  为重点盯防对象。结果与卡 020 最后一项 verifier 回填由下会话完成。
+- **下一队列**：卡 020 收口（23 套件回填）→ ADR 026 拍 B 立卡
+  （canonical-by-construction 实现，encoder normalize 忠实移植 +
+  全量回归）→ 卡 012 M-C/M-D。
+
+## 总控进度追记（2026-10-14 凌晨，总控）——卡 020 23 套件收口 CLOSED
+
+- **23 套件里程碑回归 23/23 rc=0**：池内 20 套件 rc=0（`~/logs/020/reg/`）；
+  3 套件池帽杀非语义，经 solo 真值跑闭环：
+  - `stepgraph_vs_refvm`：solo rc=0 **1476.7s/588MB**（37/37；016C 基线
+    1154.9s，+27.9% = 邻居训练负载 + 图增长）→ 帽 1200→2000。
+  - `brec_drec`：池 8022@388s → solo 8009@414s（帽 8000）→ 9003@695s
+    （帽 9000）→ 真值 rc=0 **1277.0s/10575MB，0 divergences**（帽 11000）
+    → 帽 RSS 8000→12000、wall 1800 不动。
+  - `defeq_cache`：池 8018@2008s → solo 8015@2342s → 9006@2393s → 真值
+    rc=0 **2505.4s/10565MB，ALL OK**（帽 11000）→ 帽 2700→3600、8000→12000。
+  - RSS 增长归因：图 dims 012 时代 ~33k → 020 49.3k（+50%），非内存
+    泄漏（三次爬帽单调、真值单跑收敛）。帽校准三条已落
+    `scripts/run_cpu_regression.sh`（实测依据注释在行内）。
+- **事故与处置**：原 solo 看守器（/tmp/solo_rerun_020.sh）死锁——等待条件
+  `pgrep -f run_cpu_regression.sh` 永远匹配其自身祖先 shell 的命令行
+  （命令行嵌着脚本全文，AGENTS §三 pgrep 自匹配坑的镜像），总控杀掉
+  两个看守器后亲起修正链（`/tmp/solo_chain_020.sh` → `/tmp/recalib*_020.sh`），
+  `~/logs/020/reg_solo/chain.log` 全程留痕；首次链拼写漏 `test_` 前缀
+  秒败 3 例已留痕（chain_attempt 丢弃重跑）。
+- **卡 020 状态翻 CLOSED**（verifier 23 套件项回填 + 状态行）。
+- **下一队列执行中**：ADR 026 拍 B 已立卡 021（canonical-by-construction
+  实现），研究件已落——15 行 oracle 探针（`#KDECL` 通道，含 pF4i succ
+  分配律实证修正）+ Python normalize 移植（expr/model.py，15/15 复现）
+  + fold 设计验证器（1497 Pi-spine 链 0 mismatch）+ 槽预算实测
+  （侧 A≤1/侧 B≤3/union≤4/幸存者≤3，宽 union 全部 explicit+param 成分，
+  无 Max/Imax 基互排证据）。encoder 接线已落（tokens.py `_enc_level` +
+  expr_normalize_levels；level_encoding 契约更新 decode==normalize，
+  轻套件 6 件全绿）；15 探针行已入 lvl 节（bf3/bf4 登记 B1 KNOWN_GAPS，
+  B2 fold 规范发射后按 XPASS 协议摘除）。B1/B2 两检查点设计见卡 021。
+
+## 总控进度追记（2026-10-14 上午，总控）——卡 021 拍 B 实施中（B1 检查点证据 + 修订方案）
+
+- **B1 检查点跑毕**（`~/logs/021/lvl_b1.log`，32 行 = 17 旧 + 15 新探针行）：
+  23/32 pass + 2 XFAIL-KNOWN-GAP（bf3/bf4 如预期）+ 9 FAIL，两类失败
+  全部是机制证据非实现事故：
+  1. **臂与 encoder normalize 不可共存**（lvl_xc 被破 + bx1/bx2/bx5/bx6
+     同类）：臂在已规范形上**二次 normalize**——`max(succ u,1)` 是 imax
+     路径的 pairwise 产物，臂再摊平得 `succ u` → 假收。**非幂等陷阱实证
+     （B1 的核心产出）**：B1/B2 必须合并落地，臂退役与 encoder 接线
+     同一提交。
+  2. 负向 fold 行错误类别不可映射（oracle=appTypeMismatch 不在
+     CODE_OF_CLASS）——bf 行已改**裸 Pi 值设计**（declared Sort L +
+     value=Pi 项，infer(Pi)=Sort(fold) 顶层比较失败→declTypeMismatch ✓），
+     6 行 oracle 复验全 MATCH。
+- **第三边界发现**：I_SORTEM 运行期 succ 包裹（infer_sort :345-348
+  `mk_sort(mk_succ(l))` 裸构造）产出非规范形——kernel 比较期 normalize
+  会把 `succ(max u v)` **分配**成 `max (succ u) (succ v)`（:449-453
+  逐幸存者重包），图的裸 succ 节点不分发。ADR 026 §3 草案漏了这个
+  边界（§3.2 修订已补 fold，sortem 边界在卡 021 修订中补）。
+- **修订实施方案（K 方案，卡 021 §3 改）**：
+  1. encoder normalize（已落+验证）。
+  2. **succ 影子**：level 节点 X 槽空闲（KL_* 仅用 V0/V1/V2）——encoder
+     对每棵静态 level 树另发 `normalize(succ(T))` 影子树入 X 槽；
+     I_SORTEM `select(X≠0)` 消费影子（静态根零新节点、零发射拍），
+     动态根（运行期构造的 Sort 再 infer）回退裸 succ——登记残余。
+     影子的影子（k≥2 嵌套 infer）登记残余。
+  3. I_PIL2 case A union-rebuild：A 侧 2 lane / B 侧 3 lane 摊平
+     （复用 _flat）+ explicit 吸收 + 同 base 去重 + (kind,nid,offset)
+     选择排序（Max/Imax 基互排→fallback）+ 右折叠发射；**幸存者 ≤2
+     单拍发射先落**（语料 193/477 重建事件），3 幸存者 2-beat 发射
+     （12 次，Vector3 闭包形）为后续拍——bf3 届时按 XPASS 摘 gap。
+  4. 臂退役（_lvl_max_canon 的 multiset 机制删；_flat/_lv_view/
+     _lvl_base_eq/_n2z_or 留给 fold/is_prop 复用）。
+  5. bf3/bf4 现 KNOWN_GAPS 保留至 fold 电路落地；bf3 的 2-beat
+     未落地前保持 gap（bf4 由影+单拍重建关闭）。
+- **语料/探针证据全部落盘**：.scratch/probe_norm_asym.py（15 行原文）、
+  check_port_vs_probes.py（移植 15/15）、scan_fold_budget.py（fold
+  设计验证器 1497 链 0 mismatch + 槽预算）；探针行已永久化进 lvl 节。
+- **下一步**（本会话续或下会话）：实施 K 方案 2-4 → lvl 复跑（预期
+  32/32，bf3 gap）→ decl 全语料 → level/stepgraph/engine → 重编译
+  dims 记账 → 23 套件 → 卡 012 M-C/M-D → 里程碑出口。
+
+## 总控进度追记（2026-10-14 下午，总控）——卡 021 拍 B 实施进展（三项机制修复 + lvl 半绿）
+
+- **实现已全部落盘**（工作树未提交）：① `expr/tokens.py` 影子发射
+  （normalize(succ(T)) 树，**E2 槽**——X 被 Const level-arg 链占用
+  （`_enc_expr` 的 Const 分支在 `_enc_level` 之后写 X 链接，首版用 X 被链
+  覆写——迁移到 E2 解除冲突）；② `build_vm.py` I_SORTEM 消费影子
+  （`select(E2≠0)` 直用影子位置零发射拍；动态根回退裸 succ——登记残余；
+  **D_c 位置修复**：影子路径无发射时 P_EMIT 的 Sort 落 c1 非 c2，D 必须随
+  之 select(has_sh, c1, c2)，否则驱动器死循环——50000 步上限下表现为
+  "挂死"）；③ I_PIL2 case-A union-rebuild（_flat 六 lane 摊平 + explicit
+  吸收 + 同 base 去重 + (kind,nid,offset) 秩排序选择 + 幸存者 ≤2 单拍
+  发射 + 超预算/3 幸存者回退 pairwise——bf3 留 KNOWN-GAP 待 2-beat）；
+  ④ `_lvl_max_canon` 臂退役（stub 化 + 死体删除；_flat 提升为共享助手）。
+- **第三处修复（lvl 半绿暴露）**：B2 首跑 27/32——lvl_oi/nm/bx4/bf2/bf4
+  五连败同根因：**`_lvl_eq_struct` 从不递归 Max/IMax 子节点**（旧臂承担
+  max 比较，臂退役后无人接）——但规范形是排序对齐的，配对子递归即
+  kernel operator== 精确复现。已加 mm 腿：共享 V0 子调用（succ 腿与
+  mm 左子同源，2-ary 展开）+ mm 预算 3（语料嵌套 ≤2）+ LVL_DEPTH 8→5
+  （规范形浅：spine ≤2/显式 ≤2，深于帽=不相等 sound-incomplete）。
+  **待验**：harness 3 行（neg1 拒 11 步/pg2 收 35/bf1 收 23 绿为基）→
+  lvl 全节（预期 31/32 + bf3 gap）。
+- **关键语义成果已验证**：lvl_xc **恢复 PASS**（encoder normalize + 臂
+  退役给出 kernel 逐路径一次语义的精确复现——B1 双 normalize 假收问题
+  根治）；bx1-7 除 bx4（mm 腿修复对象）全 PASS；bf1 吸收塌缩 23 步
+  （影子路径省拍）、bf4i/j 发射序钉 PASS。
+- **验证队列（下会话或本会话续）**：lvl 全节 → decl 全语料（147 checks）
+  → level 37/37 → stepgraph 84/84（步数面漂移按 ADR 026 §4.2 分诊）→
+  重编译 sbin + dims 记账（预期净缩 ~-6k±2k；mm 腿有增量，以实测为准）→
+  引擎 34/34+meta → 硬编码扫描 → 文档五件（VM_SPEC §12.8/§16.10、
+  ENV_FORMAT level-token E2 影子、KERNEL_COVERAGE D 组、ARCHITECTURE、
+  ADR 026 翻 ACCEPTED + §3.2 已修订）→ 23 套件 → 卡 012 M-C/M-D →
+  里程碑出口（发布 push 仍需人工按键）。
+- **工程账**：调试 harness `.scratch/dbg_lvl_rows.py`（建图一次 + 小步
+  数帽 run_check + (A,B) 环录制——语料外一次性工具，取证后删）；
+  探针/扫描三件套在 .scratch（probe_norm_asym / check_port_vs_probes /
+  scan_fold_budget）——行已永久化进 lvl 节，工具按 AGENTS §4 处置。
+
+## 总控进度追记（2026-10-14 深夜，总控）——卡 021 拍 B：canon-mm 腿修复 + 剩余 bf2/bf4 断点
+
+- **canon 顶层 mm 腿已补**（`_lvl_eq_canon` 加 mm 参数 + is_mm 腿，共享
+  succ_leg 作 V0 子调用、sub1=struct-with-mm）——**lvl_oi/lvl_nm/lvl_bx4
+  由拒翻收**（harness 实测 13/13/11 步 accept）。至此 lvl 全节预期
+  27+3=30 处绿。
+- **剩余断点：lvl_bf2/lvl_bf4 在 35 步拒**（bf3 是登记 gap 不算）。
+  根因已收窄，证据在 `.scratch/dbg_lvl_rows.py` 的流转储（harness
+  DBG_ROWS=lvl_bf2 跑法）：
+  1. fold 发射了 **KL_IMAX(V0=l1, V1=0)**——I_PIL2 拍上 **SA（l2 槽）
+     = 0**（`[435] K4(353,0,0)`、`[442] K4(345,0,0)`，位置 0 的 kind
+     非 ZERO/SUCC → r1=r2=r3=r4 全 0 → imax 裸发射）。
+  2. **单 binder 的 bf1 fold 完全正常**（23 步 accept，l2=2-影子
+     正确吸收）——即 body-level → A 槽 → I_PIS2 lvl2_root 的交接
+     在首拍工作；**双 binder（bf2）的链式 I_PIL2 两拍 SA 都是 0**。
+  3. 嫌疑面：嵌套 INFER 帧链上的 I_PIS1→I_PIS2→I_PIL2 槽交接 ×
+     影子路径的零发射拍（D/E 槽语义或 lvl2_root 的 focus-kind 门
+     `_kind_eq_raw(fK, K_SORT, One)` 在链式路径上不匹配）。
+     B1（改前）bf2 经臂兜底 41 步 PASS——臂退役后此交接缺陷暴露。
+  4. 下会话第一步：harness 打印逐步 STATE(A..F) 对比 bf1/bf2 的
+     I_PIS2 拍 focus kind 与 SA 来源；或直接审查 I_PIS2 的
+     `lvl2_root = _select(_kind_eq_raw(fK, K_SORT, One), fV0, SA)`——
+     链式路径上 fK 是否 K_SORT（内层 Pi infer 的返回帧形状）。
+- **工作树状态**（未提交，本条随提交落盘）：expr/model.py（normalize
+  移植+expr_normalize_levels，已验证 15/15）、expr/tokens.py（编码器
+  normalize 接线 + E2 影子发射）、lean_vm/build_vm.py（I_SORTEM 影子
+  消费 + D_c c1 修复、I_PIL2 case-A union-rebuild、臂退役 stub、
+  _flat 提升、struct/canon 双 mm 腿、LVL_DEPTH 8→5）、
+  tests/test_decl_injection_vs_lean.py（15 探针行 + bf 行裸 Pi 设计 +
+  bf3 gap + level_encoding 契约更新）、tests/test_level_encoding.py
+  （round-trip == normalize 契约）、docs/plans/021 + ADR 026 §3.2 修订。
+- **轻套件回归基线**（编码器接线后实测全绿）：env_meta 0F、
+  env_meta_import 259 checks 0F、level_vs_lean 37/37、kernel_oracle
+  10/10+3B、ref_vs_lean 34/34、ref_infer_defeq 82/82、
+  level_encoding 0F。
+- **bf3（3 幸存者 2-beat）与 fold 动态根/影子 k≥2** 仍为登记残余
+  （KNOWN_GAPS + VM_SPEC §16.10 待同步）。
+
+## 总控进度追记（2026-10-14 深夜，总控）——卡 021 拍 B ladder 全绿 + 收口推进
+
+- **拍 B ladder 全绿（提交 531080f）**：
+  - lvl **32/32+0 xfail** rc=0（908s，缓存影子复跑；首跑 1441s）；
+  - decl 全语料 **147/147+1 xfail 0 fail** rc=0（7735.1s/1901MB；xfail
+    仅 ipr_dep_snd 卡 019 既有登记）；
+  - stepgraph_infer_defeq **84/84（0 pinned）** rc=0（5179.1s/733MB——
+    步数面零破线，ADR §4.2 风险未现）；
+  - 引擎 **34/34+known 3/4+argmax/softmax 流一致 34/34**（1532.7s/399MB，
+    SBIN=021 自证）；level 37/37、kernel_oracle Part A 10/10+**容量 3/3**、
+    轻七件全绿。
+- **拍 B 实现的三轮调试产出（机制级，全部留档）**：
+  1. `_lvl_base_eq` **nid 比较缺失**——卡 018 潜伏缺陷（docstring 说
+     nid 相等判定但函数体从未比较；臂语料恰好无可区分行）；fold 去重是
+     第一个区分 u/v 的消费者（bf2/bf4 五连败同根因）。
+  2. `p2_emit` 发射门必须用真实发射条件（我的 2-beat 首版用
+     `cg·(1-emit_3)`——无发射拍也走 raw 通道，发射多余节点使 c1/c2
+     位置簿记失步→帧走查死循环；表现为 50000 步帽下的"挂死"）。
+  3. phase-3 续体帧走 **fr2 通道**（em_frame2 载荷 = fr2_*_i；首版误写
+     fr1_*_i——帧值全默认 V0=1→无人消费→死循环）。附 em_frame2_m2
+     门表需加 ph_pil2o。
+  4. **容量**：影子树致 List.map 7881>4096 破窗（kernel_oracle Part B）
+     → **Sort-only 门控**（Const level 链无影子——sortem 永不读其根）
+     + **按规范化项共享缓存**（frozen dataclass 键；影子根无 parent 可
+     共享）→ 4044≤4096。
+- **图账（实测，ADR"以拍 B 实测为准"）**：58,445 dims/7,676 lookups/
+  362,418 nnz（对 020 基线 +9,098/+1,557/+46,544）——**净增长**：
+  mm 递归腿（多站点 2^mm 展开）+ fold 重建电路 > 臂退役节省；ADR §3
+  的"净缩 −6k±2k"预估被推翻，实质收益 = 残余 2-5 结构性清偿 +
+  M-C/M-D 形状完备（2-beat 盖 Vector3 类）。引擎每步成本 +15% 量级，
+  引擎墙 624→1533s（含 sbin 更换）。
+- **文档六件已同步**（同提交）：VM_SPEC §12.8.2（三构造边界+比较降级+
+  图账）+ §16.10 重写（1-5 结构性关闭、现行 R1-R6）；ENV_FORMAT
+  level 槽位约定（X=Const 链、E2=Sort 影子）；KERNEL_COVERAGE D4/D5
+  翻 canonical-by-construction/全量实现；ARCHITECTURE 021 行
+  （md5 `a817d39522232f166759cd3feaf7c7fc`）；ADR 026 翻 ACCEPTED
+  （三个拍 B 修正并入）；卡 021 verifier 勾选。
+- **在跑**：① 23 套件里程碑回归（`REGRESSION_SBIN=021`，
+  `~/logs/lean4vm_cpu_regression/`，master pid 1192321；brec/defeq_cache
+  用 020 校准新帽 12000，引擎单跑需 SBIN 钉 021）——**注意 beat B 引擎
+  墙 1533s > 引擎套件池帽**（脚本行查 `engine_vs_refvm` 帽是否够）；
+  ② 独立复核五道门代理（干净上下文，只读）在跑。
+- **下一队列**：复核结果回填卡 021 §复核节 → 23 套件回填（越帽按
+  mutation 先例 solo 重跑+校准）→ 卡 021 CLOSED 提交 → 卡 012 M-C/M-D
+  （引擎通道规模差分，874 常量闭包 jsonl 在 ~/logs/012I/closures/；
+  M-C 设计要点：≥20 例三通道差分、期望 oracle 现跑、bf3 类 2-beat
+  已为 Vector3 形备好）→ 里程碑出口（发布 push 仍需人工按键）。
+
+## 总控进度追记（2026-10-15 凌晨，总控）——23 套件回归池跑进行中（7 例池杀）
+
+- **23 套件池跑状态**（`~/logs/lean4vm_cpu_regression/`，021 sbin）：
+  22/23 rc 落盘，decl_injection 池内跑（7200 池帽 vs 拍 B solo 真值
+  7735s——预期杀）。**7 例池杀全部为帽类（非语义）**：
+  - RSS 杀（beat-B 图 history 随 dims +18% 增长，020 校准帽再被顶穿）：
+    `brec_drec`（>12000）、`quot_graph_vs_lean`（>6500）、
+    `defeq_cache`（>12000）。
+  - 墙钟杀（步成本 +15-20%）：`stepgraph_vs_lean`（>1500）、
+    `stepgraph_infer_defeq`（>4500；**solo 真值已测 5179.1s/733MB
+    rc=0**——池帽需校准 ~7400）、`defeq_branches`（>1800）、
+    `olean_export`（>900）。
+  - 其余 15 套件池内 rc=0（含 mutation、string、reducenat、
+    datadriven、level、env_meta、kernel_oracle、check_e2e、
+    stepgraph_vs_refvm、engine 等）。
+- **solo 重跑队列**（池跑完后串行，取真值→按真值×~1.1 校准脚本帽→
+  回填卡 021 23 套件项）：
+  1. `stepgraph_vs_lean`（cap 5000|5000；真值估 ~1250-1500）
+  2. `olean_export`（cap 2000|0；估 ~700-780）
+  3. `defeq_branches`（cap 2600|6000；估 ~1800-2100）
+  4. `quot_graph_vs_lean`（cap 1200|9000；RSS 真值估 ~6500-7000）
+  5. `brec_drec`（cap 1600|**14000**——RSS 真值估 12.5-13k）
+  6. `defeq_cache`（cap 3300|**14000**；估 2600-2900/11-12k）
+  已有真值免跑：`stepgraph_infer_defeq` 5179.1s/733MB、
+  `decl_injection` 7735.1s/1901MB（若池内也被杀）。
+  校准格式照 020（a0d18cb 格式，实测依据注释进脚本行）。
+- **独立复核代理**在跑（五道门，只读）；结果回卡 021 §复核节后
+  卡 021 方可翻 CLOSED。
+- **卡 012 M-C/M-D 下一队列不变**（bf3 2-beat 已为 Vector3 形备好）。
+
+## 总控进度追记（2026-10-15，总控）——23 套件池跑完成：15 rc=0 + 8 池杀，solo 链待跑
+
+- **池跑终态**（`~/logs/lean4vm_cpu_regression/`，021 sbin）：**15/23
+  rc=0 + 8 例池杀**（decl_injection 亦在 7200 池帽被杀——solo 真值
+  7735s 已先测）。全 8 例均为帽类（RSS 3：brec_drec/quot/defeq_cache；
+  墙 5：decl/stepgraph×2/defeq_branches/olean_export），非语义。
+- **下会话第一步：solo 重跑链**（串行、核 8-13、`run_mem_guarded`，
+  逐件记 wall/RSS 真值到 `~/logs/021/reg_solo/`）：
+  1. stepgraph_vs_lean（5000|5000）
+  2. olean_export（2000|0）
+  3. defeq_branches（2600|6000）
+  4. quot_graph_vs_lean（1200|9000）
+  5. brec_drec（1600|**14000**）
+  6. defeq_cache（3300|**14000**）
+  （stepgraph_infer 5179.1s/733MB、decl 7735.1s/1901MB 真值已有。）
+  然后按真值×~1.1-1.4 校准 run_cpu_regression.sh 八行帽（a0d18cb 格式，
+  注释记实测），回填卡 021 的 23 套件 verifier 项（23/23 rc=0 口径：
+  池 15 + solo 8）。
+- **独立复核**代理若已返回：结果（PASS/FAIL + findings）落卡 021
+  §复核节；FAIL 项当场修 + 复核。全过 + 23 套件回填后卡 021 翻
+  CLOSED 提交。
+- **再后**：卡 012 M-C/M-D → 里程碑出口（发布 push 人工按键）。
+
+## 总控进度追记（2026-10-15 下午，总控）——复核修复后的重跑链（脱离管道）
+
+- **背景**：客户端闪退连杀死在跑的 decl/stepgraph（未脱离管道——长跑
+  纪律违反的教训再次确认）。已用 `setsid` 脱离管道重启
+  `/tmp/rerun_021.sh`（`~/logs/021/rerun_chain.log` 记账）：decl 全语料
+  → stepgraph → 引擎，串行核 0-5，日志 `decl_full_e.log`/
+  `stepgraph_021c.log`/`engine_021b.log`。
+- **sbin 已重编译**（174c31c）：finding 2（both_pm kind 相等）改了
+  build_vm → 旧 sbin 陈旧；新 `step_vm_021_scratch.sbin`
+  **58,565** dims（+120）/md5 `3564c786…`，ARCHITECTURE 行已刷。
+  链尾引擎步骤将用新 sbin ✓。
+- **重要连带**：finding 1/2 修复（encoder 影子/递归 + both_pm）改变了
+  全部语料流与图——**此前 23 套件池跑的 15 rc=0 + 8 池杀全部基于
+  修复前代码，已失效**。完整收口序列（下会话继续）：
+  1. 当前链（decl/stepgraph/engine）——约 4.5h；
+  2. **23 套件池全量重跑**（`REGRESSION_SBIN=021` 新 sbin，
+     `setsid` 脱离）——预期池杀重现（帽按 020+21 实测准备校准）；
+  3. **solo 真值链**（6 件池杀重跑，帽按 handoff 前述队列）；
+  4. 帽校准（a0d18cb 格式）→ 卡 021 的 23 套件项回填 → **卡 021
+     CLOSED 提交**；
+  5. 卡 012 M-C/M-D → 里程碑出口（push 人工按键）。
+- **beat B 语义状态**（复核修复后）：lvl **34/34**（含 bs1/bs2 影子
+  边界钉）+ port 15/15 + 轻七件归档绿；VM_SPEC §12.8.2 影子条款已按
+  "从源计算 + 根归一一次 + 裸递归"修正；卡 021 §7 复核节在案
+  （f10bcfa）。
+- **收口自动化已武装**（13:40）：`/tmp/followon_021.sh`（脱离管道）——
+  ① 等 rerun 链完成标记 → ② 旧池目录改名保存
+  `~/logs/lean4vm_cpu_regression_prefix_b7`（修复前证据保留）→ ③ 23 套件
+  池跑（新 sbin，`REGRESSION_LOG_DIR` 新目录）→ ④ 按 PID 等池退出 →
+  ⑤ 6 件 solo 真值链（帽：stepgraph_vs_lean 5000|5000、olean 5000|2000、
+  defeq_branches 6000|2600、quot 9000|1500、brec 14000|2000、
+  defeq_cache 14000|4000）。账目在 `~/logs/021/followon.log`。
+  **下会话收口步骤**：读 followon.log + rerun_chain.log + 池 rc 表 →
+  按 solo 真值校准 `run_cpu_regression.sh` 八行帽（a0d18cb 格式）→
+  卡 021 23 套件项回填（decl/stepgraph/engine 真值取自 rerun 链，
+  6 件取自 solo，其余 14 件取自池）→ 卡 021 **CLOSED 提交** → 卡 012
+  M-C/M-D。
+
+## 总控进度追记（2026-10-15 下午，总控）——M-C oracle 通道打通 + 收口自动化在跑
+
+- **收口自动化**（脱离管道）：rerun 链（decl_full_e → stepgraph_021c →
+  engine_021b，核 0-5）进行中；followon（池跑 + 6 件 solo）已武装
+  （`~/logs/021/followon.log`）。
+- **卡 012 M-C oracle 通道已建**（`tests/mc_oracle.py`）：从 M-A
+  RT_TEMPLATE 派生——闭包 874/87/8 常量 bulk
+  `addDeclWithoutChecking`（M-A 已验通道）+ 每个 MCCASE 行用
+  **checked `Kernel.Environment.addDecl`** 重加（重命名消
+  alreadyDeclared）；verdict = Kernel.Exception 类别名。Quot 闭包 4 例
+  smoke：rename 重加 def/thm 均 OK ✓。
+- **M-C 案例生成器的两条义务**（smoke 实测）：①换类型变异必须同步
+  `up`（lparam 表）否则 `other:undefined universe level`；②替换类型
+  必须引用**闭包内**常量（fresh kernel env 无 Nat/Std 前置）——
+  thmTypeIsNotProp 案例用闭包内非 Prop 常量构造。
+- **M-C 剩余**：案例生成器（≥20 例：accept 重加采样 + 拒绝变异
+  declTypeMismatch/thmTypeIsNotProp/unknownConstant/level 类——
+  **level 变异案例 = beat B 通道的规模测试**）+ 图/RefVM 腿
+  （InjectionEnv 元数据通道 + run_check，模式照 lvl harness）+
+  引擎腿（sbin + verify_engine 模式）→ 汇成
+  `tests/test_mathlib_closure_vs_lean.py`；M-D = 全量差分 + 曲线进
+  VM_SPEC §19。
+
+## 总控收口（2026-10-15 深夜，总控）——卡 021 CLOSED
+
+- **23 套件收口序列全部落定**（复核修复 174c31c 代代码 + 新 sbin）：
+  1. rerun 链（13:19–16:42，核 0-5）：decl 全语料 **149/149+1 xfail
+     rc=0**（7823.3s/1869MB，`decl_full_e.log`；149 = 复核修复加的
+     bs1/bs2 影子边界钉入 lvl 节后的新计数）、stepgraph **84/84
+     rc=0**（3755.4s/733MB）、引擎 **34/34+known 3/4 rc=0**
+     （648.7s/400MB）。
+  2. followon 池跑（16:44 起，自动化 `/tmp/followon_021.sh`）：18 rc=0
+     + 5 池杀（decl 墙 7200.5s、stepgraph_vs_lean 墙 1500.2s、
+     quot RSS 6789>6500@237.7s、brec RSS 12003>12000@1108.8s、
+     defeq_cache RSS 12023>12000@2625.3s）。
+  3. solo 真值链（20:24–22:36，核 0-5，自动化串行）：5 池杀件全部
+     **rc=0**——stepgraph_vs_lean 1180.6s/1540MB、olean 729.0s
+     （池内也 rc=0，双证）、defeq_branches 1586.0s/1655MB（池内
+     1781.6s 也 rc=0）、quot 474.5s/7927MB、brec 1622.7s/12485MB、
+     defeq_cache 2338.4s/12983MB。
+  **合计 23/23 rc=0**（池 18 + solo/重跑 5）。修复前池证据保名
+  `~/logs/lean4vm_cpu_regression_prefix_b7/`。
+- **帽校准 12 行**落 `scripts/run_cpu_regression.sh`（a0d18cb 格式，
+  实测依据注释在行内）：池杀 5 行（decl 7200→11000、stepgraph_vs_lean
+  1500→1800、quot RSS 6500→11000、brec 1800\|12000→2300\|17000、
+  defeq_cache RSS 12000→18000）+ 池内余量 <1.25 的 7 行
+  （stepgraph_vs_refvm 2000→2600@1875.3s、stepgraph_infer 4500→
+  6100@4323.0s、check_e2e 900→1100@771.9s、olean 900→1300@873.4s、
+  string 1500\|7500→1800\|10000@1279.8s/6677MB、reducenat 2400→
+  2900@2034.1s、defeq_branches 1800→2300@1781.6s）。mutation
+  1595.1s/2700 帽余量 1.69 不动。decl 的 RSS 帽 9200 对真值 1869MB
+  （numpy 后端把 020 时代的 7629MB 压掉了）余量巨大，不动。
+- **卡 021 翻 CLOSED**：verifier 23 套件项回填（证据表在卡 §4）+
+  状态行收口。遗留登记转后续：bf3 2-beat（Vector3 形）、fold 动态
+  根/影子 k≥2（§16.10 R 残余）、mode 跨 ST 续体（G03 不变）。
+- **卡 012 M-C 开工前测量（本会话已做，load-bearing）**：
+  - 闭包编码规模（encode-only 实测）：Quot **879 token** / Vector3
+    **45,592** / Nat.testBit_land **3,876,777**。⇒ Python 图腿只有
+    Quot 全环境可行；Vector3/Nat 图腿改走**逐例最小 env**（案例引用
+    闭包的传递闭包，AGENTS 最小 env 纪律），全环境规模由引擎腿承担。
+  - **引擎腿成本警报**：Vector3 全环境（45.6k token）CHECK 单例
+    **>3000s 未完成**（探针 `.scratch/probe_engine_cost.py` R1 超时
+    实测）——远超 toy 4.4k 的线性外推（~55s）。成本分解探针（WHNF
+    全环境 vs CHECK 最小环境 vs CHECK 全环境）已脱管在跑
+    （`~/logs/012MC/probe_engine_cost.log`）；M-C 引擎腿与 M-D 规模
+    计划以该分解为准（引擎每步/每位置成本模型需重标定）。
+  - M-C oracle 通道（`tests/mc_oracle.py`）+ 两条生成器义务在案
+    （up 同步、闭包内引用）；案例矩阵设计：accept 重加（axiom/def/
+    thm 各采样）+ alreadyDeclared + declTypeMismatch 值/型交换 +
+    thmTypeIsNotProp（闭包内非 Prop 型）+ unknownConstant（ty/val
+    两位点）+ level 等价收（max u u / max u 0 / max 0 u——beat B
+    通道真实形状规模测试）与 level 不等价拒（succ u / max u v）。
+- **下一队列**：M-C 测试文件落地（`tests/test_mathlib_closure_vs_
+  lean.py`，四腿：oracle/graph/RefVM/engine，引擎腿范围按成本分解
+  探针定）→ M-D 全量差分 + 曲线 → 里程碑出口（发布 push 人工按键）。
+
+## 总控进度追记（2026-10-15 深夜二，总控）——M-C 差分落地：15 行分歧四根因，卡 022 立案
+
+- **卡 021 收口提交（595b61d）**：23 套件 23/23 rc=0（池 18 + solo/
+  重跑 5）+ 帽校准 12 行；上一段收口记录在案。
+- **M-C 差分套件落地**：`tests/test_mathlib_closure_vs_lean.py` 35 行
+  四通道（oracle=mc_oracle checked-add 全闭包 env / graph=InjectionEnv
+  +run_check / refvm=RefVM.check+decl-lparams / engine=vm_run check 模式；
+  逐例最小 env=案例引用闭包传递闭包 **+ inductive ctors**——结构通道
+  bundle 查 ctor 的实测要求，RefVM __init__ 对缺 ctor 直接 KeyError 的
+  harness 事故已修）。oracle 35/35 现跑（5.9s 含 Nat 779 常量 bulk 载入
+  ，零 other 类=两条生成器义务守约）。
+- **判定结果（~/logs/012MC/full_run.log + nat_rows.log，35 行 × 4 腿
+  台账）**：20 行全通道对齐（accept 3 行 / alreadyDeclared 5 /
+  declTypeMismatch 3 / thmTypeIsNotProp 2+1 / unknownConstant 4 /
+  level 等价-拒 4——各类别都有对齐行）；**15 行分歧分诊四组，全部
+  登记卡 022（docs/plans/022-mc-closure-gaps.md）**，套件内以
+  KNOWN_GAPS 常跑（XPASS 协议）：
+  - **A（9 行，三通道共有，M-D 前置）**：binder-identity bvar
+    defeq——bvar 实参类型 vs 实例化 Pi domain 双双解析到**同一 binder
+    marker link 行**而 bid 为 0（bid 只在 defeq binder 比较被 stamp，
+    infer_lambda 从不 stamp），bvar-bvar 分支把一个 binder 当两个
+    fvar → 一切真证明的 `f x` 死于 code 1。kernel 对照 =
+    type_checker.cpp:837-838 的 `t == s` 短路。证据链
+    .scratch/dbg_mc_{defeq,chain,bid}.py（同 marker 行 (31,77,0,0,0,1,0)
+    两侧原文）。
+  - **B（4 行，graph/engine only）**：宇宙多态 LAM 值 def（id 重加）
+    graph+engine 拒 code 1 而 **RefVM 接受**（83 微步复现，env 规模
+    无关，.scratch/dbg_mc_empty.py）——stepgraph 偏离自己的参照机。
+  - **C（1 行）**：thm kind gate 对多参数 Pi-sort 型不点火（q_tnp
+    code 1 vs 应 8；concrete sort 型 v_tnp/n_tnp 均正确 8）。
+  - **E（1 行）**：Nat.add 重加 graph+engine code 4（unsupported）
+    而 RefVM 接受。
+- **引擎规模实测 → ADR 027**（docs/decisions/027-engine-scale-
+  measured.md，修正 M-B 的"引擎通道承载 3000+ cid"裁定）：45.6k
+  token 全环境 CHECK >3600s、裸 WHNF warmup >1800s（双探针删失），
+  最小环境 0.3s DONE；引擎与 Python 求值器同属超线性类。M-C/M-D 通道
+  分工改"逐例最小 env 三通道 + Quot 全环境引擎腿 + 曲线归档"；M-D 按
+  ADR 027 §2 重定义（卡 012 M-D 条款已同步）。VM_SPEC §19.5 已落。
+- **文档**：卡 012 M-C 执行段 + 状态行、卡 022（fix 卡：拍 1 语义
+  设计师定四组合同与 ref_vm 冻结裁决 → 拍 2 A 组 → 拍 3 B/C/E →
+  拍 4 回归+摘册）、ADR 027、VM_SPEC §19.5、本板。
+- **回归表**：`mathlib_closure_vs_lean` 入 `scripts/run_cpu_regression.sh`
+  （**3600|4000**，24 套件基数 23→24）；guarded 终跑原文
+  `~/logs/012MC/guarded_final.log`——**rc=0，wall 2121.6s / RSS 1950MB**，
+  汇总行 `graph: 20 agree/15 diverge/0 boundary, refvm: 16/9/10,
+  engine: 15/15/5, enginefull: 5/8/3`，47 个 XFAIL-KNOWN-GAP（15 行
+  注册腿），零普通 FAIL、零 XPASS。
+- **下一队列**：卡 022 拍 1（语义设计师：A/B/C/E 图侧失败点 step
+  trace + kernel 引用 + 修复合同）→ 拍 2-4 → M-C 15 gap 行转绿摘册
+  → M-D（按 ADR 027 重定义后口径）→ 里程碑出口（push 人工按键）。
+
+## 总控进度追记（2026-10-17 晨，总控）——卡 022 拍 1：诊断完成，ADR 028 DRAFT 落盘
+
+- **拍 1 执行史**：语义设计师代理（上会话派）完成四组诊断，探针全量落
+  `.scratch/dbg022_*.py`（19 件）后在「写 ADR」一步停摆（04:24 最后
+  落盘，静默 1h+；死因定性：长跑上下文耗尽，§1.16 面）。总控核查后
+  接手末步：重跑关键探针取证原文（~/logs/022B1/），代笔落
+  **docs/decisions/028-mc-closure-gap-fixes.md（DRAFT）**。
+- **拍 1 核心结论**（证据在 ADR 028 与 ~/logs/022B1/）：
+  1. **A(9行)+B(4行)+C(1行) 收拢为一个机制**：binder-identity 恒等缺失
+     （bvar-bvar 只认 bid、infer 从不 stamp bid）+ A2 T_PI_CLO.V2 marker
+     载体。A1+A2 已在 RefVM 内存补丁验证：A 组 7/9 行转绿、
+     DEFEQ_CORPUS 零漂移、抗混同探针（同形异 binder 判异）通过。
+     B = 同机制图侧面（83 步 trace 定案）；C = gate-REACH（CK_G1
+     帧数为零，型侧 infer 先死于 A 面；A 落地后 n2z=False → 应 8）。
+  2. **E = 图侧 INFER 无 K_MDATA 臂**：Nat.add 声明型 Pi domain 的
+     MData(Nat) 在 CK_G0 型侧 infer 第 2 微步触发 code 4；立卡 brecOn
+     嫌疑被证伪（value 树未走到）。RefVM.check 接受是因为它从不
+     infer 声明型。kernel：type_checker.cpp:339 MData infer 递归子。
+  3. **残差两行**（q_acc_thm：最内层 Eq spine 的 3 帧浅索引 + BVar-vs-
+     App 面；n_acc_thm：infer_proj 结构型面）证据钉死、根因 NOT-
+     VERIFIED，登记为拍 2 诊断义务。
+  4. **ref_vm 冻结裁决：准修（A1+A2 皆最小内部修复）**——kernel t==s
+     逐字移植 + 同恒等语义的最小载体；不修则冻结机对全部真证明类误拒。
+- **下一步**：独立复核代理（干净上下文，只读）对 ADR 028 出 PASS/FAIL
+  → 通过后拍 2（A 组图侧实现 + ref_vm 最小修复 + 两残差收口）→
+  拍 3（E 臂 + C 复验）→ 拍 4（回归 + XPASS 摘册）→ M-D。
+- **拍 1 复核收口（同晨）**：独立复核代理（干净上下文、只读）对 ADR 028
+  出 **FAIL-narrow → 修订后收货**：机制/内核引用/健全性/冻结裁决/证据
+  引文全过（复核者自跑 e_node 探针 byte-for-byte 复现），4 处文本精度
+  缺陷（关键一处：§1.3 误述 HEAD defeq 无顶恒等——实际 ref_vm.py:1087-
+  1088 已有，ref_vm 改动收窄为仅 bvar-bvar 块）+ 1 处引文口径，全部
+  已修并入 ADR §7。**ADR 028 翻 ACCEPTED，拍 2 开工资格成立。**
+
+## 2026-10-22/23 会话（总控 + 单串行子代理 card022-beat2）：卡 022 拍 2 收口
+
+**方式**：用户裁定"派一个子智能体串行做，总控负责**审实现代码**（不是跑一次）"。
+总控逐行审了 ref_vm/quot、ref_vm/infer_proj、engine/vm.cpp、build_vm A1+A2、
+三枚常驻钉，并独立抽验了 `q_acc_thm` 行（graph code 1 / refvm ACCEPT 0，
+wall 786.8s）。子代理两轮审计反馈后返工（proj 的 Prop 保护/依赖字段拒、
+quot 顺序、引擎悬崖定性），全部落盘。
+
+### 拍 2 结论（与 ADR 028 §1.6/§1.7 的立卡假设不同，见 ADR 028 §8）
+
+1. **两残差不是 A 家族**：
+   - `q_acc_thm` = 冻结机**缺 quot 递归子归约**（`K/quot.h:39-75`）；
+   - `n_acc_thm` = `infer_proj` **缺头剥离/参数实例化**（`K/type_checker.cpp:248-289`）；
+   - A1+A2 机制本身对 9 行里的 8 行成立（图侧 8/9 绿）。
+2. **冻结条款裁定（准修）**：两处 ref_vm 补全按 ADR 028 §1.5 "最小内部修复"
+   收录，条件（Prop 保护、依赖字段保守拒、index 边界、负向钉）已全部满足。
+3. **引擎侧重大发现（ADR 027 补条款）**：`q_acc_def` 的 1 步固定点不是取指
+   off-by-one，而是**位置内建槽（slots 1..3）在 fp32 层栈里累积残差**导致的
+   取指数值悬崖（q≳2900 时 argmax 由噪声决定；实测 q=2810 noise/gap=1.26）。
+   修法 = `engine/vm.cpp` 每位置层栈后写回精确内建值（+12 行，无格式/图/sbin
+   变更）；34/34 双流一致、`q_acc_def` 引擎腿 `DONE 1 0 1883` ACCEPT。
+   **对 M-D 的含义**：45.6k token 全环境引擎腿此前"不可行"不只因成本，还因
+   判定不可信；本修后取指对任意流长精确。
+4. **A 组终版**：8 行 × graph/refvm/engine 三通道全绿；唯一红行 `q_acc_thm`
+   在 graph（code 1）/engine（-1，同面超时）两侧，参照机已绿 → **卡 024**。
+
+### 验证面（全 rc=0，`~/logs/022B3/`）
+
+`stepgraph_infer_defeq` **84/84（0 pinned）** · `stepgraph_vs_refvm` **37/37** ·
+`ref_vs_lean` **34/34** · `ref_infer_defeq` **82/82** · `check_e2e` A15/15+B15/15 ·
+`mutation_reject` A16/16+B8/8 · `defeq_branches` **ALL OK** · `level_vs_lean`
+37/37（kdecl 段）· 引擎对拍 **34/34**（`stream_same` 34/34）· `decl_injection`
+ipr 段 10/10+1xfail。XPASS 14 条 = `KNOWN_GAPS` 已与 oracle 对齐待摘（拍 4）；
+零普通 FAIL。
+
+### 交付物
+
+`engine/vm.cpp` +12 · `lean_vm/build_vm.py` A1+A2（26+/5-）· `lean_vm/ref_vm.py`
++212（quot 归约 + infer_proj 重写 + guards）· `tests/test_decl_injection_vs_lean.py`
++79（bid_same/bid_distinct/ipr_pd_data + IprPD 前导）· 卡 022 执行段、卡 023
+（CLOSED）、卡 024（open）· ADR 027 补条款、ADR 028 §8 · ARCHITECTURE 022
+件行 + vm_run 行 + 24 套件注记。**未提交任何 `.scratch`/`model/*.sbin` 诊断件。**
+
+### 未闭环 / 下一会话第一步
+
+1. **卡 024**：`q_acc_thm` graph code 1（面 = quot reduct 的 `infer_app`
+   I_ARG_S，s2911–s2925 / token 806..811@env0）；engine 同面 -1（TIMEOUT）。
+   修后该行三腿应全绿。
+2. **拍 3**：E 组 INFER MData 臂 + B 组 4 行 + C 组 q_tnp 行级复验
+   （B/C 预期随 A 转绿，须逐行取证）。
+3. **拍 4**：摘 15 条 `KNOWN_GAPS`（现 14 条已 XPASS）+ 24 套件全量回归。
+   **mathlib_closure 套件帽已失效**：实测 11 行撞 3700s（引擎腿从"秒级报错"
+   变"跑到判定"，300s/行；graph accept 行 ~700s）。建议改为**按 closure 分段**
+   （Quot/Vector3/Nat 三段，各 ≤40 min），回归脚本引用三段之和——该改动属
+   `scripts/run_cpu_regression.sh`，需开卡/ADR。
+4. **M-D**：A 组已不再挡路（8/9 三通道 + 取指精度修复）；按 ADR 027 §2
+   口径（逐例最小 env 三通道 + Quot 全环境引擎腿 + 曲线）执行。
+5. 引擎腿在**全量**套件里的墙钟模型需重估（本会话的 34/34 与单行探针足够
+   定性，但回归帽要按实测重标）。
+
+## 2026-10-23 后半场（总控 + 五个一次性子代理）：卡 024 / 拍 3 / 拍 4 / M-D
+
+**组织方式**（用户裁定）：一次性子代理串行，每个盒子干净上下文、做完即弃；
+总控只审代码与裁决，不复用代理。共五盒：024 诊断（2）、024 修复（1）、
+验证（1）、拍 4（1）、回归（进行中）。
+
+**024**：真正病灶是 **quot reduct 的 whnf 交付**（`quot_go` 现造 App，但
+WHNF 交回原闭包 → D_SW3 "unmoved" 误判）。修法 = `quot_go` 把操作数 env
+记入 App token 的 X 槽 + `ms_sp_whnf` 按 token 形状改取 spine root（+40 行，
+`K/quot.h:64-68`）。`q_acc_thm` graph/engine/enginefull 三腿转绿。
+
+**拍 3**：E（INFER MData 透明臂，`K/type_checker.cpp:339`）→ `v_acc_natadd`
+绿；B 四行三通道绿 + 常驻钉 `lvl_lam_poly`（真实 `id` dump）；C `q_tnp`=8。
+
+**拍 4 / M-D**：15 条 KNOWN_GAPS 全摘；**35 行 × 4 通道全绿**（Quot 段
+5092.2s/2333MB、Vector3 559.3s/1584MB、Nat 206.3s/1939MB）；引擎窗口
+600→1200（实测依据）；mathlib 按 closure 三分段（卡 025，帽 ×1.4）。
+M-D 曲线落 VM_SPEC §19.6。终验证件 `model/step_vm_022b_scratch.sbin`
+（58,597/7,680/363,318，md5 `7c7c3cc2…`），引擎 34/34 双流、84/84。
+
+**进行中**：26 套件全量回归（`regression26` 盒，`~/logs/lean4vm_cpu_regression/`）。
+**待总控**：全量回归 rc 表 → 最终 diff 审核（代码/证据/文真值表）→ 提交 →
+快照 push（用户已授权"审后 push"）。

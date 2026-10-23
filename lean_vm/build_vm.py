@@ -60,7 +60,7 @@ from expr.model import (
 )
 from expr.tokens import (
     T_FRAME, T_PEND, T_LINK, T_PI_CLO, T_DEFCACHE, T_WHNFCACHE,
-    TASK_WHNF, TASK_INFER, TASK_DEFEQ, TASK_LEVEL, TASK_CHECK,
+    TASK_WHNF, TASK_INFER, TASK_DEFEQ, TASK_CHECK,
     T_ENV, T_ENV_META, T_ENV_RECVAL, T_ENV_RULE, T_ENV_RECEXTRA,
     T_ENV_CTORVAL, T_ENV_INDVAL, T_ENV_LIST, CK_RECURSOR, CK_QUOT,
     T_ENV_QUOTVAL, T_ENV_DEFVAL, CK_DEFINITION,
@@ -251,6 +251,12 @@ I_ARG_S = 69
 # .other, new reject code 10).  The chain head rides the TASK_CHECK anchor's
 # F2 slot (0 = no lparams → the arm is inert; ENV_FORMAT §2.8).
 CK_G9 = 70
+
+# Card 019 (P0-2): is_prop field-delivery continuation of infer_proj
+# (kernel is_prop(binding_domain(r)) at K/type_checker.cpp:290 — the ST
+# carries the computed field domain while TASK_INFER judges its sort; the
+# IP_PK step re-checks K_SORT ∧ n2z and delivers or rejects code 12).
+IP_PK = 71
 
 # Card 014 (ADR 017): the is_def_eq memo layer. VM014_CACHE=0 removes every
 # cache arm at build time (the verdict-invariance control: the two settings
@@ -488,13 +494,27 @@ def build_step_graph():
         return reglu(p, _is_rec_ind(cid) if want_rec
                      else One - _is_rec_ind(cid))
 
-    def _is_struct_induct(cid):
-        """Non-recursive 0-param 0-index *structure* inductive, identified from
-        metadata (legacy fallback CID_P2).  Used by the projection-type peel,
-        whose ctor Pi-spine source mk_ty is still the one legacy site."""
-        return _select(reglu(_no_meta(cid), One),
-                       _eq_expr(cid, Expression({_one_dim: CID_P2})),
-                       _is_induct(cid, False))
+    def _struct_ctor(cid):
+        """(ctor_count, first_ctor_cid) of inductive `cid`, read by scanning
+        the per-cid T_ENV_CTORVAL tokens (anchor(c).V2; V1 = induct_cid) —
+        WP1 has no inductive->ctor cid link, the same gap _is_unit_induct
+        works around for get_cnstrs() (K/declaration.h:303).  With count==1
+        the accumulator IS the unique ctor (kernel head(cnstrs),
+        K/type_checker.cpp:263).  Legacy no-metadata fallback: the toy
+        CID_P2 -> CID_P2MK pair."""
+        cnt, acc = Zero, Zero
+        for c in range(_NSCAN):
+            h = _mhead(c)
+            ok = _kind_eq_raw(fetch_by_position([k_], h)[0], T_ENV_CTORVAL, One)
+            ind = fetch_by_position([v1_], h)[0]
+            m = reglu(reglu(ok, _eq_expr(ind, cid)), _inrange[c])
+            cnt = cnt + m
+            acc = acc + m * c
+        leg_ok = reglu(_no_meta(cid), One)
+        leg_cnt = One
+        leg_acc = Expression({_one_dim: CID_P2MK})
+        return (_select(leg_ok, leg_cnt, cnt),
+                _select(leg_ok, leg_acc, acc))
 
     def _quot_kind(cid):
         """quot_kind of a Quot constant (declaration.h:388: Type=0 Mk=1 Lift=2
@@ -701,7 +721,6 @@ def build_step_graph():
     is_infer_frame = reglu(_kind_eq_raw(frV0, TASK_INFER, One), has_frame)
     is_defeq_frame = reglu(_kind_eq_raw(frV0, TASK_DEFEQ, One), has_frame)
     is_whnf_frame = reglu(_kind_eq_raw(frV0, TASK_WHNF, One), has_frame)
-    is_level_frame = reglu(_kind_eq_raw(frV0, TASK_LEVEL, One), has_frame)
     # Phase 5 M4.2: CHECK anchor frames (kernel `check` driver loop). A CHECK
     # frame is the loop anchor for ONE declaration: V1 = declared type root,
     # X = value root, V2 = next anchor (0 = last). It is NOT a pop_task frame:
@@ -709,8 +728,7 @@ def build_step_graph():
     # skips the anchor to the NEXT one, so CK_RES advances by pointing D at
     # the ST's own V2.
     is_check_frame = reglu(_kind_eq_raw(frV0, TASK_CHECK, One), has_frame)
-    is_task_frame = (is_infer_frame + is_defeq_frame + is_whnf_frame
-                     + is_level_frame)
+    is_task_frame = is_infer_frame + is_defeq_frame + is_whnf_frame
     ret_pending = reglu(_eq_expr(SE, One),
                         One - is_walk_frame - is_compute - is_iota_build)
     cont_mode = reglu(ret_pending, reglu(is_st_frame, _geq_expr(frF2, One)))
@@ -720,7 +738,7 @@ def build_step_graph():
     main_mode = (One - is_walk_frame - is_compute - is_build - is_cs_build
                  - is_cs_build_p2 - is_iota_build
                  - is_infer_frame
-                 - is_defeq_frame - is_level_frame - is_check_frame - st2_mode)
+                 - is_defeq_frame - is_check_frame - st2_mode)
     # CHECK kickoff: D = anchor, no result in flight → start infer(value)
     ck_kick = reglu(is_check_frame, One - ret_pending)
     walk_more = reglu(is_walk_frame, _geq_expr(frX, One))
@@ -995,6 +1013,24 @@ def build_step_graph():
     result_spine = reglu(pend_nonempty, _geq_expr(SF, One))
     v_done = _select(result_spine, SF, SA)
     e_done = SB
+    # A machine-MINTED spine root (WP4 quot_reduce_rec's reduct `mk_app(f,
+    # app_arg mk)`, K/quot.h:64-68) is a freshly emitted App token, not the
+    # task's own application: its operands are the `f` thunk and the mk
+    # closure's `a`, so they live in the mk closure's env while the head may
+    # resolve through value links (env changes) — the F2/nbX closure env the
+    # whnf task was pushed with decodes neither.  The emission records that
+    # env in the App token's free X slot (a tree App always has X=0), so any
+    # delivery of this spine root must pair it with its own env; handing out
+    # the pre-reduction closure instead makes D_SW3's "unmoved" identity test
+    # compare the un-reduced spine (kernel whnf DID move: the reduct).
+    # The gate is the token shape itself (App root carrying an env), so every
+    # other spine-root arm (rec/cs/iota PEND chains, tree Apps with X=0) keeps
+    # its existing delivery bit-for-bit.
+    sr_env = fetch_by_position([x_], SF)[0]
+    sr_minted = reglu(result_spine,
+                      reglu(_kind_eq_raw(fetch_by_position([k_], SF)[0],
+                                         K_APP, One),
+                            _geq_expr(sr_env, One)))
 
     # completion targets (the walk-marker halt term is added after the
     # WALK section, where mk_stuck is defined)
@@ -1465,16 +1501,19 @@ def build_step_graph():
     # F2 slot). No pending args → the bvar token (SE) under its focus env.
     # (The old head-only delivery with SB clobbered to the last link's
     # captured env made D_SW3's sw_stuck fail and deq_eta_lam loop.)
+    # Minted spine root (sr_minted, the quot reduct): the application the
+    # task was pushed with is GONE — whnf replaced it — so the delivered pair
+    # is that spine root with its own recorded env.
     ms_sp_whnf = reglu(mk_stuck, reglu(result_spine,
                                        _kind_eq_raw(nbV0, TASK_WHNF, One)))
-    A_walk = _select(ms_sp_whnf, nbV1,
+    A_walk = _select(ms_sp_whnf, _select(sr_minted, SF, nbV1),
             _select(wf_soft, nbV1,
             _select(walk_fail, fV2,
             _select(mk_dq, SA,
             _select(mk_stuck, _select(result_spine, SF, SE),
             _select(walk_more, fV2,
                     fV0))))))                   # hop: next link / done: value
-    B_walk = _select(ms_sp_whnf, nbX,
+    B_walk = _select(ms_sp_whnf, _select(sr_minted, sr_env, nbX),
             _select(wf_soft, nbX,
             _select(walk_fail, SB,
             _select(mk_dq, SB,
@@ -3219,7 +3258,328 @@ def build_step_graph():
         """continuation id with the mode high slot (m is a 0/1 gate)"""
         return Expression({_one_dim: n}) + m * MODE_STRIDE
 
-    g = {n: gid(n) for n in range(1, 71)}
+    LVL_DEPTH = 5
+    LVL_CHAIN_DEPTH = 8
+    # card 021 canonical-compare budgets: succ spine 5 (corpus
+    # spine-depth ≤2, explicit ≤2; deeper explicit compares
+    # unequal — sound-incomplete) + Max/IMax nesting 3 (corpus ≤2).
+
+    def _lvl_eq_struct(l, r, depth, mm=3):
+        if depth <= 0:
+            return Zero
+        # Identical closure ⇒ defeq (kernel level is_def_eq is deep
+        # structural: lhs == rhs || normalize(lhs) == normalize(rhs),
+        # K/level.cpp:518-521).  Levels carry no bvars, so the same env slot
+        # IS the same level term.  Without this, a KL_MAX/KL_IMAX node loses
+        # even against itself, so deq_const never fired on max(1,1)-levelled
+        # consts: the d6 head pair Nat.rec@{max(1,1)} =?= itself fell into
+        # the soft-whnf/proof-irrel ladder, its False unwound into the
+        # DE_PRJ re-dispatch and d6/d7 stopped halting (005 F13-01/F13-02).
+        pos_eq = _eq_expr(l, r)
+        lk = fetch_by_position([k_], l)[0]
+        rk = fetch_by_position([k_], r)[0]
+        same = _eq_expr(lk, rk)
+        lv0 = fetch_by_position([v0_], l)[0]
+        rv0 = fetch_by_position([v0_], r)[0]
+        res = pos_eq + reglu(One - pos_eq,
+                             reglu(same, _eq_expr(lk, One * KL_ZERO)))
+        res = res + reglu(One - pos_eq,
+                          reglu(reglu(same, _eq_expr(lk, One * KL_PARAM)
+                                                + _eq_expr(lk, One * KL_MVAR)),
+                                _eq_expr(lv0, rv0)))
+        # card 021: canonical Max/IMax recursion.  With the comparison-time
+        # canonical arms retired, structural equality must reproduce the
+        # kernel's operator== on two NORMALIZE forms — and canonical forms
+        # are sort-aligned, so the paired child recursion is exact (a RAW
+        # max pair would need order-insensitive multiset matching; a
+        # canonical pair does not).  One shared V0 subcall serves both the
+        # Succ spine and the Max/IMax left child, so the unroll stays
+        # 2-ary; the mm budget bounds the binary nesting (corpus ≤2 —
+        # deeper compares unequal, sound-incomplete).
+        sub0 = _lvl_eq_struct(lv0, rv0, depth - 1, mm)
+        res = res + reglu(One - pos_eq,
+                          reglu(reglu(same, _eq_expr(lk, One * KL_SUCC)),
+                                sub0))
+        if mm > 0:
+            lv1 = fetch_by_position([v1_], l)[0]
+            rv1 = fetch_by_position([v1_], r)[0]
+            is_mm = reglu(same, _eq_expr(lk, One * KL_MAX)
+                                + _eq_expr(lk, One * KL_IMAX))
+            sub1 = _lvl_eq_struct(lv1, rv1, depth - 1, mm - 1)
+            res = res + reglu(One - pos_eq,
+                              reglu(is_mm, reglu(sub0, sub1)))
+        return res
+
+
+    def _flat(root, rootK, a, b):
+        """split a canonical level tree into ≤3 top-level-max lanes
+        (caseA root not Max → (root, -, -); caseB → (a, b, -); caseC
+        a Max → (a.a, a.b, b); caseD b Max → (a, b.a, b.b); both
+        children Max = 4 arguments, out of budget — the `both` flag
+        gates the caller's fallback).  Shared by the I_PIL2 case-A
+        union-rebuild (card 021); previously nested in the retired
+        _lvl_max_canon arm."""
+        aK = fetch_by_position([k_], a)[0]
+        bK = fetch_by_position([k_], b)[0]
+        is_max_root = _eq_expr(rootK, One * KL_MAX)
+        a_is_max = reglu(is_max_root, _eq_expr(aK, One * KL_MAX))
+        b_is_max = reglu(is_max_root, _eq_expr(bK, One * KL_MAX))
+        caseA = One - is_max_root
+        caseB = reglu(is_max_root, reglu(One - a_is_max, One - b_is_max))
+        caseC = reglu(a_is_max, One - b_is_max)
+        caseD = reglu(b_is_max, One - a_is_max)
+        both = reglu(a_is_max, b_is_max)
+        aa0 = fetch_by_position([v0_], a)[0]
+        aa1 = fetch_by_position([v1_], a)[0]
+        bb0 = fetch_by_position([v0_], b)[0]
+        bb1 = fetch_by_position([v1_], b)[0]
+        s1 = _select(caseA, root, _select(caseB, a,
+                     _select(caseC, aa0, a)))
+        s2 = _select(caseA, Zero, _select(caseB, b,
+                     _select(caseC, aa1, bb0)))
+        s3 = _select(caseC, b, _select(caseD, bb1, Zero))
+        live2 = is_max_root
+        live3 = caseC + caseD
+        return (s1, s2, s3), (One, live2, live3), both
+    def _lvl_chain_eq(a, b, depth, canon_steps=0):
+        """Const level-arg sibling chains (X-linked, 0 = end) pairwise equal.
+        The first `canon_steps` chain steps (counted from the head) compare
+        canonically; deeper steps stay structural."""
+        if depth <= 0:
+            return Zero
+        a_end = _eq_expr(a, Zero)
+        b_end = _eq_expr(b, Zero)
+        a_nx = fetch_by_position([x_], a)[0]
+        b_nx = fetch_by_position([x_], b)[0]
+        if canon_steps > 0:
+            # the chain STEP is the canonical instance (ADR 025 §2.3 six
+            # instances = deq_sort depth 0/1 + chain steps 0/1 ×2 sites);
+            # the arg's own succ spine recurses pure-struct
+            head = _lvl_eq_canon(a, b, LVL_DEPTH, 1)
+        else:
+            head = _lvl_eq_struct(a, b, LVL_DEPTH)
+        step = reglu(One - a_end, reglu(One - b_end,
+                       reglu(head,
+                             _lvl_chain_eq(a_nx, b_nx, depth - 1,
+                                           canon_steps - 1))))
+        return reglu(a_end, b_end) + step
+
+    # ── normalizes_to_zero circuit (D8, K/level.cpp:174-186) ────────────────
+    # Single-tree recursion (unlike _lvl_eq_struct's paired compare): 1 iff the level
+    # tree rooted at `pos` normalizes to zero.  Kernel rules verbatim:
+    #   Zero→1; Param/MVar/Succ→0; Max→n2z(lhs) ∧ n2z(rhs); IMax→n2z(rhs)
+    # only (`mk_imax` returns its rhs whenever the rhs is zero, so the lhs
+    # contributes nothing, K/level.cpp:112-123 + :174-186).
+    # The recursion is a full binary unroll over the depth cap: a Max node
+    # branches into both children at RUNTIME, so every build-time subtree must
+    # exist; the per-node kind gates keep the verdict 0/1 and mutually
+    # exclusive (kinds are disjoint), so a Succ/Param/MVar node (or a NULL
+    # position past the tree edge) yields 0.  Depth cap 8: measured level
+    # trees are depth ≤ 3; the kernel has no depth notion, and a capped path
+    # yields 0 (not-prop) — the sound-incomplete direction (never an unsound
+    # accept), the same policy _lvl_eq_struct documents for Max/IMax pairing.
+    LVL_N2Z_DEPTH = 8
+
+    def _n2z(pos, depth):
+        if depth <= 0:
+            return Zero
+        k = fetch_by_position([k_], pos)[0]
+        v0 = fetch_by_position([v0_], pos)[0]
+        v1 = fetch_by_position([v1_], pos)[0]
+        is_zero = _eq_expr(k, One * KL_ZERO)
+        is_max = _eq_expr(k, One * KL_MAX)
+        is_imax = _eq_expr(k, One * KL_IMAX)
+        # share the child subtrees: each node unrolls TWO children (the v1
+        # subtree feeds both the Max AND-gate and the IMax rhs rule), so a
+        # depth-d circuit is 2^d - 1 nodes (d=8 → 255), not a per-kind
+        # tripling.
+        nz_v0 = _n2z(v0, depth - 1)
+        nz_v1 = _n2z(v1, depth - 1)
+        return (reglu(is_zero, One)
+                + reglu(is_max, reglu(nz_v0, nz_v1))
+                + reglu(is_imax, nz_v1))
+
+    # ── level compare (D4/D5, K/level.cpp:518-521) ──────────────────────────
+    # is_equivalent = lhs == rhs || normalize(lhs) == normalize(rhs).  With
+    # canonical-by-construction (card 021: encoder normalize, I_PIL2
+    # union-rebuild, succ shadows) the graph-held forms ARE the normalize
+    # forms, so the structural circuit is the whole judgment; the bounded
+    # comparison-time arms are retired (they double-normalize canonical
+    # inputs and would over-accept — the lvl_xc B1 evidence).  Two kernel
+    # facts kept the historical arms honest and now shape the construction
+    # boundaries instead:
+    #   - normalize sorts max arguments with is_norm_lt (K/level.cpp:474),
+    #     whose Param/MVar order is the interned level_id (level.cpp:407,
+    #     set by name-interning order) — graph nids are
+    #     encounter-order integers, irreproducible.  But an equivalence
+    #     JUDGMENT never needs the canonical order, only that the normalized
+    #     survivor multisets are equal: the pairing below is order-insensitive
+    #     (kernel still accepts, K/level.cpp:477-509 survivor semantics).
+    #   - normalize is ONE-SHOT (is_equivalent never normalizes twice,
+    #     K/level.cpp:518-521): an IMax argument re-enters through mk_imax's
+    #     smart constructor (level.cpp:463-467) and never joins the max
+    #     flattening — so MAX vs IMAX roots compare unequal even when a
+    #     "mathematically" equal form exists.
+    # Bounds (corpus-scan evidence, card 018 §5.3): succ-spine view cap 3,
+    # max-argument flatten cap 2 (root + one nested layer, 3 slots), n2z cap
+    # 4, canonical arms deployed at deq_sort depth 0/1 and chain steps 0/1
+    # only.  Every bound overrun judges UNEQUAL (sound, incomplete).
+    LVL_CANON_SPINE = 3
+    LVL_N2Z_P_DEPTH = 4
+
+    def _n2z_packed(pos, depth):
+        """packed normalizes_to_zero (K/level.cpp:174-186), narrower and
+        cheaper than the is_prop cap-8 circuit above — the defeq arms only
+        need the imax-normalizes-to-zero class, not full is_prop width."""
+        if depth <= 0:
+            return Zero
+        k, v0, v1 = fetch_by_position([k_, v0_, v1_], pos)
+        is_zero = _eq_expr(k, One * KL_ZERO)
+        is_max = _eq_expr(k, One * KL_MAX)
+        is_imax = _eq_expr(k, One * KL_IMAX)
+        nz_v0 = _n2z_packed(v0, depth - 1)
+        nz_v1 = _n2z_packed(v1, depth - 1)
+        return (reglu(is_zero, One)
+                + reglu(is_max, reglu(nz_v0, nz_v1))
+                + reglu(is_imax, nz_v1))
+
+    def _lv_view(pos, cap):
+        """(base, base kind, offset k, capped) along the KL_SUCC spine (D9
+        to_offset, K/level.cpp:67-74; linear — only V0 is followed).  One
+        packed fetch per spine level.  capped = every spine level was Succ:
+        the view is out of budget and its consumer must treat it
+        conservatively (compare: never matches; fold: no rule fires)."""
+        ks = []
+        nxts = [pos]
+        for _ in range(cap):
+            k_nx = fetch_by_position([k_, v0_], nxts[-1])
+            ks.append(k_nx[0])
+            nxts.append(k_nx[1])
+        ks.append(fetch_by_position([k_], nxts[cap])[0])
+        flags = [_eq_expr(k, One * KL_SUCC) for k in ks[:cap]]
+        prods = [One]
+        for f in flags:
+            prods.append(reglu(prods[-1], f))
+        kcnt = Zero
+        for i, f in enumerate(flags):
+            kcnt = kcnt + reglu(prods[i], f)
+        base, bkind = nxts[cap], ks[cap]
+        for i in reversed(range(cap)):
+            base = _select(One - flags[i], nxts[i], base)
+            bkind = _select(One - flags[i], ks[i], bkind)
+        return base, bkind, kcnt, prods[cap]
+
+    def _lvl_base_eq(bt, bkt, bs, bks, nid_t, nid_s):
+        """Base equality for multiset pairing: same position, both explicit
+        (base Zero), or both Param/MVar with equal name nid (kernel D3 name
+        equality, K/level.cpp:132-133).  0/1."""
+        pos_eq = _eq_expr(bt, bs)
+        both_zero = reglu(_eq_expr(bkt, One * KL_ZERO),
+                          _eq_expr(bks, One * KL_ZERO))
+        # card 021: the nid comparison was MISSING in the card-018 arm era —
+        # both_pm checked only the kinds, so two DIFFERENT params compared
+        # base-equal (latent: the arm corpus never distinguished; the fold
+        # union-rebuild's same-base dedup was the first consumer that does).
+        both_pm = reglu(
+            reglu(_eq_expr(bkt, One * KL_PARAM)
+                  + _eq_expr(bkt, One * KL_MVAR),
+                  _eq_expr(bks, One * KL_PARAM)
+                  + _eq_expr(bks, One * KL_MVAR)),
+            _eq_expr(bkt, bks))
+        both_pm = reglu(both_pm, _eq_expr(nid_t, nid_s))
+        res = pos_eq + reglu(One - pos_eq, both_zero)
+        res = res + reglu(One - pos_eq, reglu(One - both_zero, both_pm))
+        return res
+
+    def _lvl_max_canon(l, r, lk, lv0, rk, rv0):
+        """RETIRED (card 021 / ADR 026 beat B): with every graph-entering
+        level in normalize form (encoder normalize + fold union-rebuild +
+        succ shadows), the kernel's is_equivalent(lhs, rhs) IS the
+        structural equality of the graph-held forms, so the bounded
+        comparison-time canonical arms are not just unneeded — re-running
+        them on canonical inputs DOUBLE-normalizes (non-idempotent imax
+        path forms) and would accept pairs the kernel rejects (the lvl_xc
+        B1 checkpoint evidence).  Over-budget fold shapes now fall back to
+        the pairwise emission at construction time (sound-incomplete,
+        reject-direction).  _flat/_lv_view/_lvl_base_eq live on: the I_PIL2
+        union-rebuild and the is_prop n2z circuits share them."""
+        return Zero
+
+    def _lvl_eq_canon(l, r, depth, canon_left, use_n2z=False, mm=3):
+        """struct leg (+ n2z for the is_prop channel), 0/1 verdict —
+        prioritized merge keeps the sum in {0,1} (the verdict feeds
+        _select conditions and the defeq cache-write gate).  The canonical
+        arms are RETIRED (card 021 / ADR 026 beat B): graph-held levels are
+        normalize forms, so structural equality IS the kernel's
+        is_equivalent; the canon_left parameter is kept for the Succ-leg
+        recursion shape only (it no longer buys anything beyond struct).
+        The Max/IMax paired-child recursion (card 021) lives in BOTH this
+        entry and _lvl_eq_struct — the deq_sort site recurses through this
+        function at the top, so a canonical max pair must be decided HERE:
+        the shared V0 subcall is the succ_leg, the V1 subcall is
+        struct-with-mm."""
+        if depth <= 0:
+            return Zero
+        pos_eq = _eq_expr(l, r)
+        lk = fetch_by_position([k_], l)[0]
+        rk = fetch_by_position([k_], r)[0]
+        lv0 = fetch_by_position([v0_], l)[0]
+        rv0 = fetch_by_position([v0_], r)[0]
+        same = _eq_expr(lk, rk)
+        if canon_left >= 2:
+            succ_leg = _lvl_eq_canon(lv0, rv0, depth - 1, 1)
+        else:
+            succ_leg = _lvl_eq_struct(lv0, rv0, depth - 1)
+        res = pos_eq + reglu(One - pos_eq,
+                             reglu(same, _eq_expr(lk, One * KL_ZERO)))
+        res = res + reglu(One - pos_eq,
+                          reglu(reglu(same, _eq_expr(lk, One * KL_PARAM)
+                                                + _eq_expr(lk, One * KL_MVAR)),
+                                _eq_expr(lv0, rv0)))
+        res = res + reglu(One - pos_eq,
+                          reglu(reglu(same, _eq_expr(lk, One * KL_SUCC)),
+                                succ_leg))
+        if mm > 0:
+            lv1 = fetch_by_position([v1_], l)[0]
+            rv1 = fetch_by_position([v1_], r)[0]
+            is_mm = reglu(same, _eq_expr(lk, One * KL_MAX)
+                                + _eq_expr(lk, One * KL_IMAX))
+            sub1 = _lvl_eq_struct(lv1, rv1, depth - 1, mm - 1)
+            res = res + reglu(One - pos_eq,
+                              reglu(is_mm, reglu(succ_leg, sub1)))
+        arms = _lvl_max_canon(l, r, lk, lv0, rk, rv0)
+        if use_n2z:
+            nz = reglu(_n2z_packed(l, LVL_N2Z_P_DEPTH),
+                       _n2z_packed(r, LVL_N2Z_P_DEPTH))
+            arms = nz + reglu(One - nz, arms)
+        return res + reglu(One - res, arms)
+
+    def _n2z_or(pos, depth):
+        """is_not_zero (K/level.cpp:160-172) — the D8 normalizes_to_zero
+        circuit with Succ and Max gates FLIPPED, so it shares nothing with
+        _n2z_packed.  Strict 0/1 OR (a + (1-a)*b) — a RegLU passes its
+        second argument through unclamped, and the _select conditions and
+        fold gates downstream need a binary verdict."""
+        if depth <= 0:
+            return Zero
+        k, v0, v1 = fetch_by_position([k_, v0_, v1_], pos)
+        is_succ = _eq_expr(k, One * KL_SUCC)
+        is_max = _eq_expr(k, One * KL_MAX)
+        is_imax = _eq_expr(k, One * KL_IMAX)
+        a = _n2z_or(v0, depth - 1)
+        b = _n2z_or(v1, depth - 1)
+        orb = a + reglu(One - a, b)
+        return (reglu(is_succ, One)
+                + reglu(is_max, orb)
+                + reglu(is_imax, b))
+
+    def _lvl_kind_ok(k):
+        """1 iff k is a level-node kind (KL_ZERO..KL_MVAR = 1..6)."""
+        return (_eq_expr(k, One) + _eq_expr(k, One * 2)
+                + _eq_expr(k, One * 3) + _eq_expr(k, One * 4)
+                + _eq_expr(k, One * 5) + _eq_expr(k, One * 6))
+
+    g = {n: gid(n) for n in range(1, IP_PK + 1)}
     # CONT-tree gates must be mode-gated: frF2 on non-ST frames (e.g. the
     # DEFEQ frame's F2 = s_env) can collide with a continuation id.
     cg = {n: reglu(g[n], cont_mode) for n in g}
@@ -3537,6 +3897,12 @@ def build_step_graph():
     raw_V1_c = _select(cg[I_LAMBODY], SA, raw_V1_c)
     raw_X_c = _select(cg[I_LAMBODY], frX, raw_X_c)
     raw_E2_c = _select(cg[I_LAMBODY], SB, raw_E2_c)
+    # V2 (field 3) carries the lam's OWN binder marker position: the
+    # I_LAMSORT beat emits [marker link, this ST frame, INFER frame] — the
+    # marker link sits exactly one slot below the ST frame the machine sits
+    # on now. D_XPI2 adopts it when the T_PI_CLO's body env chain never
+    # reaches a marker row; no other T_PI_CLO consumer reads field 3.
+    raw_V2_c = _select(cg[I_LAMBODY], SD - One, raw_V2_c)
     A_c = _select(cg[I_LAMBODY], c1, A_c)
     B_c = _select(cg[I_LAMBODY], Zero, B_c)
     E_c = _select(cg[I_LAMBODY], One, E_c)
@@ -3566,43 +3932,39 @@ def build_step_graph():
     E_c = _select(i_pid_fail, One, E_c)
     D_c = _select(i_pid_fail, fetch_by_position([v2_], frV2)[0], D_c)
 
-    # I_PIS1: whnf'd domain must be a sort; scan its level tree (LEVEL).
+    # I_PIS1: whnf'd domain must be a sort; its level root (a symbolic level
+    # node position, VM_SPEC §12.1) becomes l1, the binder link is pushed and
+    # the body infer launches.  The old integer LEVEL scan and the I_PIL1 hop
+    # are retired (ADR 025 §2.5): l1 = fV0 flows straight to the I_PIL2 fold.
     i_p1_bad = reglu(cg[I_PIS1], One - _kind_eq_raw(fK, K_SORT, One))
     rej_c = rej_c + reglu(i_p1_bad, One)
     rej_code_c = rej_code_c + reglu(i_p1_bad, One)
-    fr1_V1 = _select(cg[I_PIS1], frV1, fr1_V1)
-    fr1_X = _select(cg[I_PIS1], frX, fr1_X)
-    fr1_E2 = _select(cg[I_PIS1], frE2, fr1_E2)
-    fr1_F2 = _select(cg[I_PIS1], Expression({_one_dim: I_PIL1}), fr1_F2)
-    fr2_task = _select(cg[I_PIS1], Expression({_one_dim: TASK_LEVEL}), fr2_task)
-    fr2_V2 = _select(cg[I_PIS1], c1, fr2_V2)
-    fr2_X = _select(cg[I_PIS1], Zero, fr2_X)
-    A_c = _select(cg[I_PIS1], fV0, A_c)         # level root
-    B_c = _select(cg[I_PIS1], Zero, B_c)
+    # root kind gate (∉ level kinds → rej 4; the retired LEVEL dispatch's
+    # lvl_bad moved into the arm, ADR 025 §2.5)
+    p1_lk = fetch_by_position([k_], fV0)[0]
+    i_p1_lvlbad = reglu(cg[I_PIS1], One - _lvl_kind_ok(p1_lk))
+    rej_c = rej_c + reglu(i_p1_lvlbad, One)
+    rej_code_c = rej_code_c + reglu(i_p1_lvlbad, One)
+    link1_V0 = _select(cg[I_PIS1], frV1, link1_V0)
+    link1_D = _select(cg[I_PIS1], ldepth(frX), link1_D)
+    link1_P = _select(cg[I_PIS1], frX, link1_P)
+    link1_E = _select(cg[I_PIS1], frX, link1_E)
+    link1_F = _select(cg[I_PIS1], One, link1_F)
+    em_link1_c = em_link1_c + cg[I_PIS1]
+    fr1_V1 = _select(cg[I_PIS1], fV0, fr1_V1)    # l1 = symbolic level root
+    fr1_F2 = _select(cg[I_PIS1], Expression({_one_dim: I_PIS2}), fr1_F2)
+    fr2_task = _select(cg[I_PIS1], Expression({_one_dim: TASK_INFER}), fr2_task)
+    fr2_V2 = _select(cg[I_PIS1], c2, fr2_V2)
+    fr2_E2 = _select(cg[I_PIS1], One, fr2_E2)
+    A_c = _select(cg[I_PIS1], frE2, A_c)        # body pos
+    B_c = _select(cg[I_PIS1], c1, B_c)
+    C_c = _select(cg[I_PIS1], Zero, C_c)
+    F_c = _select(cg[I_PIS1], Zero, F_c)
     E_c = _select(cg[I_PIS1], Zero, E_c)
-    D_c = _select(cg[I_PIS1], c2, D_c)
-
-    # I_PIL1: l1 in A; push the pi marker and infer the body under it.
-    link1_V0 = _select(cg[I_PIL1], frV1, link1_V0)
-    link1_D = _select(cg[I_PIL1], ldepth(frX), link1_D)
-    link1_P = _select(cg[I_PIL1], frX, link1_P)
-    link1_E = _select(cg[I_PIL1], frX, link1_E)
-    link1_F = _select(cg[I_PIL1], One, link1_F)
-    em_link1_c = em_link1_c + cg[I_PIL1]
-    fr1_V1 = _select(cg[I_PIL1], SA, fr1_V1)    # l1
-    fr1_F2 = _select(cg[I_PIL1], Expression({_one_dim: I_PIS2}), fr1_F2)
-    fr2_task = _select(cg[I_PIL1], Expression({_one_dim: TASK_INFER}), fr2_task)
-    fr2_V2 = _select(cg[I_PIL1], c2, fr2_V2)
-    fr2_E2 = _select(cg[I_PIL1], One, fr2_E2)
-    A_c = _select(cg[I_PIL1], frE2, A_c)        # body pos
-    B_c = _select(cg[I_PIL1], c1, B_c)
-    C_c = _select(cg[I_PIL1], Zero, C_c)
-    F_c = _select(cg[I_PIL1], Zero, F_c)
-    E_c = _select(cg[I_PIL1], Zero, E_c)
-    D_c = _select(cg[I_PIL1], c3, D_c)
+    D_c = _select(cg[I_PIS1], c3, D_c)
 
     # I_PIS2: body type in (A,B) is a Sort token or a fresh level chain;
-    # extract the level root and scan it (l2 = ST.E2-bound LEVEL result).
+    # extract the level root (l2) and hand (l1, l2) to the I_PIL2 fold.
     # A=0 = the body infer failed soft → cascade the marker (suppress the
     # malformed-sort reject).
     i_p2s_fail = reglu(cg[I_PIS2], One - _geq_expr(SA, One))
@@ -3613,47 +3975,228 @@ def build_step_graph():
     i_p2_bad = reglu(i_p2_bad, One - i_p2s_fail)
     rej_c = rej_c + reglu(i_p2_bad, One)
     rej_code_c = rej_code_c + reglu(i_p2_bad, One)
-    fr1_V1 = _select(cg[I_PIS2], frV1, fr1_V1)     # keep l1
+    # level-root kind gate (retired LEVEL dispatch's lvl_bad, ADR 025 §2.5);
+    # suppressed by the soft cascade like i_p2_bad
+    p2_lk = fetch_by_position([k_], lvl2_root)[0]
+    i_p2_lvlbad = reglu(cg[I_PIS2], One - _lvl_kind_ok(p2_lk))
+    i_p2_lvlbad = reglu(i_p2_lvlbad, One - i_p2s_fail)
+    rej_c = rej_c + reglu(i_p2_lvlbad, One)
+    rej_code_c = rej_code_c + reglu(i_p2_lvlbad, One)
+    fr1_V1 = _select(cg[I_PIS2], frV1, fr1_V1)     # keep l1 (symbolic root)
     fr1_F2 = _select(cg[I_PIS2], Expression({_one_dim: I_PIL2}), fr1_F2)
-    fr2_task = _select(cg[I_PIS2], Expression({_one_dim: TASK_LEVEL}), fr2_task)
-    fr2_V2 = _select(cg[I_PIS2], c1, fr2_V2)
-    fr2_X = _select(cg[I_PIS2], Zero, fr2_X)
-    A_c = _select(cg[I_PIS2], lvl2_root, A_c)      # level root
+    A_c = _select(cg[I_PIS2], lvl2_root, A_c)      # l2 = body level root
     B_c = _select(cg[I_PIS2], Zero, B_c)
     C_c = _select(cg[I_PIS2], Zero, C_c)
     F_c = _select(cg[I_PIS2], Zero, F_c)
-    E_c = _select(cg[I_PIS2], Zero, E_c)
-    D_c = _select(cg[I_PIS2], c2, D_c)
+    E_c = _select(cg[I_PIS2], One, E_c)            # fire the I_PIL2 ST next
+    D_c = _select(cg[I_PIS2], c1, D_c)
     A_c = _select(i_p2s_fail, Zero, A_c)
     B_c = _select(i_p2s_fail, Zero, B_c)
     F_c = _select(i_p2s_fail, Zero, F_c)
     E_c = _select(i_p2s_fail, One, E_c)
     D_c = _select(i_p2s_fail, fetch_by_position([v2_], frV2)[0], D_c)
 
-    # I_PIL2: l2 in A, l1 in ST.V1; imax, then emit Sort(level) chain.
-    # kernel mk_imax (K/level.cpp:112-123): is_not_zero(l2) → mk_max(l1,l2);
-    # is_zero(l2) → 0 (so `imax u 0 = 0` for ANY u, including explicit u>=1);
-    # is_zero(l1)||is_one(l1) → l2; l1==l2 → l1.  On the explicit-int channel
-    # is_not_zero(l2)⟺l2>=1 and mk_max is plain max, so the fold is:
-    #   l2==0 → 0;  l2>=1 and l1==0 → l2;  l2>=1 and l1>=1 → max(l1,l2).
-    # (The old `if l1>=1 then max else l2` gave imax 1 0 = 1, wrong.)
-    imax_l = _select(_geq_expr(frV1, SA), frV1, SA)
-    lvl_out = _select(_geq_expr(SA, One),
-                      _select(_geq_expr(frV1, One), imax_l, SA), Zero)
-    em_raw_c = em_raw_c + cg[I_PIL2]
-    raw_K_c = _select(cg[I_PIL2], Expression({_one_dim: KL_ZERO}), raw_K_c)
+    # I_PIL2: l2 in A, l1 in ST.V1 (both symbolic level-root positions); the
+    # kernel's mk_imax fold (D2, K/level.cpp:112-123) evaluated positionally,
+    # rules in kernel order:
+    #   is_not_zero(l2) → the case-A union-rebuild below;
+    #   is_zero(l2) → l2;  zero(l1)∨one(l1) → l2  (is_one is the SYNTACTIC
+    #     k=SUCC ∧ child-Zero test of level.cpp:106-110, not normalizes-to-
+    #     one);  l1==l2 → l1;  else emit KL_IMAX(l1, l2).
+    # card 021 case A (ADR 026 beat B): with is_not_zero(l2) the kernel's
+    # mk_imax collapses to mk_max(l1,l2) — a MAX-topped runtime construction
+    # whose comparison-time normalize runs the MAX path (K/level.cpp:469-516):
+    # flatten(split(l1) ∪ split(l2)) → sort by is_norm_lt → explicit
+    # subsumption (:477-499) → same-base dedup keep-larger (:498-509) →
+    # right-fold rebuild.  Both operands are already canonical (encoder
+    # normalize + prior fold emissions), so the fold must hold exactly
+    # normalize(max(l1,l2)): case B keeps the kernel's pairwise imax rules
+    # verbatim (the imax path IS the pairwise construction — design
+    # validator 0 mismatch over the 1497 replayed corpus chains, card 021
+    # §2.2); case A replaces the old bounded pairwise mk_max with the
+    # union-rebuild.  Budgets are corpus-measured: split ≤3 lanes/side
+    # (deeper nesting = the both flag), atom spine ≤3, survivors ≤2
+    # single-beat (3-survivor right-fold needs the 2-beat emission — a
+    # registered residual until then), Max/Imax-based atom pairs never
+    # need mutual ordering in the corpus — every over-budget shape falls
+    # back to the kernel-faithful pairwise max emission (sound-incomplete:
+    # reject-direction only).  The result is a NODE POSITION: an input
+    # root, a surviving lane, or c1 = the node emitted this beat.
+    lk1 = fetch_by_position([k_], frV1)[0]
+    lv01 = fetch_by_position([v0_], frV1)[0]
+    lv11 = fetch_by_position([v1_], frV1)[0]
+    lk2 = fetch_by_position([k_], SA)[0]
+    lv02 = fetch_by_position([v0_], SA)[0]
+    lv12 = fetch_by_position([v1_], SA)[0]
+    k1v0k = fetch_by_position([k_], lv01)[0]
+    r1 = _n2z_or(SA, LVL_CANON_SPINE)               # is_not_zero(l2)
+    r2 = _eq_expr(lk2, One * KL_ZERO)               # is_zero(l2)
+    is_one_l1 = reglu(_eq_expr(lk1, One * KL_SUCC),
+                      _eq_expr(k1v0k, One * KL_ZERO))
+    r3 = _eq_expr(lk1, One * KL_ZERO) + is_one_l1   # zero(l1) ∨ one(l1)
+    r4 = _lvl_eq_struct(frV1, SA, LVL_DEPTH)        # l1 == l2 (D1 rule 2 too)
+    # case-A union lanes: 3 slots per side via the shared flatten; the
+    # succ-peeled view of each lane gives the order key (base kind, base
+    # nid, succ offset) — the KL_* numbering already preserves the kernel
+    # level_kind order Zero<Succ<Max<IMax<Param<MVar (level.h:30).
+    tslots, tlive, t_both = _flat(frV1, lk1, lv01, lv11)
+    sslots, slive, s_both = _flat(SA, lk2, lv02, lv12)
+    lanes = list(tslots) + list(sslots)
+    lvs = list(tlive) + list(slive)
+    lviews = [_lv_view(p, LVL_CANON_SPINE) for p in lanes]
+    bpos_ = [v[0] for v in lviews]
+    bkind_ = [v[1] for v in lviews]
+    kk_ = [v[2] for v in lviews]
+    lcap_ = [v[3] for v in lviews]
+    nid_ = [fetch_by_position([v0_], b)[0] for b in bpos_]
+    expl_ = [reglu(lv, _eq_expr(bk, One * KL_ZERO))
+             for lv, bk in zip(lvs, bkind_)]
+    # explicit subsumption (:477-499): keep only the largest explicit k and
+    # drop it too when any surviving arg's offset reaches that k.
+    maxek = Zero
+    for i in range(6):
+        maxek = _select(reglu(expl_[i], _geq_expr(kk_[i], maxek)), kk_[i],
+                        maxek)
+    anye = Zero
+    for e in expl_:
+        anye = anye + e
+    absorb = Zero
+    for i in range(6):
+        absorb = absorb + reglu(reglu(lvs[i], One - expl_[i]),
+                                _geq_expr(kk_[i], maxek))
+    absorb = reglu(_geq_expr(anye, One), _geq_expr(absorb, One))
+    expl_ok = One - absorb
+    # same-base dedup (:498-509): a live lane is dominated when another
+    # live lane shares its base with a strictly larger offset (equal
+    # offsets are the same term — the lower lane index survives).
+    dom_ = []
+    for i in range(6):
+        d = Zero
+        for j in range(6):
+            if i == j:
+                continue
+            same_b = _lvl_base_eq(bpos_[i], bkind_[i], bpos_[j], bkind_[j],
+                                 nid_[i], nid_[j])
+            bigger = _geq_expr(kk_[j], kk_[i] + One)
+            if j < i:
+                bigger = bigger + _eq_expr(kk_[j], kk_[i])
+            d = d + reglu(reglu(lvs[i], lvs[j]),
+                          reglu(same_b, bigger))
+        dom_.append(d)
+    surv_ = []
+    for i in range(6):
+        s = reglu(lvs[i], One - _geq_expr(dom_[i], One))
+        s = reglu(s, reglu(One - expl_[i], One)
+                  + reglu(expl_[i], reglu(_eq_expr(kk_[i], maxek), expl_ok)))
+        surv_.append(s)
+    n_surv = Zero
+    for s in surv_:
+        n_surv = n_surv + s
+    # pairwise strict order (is_norm_lt restricted to the corpus-proven
+    # key domain): kind, then Param/MVar nid, then succ offset.  Kind-equal
+    # Max/Imax bases would need the recursive comparator — no corpus
+    # evidence, gated to fallback below.
+    def _lane_lt(i, j):
+        klt = _geq_expr(bkind_[j], bkind_[i] + One)
+        keq = _eq_expr(bkind_[i], bkind_[j])
+        isPM = _eq_expr(bkind_[i], One * KL_PARAM) \
+             + _eq_expr(bkind_[i], One * KL_MVAR)
+        nlt = _geq_expr(nid_[j], nid_[i] + One)
+        neq = _eq_expr(nid_[i], nid_[j])
+        olt = _geq_expr(kk_[j], kk_[i] + One)
+        return klt + reglu(keq, reglu(isPM, nlt + reglu(neq, olt))
+                           + reglu(_eq_expr(bkind_[i], One * KL_ZERO), olt))
+    rank_ = []
+    for i in range(6):
+        r = Zero
+        for j in range(6):
+            if i == j:
+                continue
+            r = r + reglu(reglu(surv_[j], surv_[i]), _lane_lt(j, i))
+        rank_.append(r)
+    is0_ = [reglu(surv_[i], _eq_expr(rank_[i], Zero)) for i in range(6)]
+    is1_ = [reglu(surv_[i], _eq_expr(rank_[i], One)) for i in range(6)]
+    s0 = Zero
+    for i in range(6):
+        s0 = _select(is0_[i], lanes[i], s0)
+    s1 = Zero
+    for i in range(6):
+        s1 = _select(is1_[i], lanes[i], s1)
+    is2_ = [reglu(surv_[i], _eq_expr(rank_[i], One * 2)) for i in range(6)]
+    s2 = Zero
+    for i in range(6):
+        s2 = _select(is2_[i], lanes[i], s2)
+    # over-budget shapes → kernel-faithful pairwise fallback
+    badbase_ = [reglu(surv_[i], _eq_expr(bkind_[i], One * KL_MAX)
+                      + _eq_expr(bkind_[i], One * KL_IMAX))
+                for i in range(6)]
+    cap_live = Zero
+    for i in range(6):
+        cap_live = cap_live + reglu(lvs[i], lcap_[i])
+    bad2 = Zero
+    for b in badbase_:
+        bad2 = bad2 + b
+    fb = _geq_expr(t_both + s_both, One) \
+       + _geq_expr(cap_live, One) \
+       + _geq_expr(bad2, One * 2) \
+       + _geq_expr(n_surv, One * 4)
+    fb = _geq_expr(fb, One)
+    caseA_nor4 = reglu(r1, One - r4)
+    ok3 = reglu(One - fb, _eq_expr(n_surv, One * 3))
+    emit_2 = reglu(caseA_nor4, reglu(One - fb, _eq_expr(n_surv, One * 2)))
+    # card 021 2-beat emission: 3 survivors rebuild as the kernel's
+    # right-fold max(s0, max(s1, s2)) — beat 1 emits the INNER max(s1, s2)
+    # through the raw channel and stashes (s0, inner position) in the
+    # state's C/E slots; the frame continues to phase 3 (E2=3 on the INFER
+    # frame), which emits the OUTER max(s0, inner) and hands the result to
+    # P_EMIT.  n_surv > 3 stays on the pairwise fallback.
+    emit_3 = reglu(caseA_nor4, ok3)
+    emit_fb = reglu(caseA_nor4, fb)
+    emit_im = reglu(One - r1,
+                    reglu(One - r2, reglu(One - r3, One - r4)))
+    lvl_res = _select(r1, _select(r4, frV1,
+                                   _select(emit_2 + emit_fb, c1, s0)),
+              _select(r2, SA,
+              _select(r3, SA,
+              _select(r4, frV1, c1))))
+    emit = emit_2 + emit_3 + emit_fb + emit_im
+    # p2_emit must gate on the ACTUAL emission conditions — a no-emission
+    # fold beat (subsume/dedup collapsed to one survivor, or a rule hit)
+    # must not touch the raw channel: a spurious raw node desynchronizes
+    # the c1/c2 position bookkeeping and stalls the frame walk.
+    p2_emit = reglu(cg[I_PIL2], emit_2 + emit_fb + emit_im)
+    p2_emit3 = reglu(cg[I_PIL2], emit_3)
+    em_raw_c = em_raw_c + p2_emit + p2_emit3
+    emit_m_all = emit_2 + emit_3 + emit_fb
+    raw_K_c = _select(p2_emit + p2_emit3,
+                      _select(emit_m_all,
+                              Expression({_one_dim: KL_MAX}),
+                              Expression({_one_dim: KL_IMAX})),
+                      raw_K_c)
+    raw_V0_c = _select(p2_emit,
+                       _select(emit_2, s0, frV1), raw_V0_c)
+    raw_V0_c = _select(p2_emit3, s1, raw_V0_c)
+    raw_V1_c = _select(p2_emit,
+                       _select(emit_2, s1, SA), raw_V1_c)
+    raw_V1_c = _select(p2_emit3, s2, raw_V1_c)
     fr1_task = _select(cg[I_PIL2], Expression({_one_dim: TASK_INFER}), fr1_task)
-    fr1_V1 = _select(cg[I_PIL2], lvl_out, fr1_V1)
+    fr1_V1 = _select(cg[I_PIL2], Zero, fr1_V1)     # P_EMIT: no succs to wrap
     fr1_V2 = _select(cg[I_PIL2], frV2, fr1_V2)
     fr1_E2 = _select(cg[I_PIL2], One * 2, fr1_E2)
+    # 2-beat emission: the 3-survivor chain continues at phase 3 (the
+    # OUTER-max beat) instead of P_EMIT, stashing the rank-0 survivor and
+    # the inner node's position for it.
+    fr1_E2 = _select(p2_emit3, One * 3, fr1_E2)
     # P_EMIT task: F2 = inherited soft flag (NOT the default frF2 cont id)
     fr1_F2 = _select(cg[I_PIL2], soft_flag, fr1_F2)
     A_c = _select(cg[I_PIL2], Zero, A_c)
-    B_c = _select(cg[I_PIL2], c1, B_c)          # KL_ZERO pos
+    B_c = _select(cg[I_PIL2], _select(emit, c1, lvl_res), B_c)
     C_c = _select(cg[I_PIL2], Zero, C_c)
+    C_c = _select(p2_emit3, s0, C_c)
     F_c = _select(cg[I_PIL2], Zero, F_c)
     E_c = _select(cg[I_PIL2], Zero, E_c)
-    D_c = _select(cg[I_PIL2], c2, D_c)
+    E_c = _select(p2_emit3, c1, E_c)
+    D_c = _select(cg[I_PIL2], _select(emit, c2, c1), D_c)
 
     # I_SORTEM: emit Sort(mk_succ(level)) over the ORIGINAL symbolic level root.
     # kernel infer_sort (K/type_checker.cpp:345-348): `check_level(sort_level)`
@@ -3664,10 +4207,22 @@ def build_step_graph():
     # that root, then the P_EMIT phase emits K_SORT over the succ node; the
     # LEVEL int scan is no longer on this path.  (Explicit succ^k(Zero) roots
     # still yield succ^(k+1)(Zero), the same chain as before.)
+    # card 021 succ-canonical shadow: the kernel's comparison-time normalize
+    # DISTRIBUTES the runtime succ over the flattened max survivors
+    # (level.cpp:449-453 + :507-509: normalize(succ (max u v)) =
+    # max (succ u) (succ v)), which a raw wrap cannot reproduce.  Static
+    # level roots carry the precomputed normalize(succ(T)) tree in the
+    # root's free E2 slot (Encoder._enc_level, ENV_FORMAT level-token E2);
+    # with a shadow the sort uses it directly (no emission beat), and a
+    # runtime-constructed root (E2=0, an emitted level) keeps the raw succ
+    # wrap as the registered sound-incomplete residual.
     sort_root = fetch_by_position([v0_], frV1)[0]
-    em_raw_c = em_raw_c + cg[I_SORTEM]
-    raw_K_c = _select(cg[I_SORTEM], Expression({_one_dim: KL_SUCC}), raw_K_c)
-    raw_V0_c = _select(cg[I_SORTEM], sort_root, raw_V0_c)
+    sort_sh = fetch_by_position([e2_], sort_root)[0]
+    sort_has_sh = _geq_expr(sort_sh, One)
+    se_emit = reglu(cg[I_SORTEM], One - sort_has_sh)
+    em_raw_c = em_raw_c + se_emit
+    raw_K_c = _select(se_emit, Expression({_one_dim: KL_SUCC}), raw_K_c)
+    raw_V0_c = _select(se_emit, sort_root, raw_V0_c)
     fr1_task = _select(cg[I_SORTEM], Expression({_one_dim: TASK_INFER}),
                        fr1_task)
     fr1_V1 = _select(cg[I_SORTEM], Zero, fr1_V1)   # no further succs to emit
@@ -3676,11 +4231,13 @@ def build_step_graph():
     # P_EMIT task: F2 = inherited soft flag (NOT the default frF2 cont id)
     fr1_F2 = _select(cg[I_SORTEM], soft_flag, fr1_F2)
     A_c = _select(cg[I_SORTEM], Zero, A_c)
-    B_c = _select(cg[I_SORTEM], c1, B_c)
+    B_c = _select(cg[I_SORTEM], _select(sort_has_sh, sort_sh, c1), B_c)
     C_c = _select(cg[I_SORTEM], Zero, C_c)
     F_c = _select(cg[I_SORTEM], Zero, F_c)
     E_c = _select(cg[I_SORTEM], Zero, E_c)
-    D_c = _select(cg[I_SORTEM], c2, D_c)
+    # with a shadow no node is emitted this beat, so the P_EMIT Sort node
+    # lands at c1 (not c2) — D carries the future Sort position either way.
+    D_c = _select(cg[I_SORTEM], _select(sort_has_sh, c1, c2), D_c)
 
     # I_LETV: value type in (A,B); defeq against the declared type.
     fr1_V1 = _select(cg[I_LETV], frV1, fr1_V1)
@@ -3751,87 +4308,6 @@ def build_step_graph():
     #      graph's checked corpora levels are the unary Zero/Param/Succ chain
     #      (Type u, Type 0/1, Prop), which this handles exactly.
     # Depth/chain caps make deeper trees compare unequal (sound, incomplete).
-    LVL_DEPTH = 8
-    LVL_CHAIN_DEPTH = 8
-
-    def _lvl_eq(l, r, depth):
-        if depth <= 0:
-            return Zero
-        # Identical closure ⇒ defeq (kernel level is_def_eq is deep
-        # structural: lhs == rhs || normalize(lhs) == normalize(rhs),
-        # K/level.cpp:517-520).  Levels carry no bvars, so the same env slot
-        # IS the same level term.  Without this, a KL_MAX/KL_IMAX node loses
-        # even against itself (recursing into both children would double the
-        # unrolled circuit per depth — the sound-incomplete note below), so
-        # deq_const never fired on max(1,1)-levelled consts: the d6 head pair
-        # Nat.rec@{max(1,1)} =?= itself fell into the soft-whnf/proof-irrel
-        # ladder, its False unwound into the DE_PRJ re-dispatch and d6/d7
-        # stopped halting (005 F13-01/F13-02).
-        pos_eq = _eq_expr(l, r)
-        lk = fetch_by_position([k_], l)[0]
-        rk = fetch_by_position([k_], r)[0]
-        same = _eq_expr(lk, rk)
-        lv0 = fetch_by_position([v0_], l)[0]
-        rv0 = fetch_by_position([v0_], r)[0]
-        res = pos_eq + reglu(One - pos_eq,
-                             reglu(same, _eq_expr(lk, One * KL_ZERO)))
-        res = res + reglu(One - pos_eq,
-                          reglu(reglu(same, _eq_expr(lk, One * KL_PARAM)
-                                                + _eq_expr(lk, One * KL_MVAR)),
-                                _eq_expr(lv0, rv0)))
-        res = res + reglu(One - pos_eq,
-                          reglu(reglu(same, _eq_expr(lk, One * KL_SUCC)),
-                                _lvl_eq(lv0, rv0, depth - 1)))
-        return res
-
-    def _lvl_chain_eq(a, b, depth):
-        """Const level-arg sibling chains (X-linked, 0 = end) pairwise equal."""
-        if depth <= 0:
-            return Zero
-        a_end = _eq_expr(a, Zero)
-        b_end = _eq_expr(b, Zero)
-        a_nx = fetch_by_position([x_], a)[0]
-        b_nx = fetch_by_position([x_], b)[0]
-        step = reglu(One - a_end, reglu(One - b_end,
-                       reglu(_lvl_eq(a, b, LVL_DEPTH),
-                             _lvl_chain_eq(a_nx, b_nx, depth - 1))))
-        return reglu(a_end, b_end) + step
-
-    # ── normalizes_to_zero circuit (D8, K/level.cpp:174-186) ────────────────
-    # Single-tree recursion (unlike _lvl_eq's paired compare): 1 iff the level
-    # tree rooted at `pos` normalizes to zero.  Kernel rules verbatim:
-    #   Zero→1; Param/MVar/Succ→0; Max→n2z(lhs) ∧ n2z(rhs); IMax→n2z(rhs)
-    # only (`mk_imax` returns its rhs whenever the rhs is zero, so the lhs
-    # contributes nothing, K/level.cpp:112-123 + :174-186).
-    # The recursion is a full binary unroll over the depth cap: a Max node
-    # branches into both children at RUNTIME, so every build-time subtree must
-    # exist; the per-node kind gates keep the verdict 0/1 and mutually
-    # exclusive (kinds are disjoint), so a Succ/Param/MVar node (or a NULL
-    # position past the tree edge) yields 0.  Depth cap 8: measured level
-    # trees are depth ≤ 3; the kernel has no depth notion, and a capped path
-    # yields 0 (not-prop) — the sound-incomplete direction (never an unsound
-    # accept), the same policy _lvl_eq documents for Max/IMax pairing.
-    LVL_N2Z_DEPTH = 8
-
-    def _n2z(pos, depth):
-        if depth <= 0:
-            return Zero
-        k = fetch_by_position([k_], pos)[0]
-        v0 = fetch_by_position([v0_], pos)[0]
-        v1 = fetch_by_position([v1_], pos)[0]
-        is_zero = _eq_expr(k, One * KL_ZERO)
-        is_max = _eq_expr(k, One * KL_MAX)
-        is_imax = _eq_expr(k, One * KL_IMAX)
-        # share the child subtrees: each node unrolls TWO children (the v1
-        # subtree feeds both the Max AND-gate and the IMax rhs rule), so a
-        # depth-d circuit is 2^d - 1 nodes (d=8 → 255), not a per-kind
-        # tripling.
-        nz_v0 = _n2z(v0, depth - 1)
-        nz_v1 = _n2z(v1, depth - 1)
-        return (reglu(is_zero, One)
-                + reglu(is_max, reglu(nz_v0, nz_v1))
-                + reglu(is_imax, nz_v1))
-
     # ── card 014 P1: is_def_eq positive cache (ADR 017; K/type_checker.cpp) ──
     # Kernel contract: the is_def_eq WRAPPER caches SUCCESS of every True
     # completion (:1247-1252 cache_success :972 on the ENTRY pair, `if (r)`
@@ -3986,7 +4462,8 @@ def build_step_graph():
     deq_const = reglu(reglu(reglu(reglu(_kind_eq_raw(tK, K_CONST, One),
                                        _kind_eq_raw(sK, K_CONST, One)),
                                   _eq_expr(tV0, sV0)),
-                            _lvl_chain_eq(tV1, sV1, LVL_CHAIN_DEPTH)), deq_gate)
+                            _lvl_chain_eq(tV1, sV1, LVL_CHAIN_DEPTH, 2)),
+                      deq_gate)
     deq_sort = reglu(reglu(_kind_eq_raw(tK, K_SORT, One),
                            _kind_eq_raw(sK, K_SORT, One)), deq_gate)
     deq_lit = reglu(reglu(reglu(_kind_eq_raw(tK, K_LIT, One),
@@ -4097,7 +4574,7 @@ def build_step_graph():
     # is_eqp(same cid) means equal lparams, the chains are the args.
     deq_hargs = reglu(deq_hargs, _lvl_chain_eq(
         fetch_by_position([v1_], a17_ht)[0],
-        fetch_by_position([v1_], a17_hs)[0], LVL_CHAIN_DEPTH))
+        fetch_by_position([v1_], a17_hs)[0], LVL_CHAIN_DEPTH, 2))
     deq_hargs = reglu(deq_hargs, reglu(deq_gate, One - deq_same))
     pi_kind_t = _kind_eq_raw(tK, K_PI, One) + _kind_eq_raw(tK, T_PI_CLO, One)
     pi_kind_s = _kind_eq_raw(sK, K_PI, One) + _kind_eq_raw(sK, T_PI_CLO, One)
@@ -4147,9 +4624,10 @@ def build_step_graph():
     B_d = _select(deq_const, Zero, B_d)
     E_d = _select(deq_const, One, E_d)
     D_d = _select(deq_const, frV2, D_d)
-    # sort/sort: verdict = _lvl_eq(tV0, sV0) (K/type_checker.cpp:843-844).
+    # sort/sort: verdict = canonical level compare (kernel quick Sort path
+    # is_equivalent, K/type_checker.cpp:843-844 + level.cpp:518-521).
     # hoisted: the cache-write arm below fires on this commit only for TRUE.
-    _deq_sort_verdict = _lvl_eq(tV0, sV0, LVL_DEPTH)
+    _deq_sort_verdict = _lvl_eq_canon(tV0, sV0, LVL_DEPTH, 2, use_n2z=True)
     A_d = _select(deq_sort, _deq_sort_verdict, A_d)
     B_d = _select(deq_sort, Zero, B_d)
     E_d = _select(deq_sort, One, E_d)
@@ -4303,23 +4781,9 @@ def build_step_graph():
     def deliver(v):
         return (v, Zero, One, frV2)
 
-    # D_SORT2: l1 in A; scan s side.
-    fr1_V1 = _select(cg[D_SORT2], SA, fr1_V1)         # save l1
-    fr1_X = _select(cg[D_SORT2], frV1, fr1_X)         # s level root
-    fr1_F2 = _select(cg[D_SORT2], Expression({_one_dim: D_SORT3}), fr1_F2)
-    fr2_task = _select(cg[D_SORT2], Expression({_one_dim: TASK_LEVEL}), fr2_task)
-    fr2_V2 = _select(cg[D_SORT2], c1, fr2_V2)
-    fr2_X = _select(cg[D_SORT2], Zero, fr2_X)
-    A_c = _select(cg[D_SORT2], frV1, A_c)
-    B_c = _select(cg[D_SORT2], Zero, B_c)
-    E_c = _select(cg[D_SORT2], Zero, E_c)
-    D_c = _select(cg[D_SORT2], c2, D_c)
-    # D_SORT3: l2 in A; verdict = (l1 == l2)
-    sort_v = _select(_eq_expr(frV1, SA), One, Zero)
-    A_c = _select(cg[D_SORT3], sort_v, A_c)
-    B_c = _select(cg[D_SORT3], Zero, B_c)
-    E_c = _select(cg[D_SORT3], One, E_c)
-    D_c = _select(cg[D_SORT3], frV2, D_c)
+    # D_SORT2/D_SORT3 retired with the LEVEL task (ADR 025 §2.5): the
+    # integer-level compare they served had no F2=D_SORT2 writer left (the
+    # arm was dormant) and the symbolic channel replaced it.
 
     # D_BIND2: dom verdict in A; push per-side markers, compare bodies.
     # (kernel is_def_eq_binding: dom mismatch → verdict False, no throw)
@@ -4394,8 +4858,14 @@ def build_step_graph():
     bv_lsV = _fv0(SA)     # s link value pos
     bv_lsE = fetch_by_position([x_], SA)[0]      # s link value env
     bv_both = reglu(bv_ltF, bv_lsF)
-    bv_same = reglu(bv_both, reglu(_geq_expr(bv_ltB, One),
-                                   _eq_expr(bv_ltB, bv_lsB)))
+    # Same-link-node identity (kernel quick_is_def_eq `t == s`,
+    # K/type_checker.cpp:837): both bvars resolving to the SAME marker link
+    # row are one binder — frV1/SA are the two walk-delivered link positions.
+    # Infer-created markers are bid-less, so the bid gate alone misses them;
+    # the OR keeps distinct-position bid semantics untouched.
+    bv_bid_eq = reglu(_geq_expr(bv_ltB, One), _eq_expr(bv_ltB, bv_lsB))
+    bv_pos_eq = _eq_expr(frV1, SA)
+    bv_same = reglu(bv_both, bv_bid_eq + reglu(One - bv_bid_eq, bv_pos_eq))
     bv_diff = reglu(bv_both, One - bv_same)
     bv_s = reglu(cg[D_BV3], bv_same)
     bv_d = reglu(cg[D_BV3], bv_diff)
@@ -4450,9 +4920,17 @@ def build_step_graph():
     xpi_tpc_env = _select(t_is_pi, sBdE, oBdE)
     xpi_tpc_flag = fetch_by_position([e2_], xpi_tpc_env)[0]
     xpi_tpc_bid = fetch_by_position([f2_], xpi_tpc_env)[0]
+    # When the tpc body env is NOT a marker row (value-link chain or 0), the
+    # T_PI_CLO's own V2 field carries its lam's binder marker position; the
+    # fresh K_PI-side marker adopts THAT marker's bid so both binders
+    # compare equal in D_BV3. Carrier 0 fetches row 0's F2 = 0 (the NULL
+    # token), i.e. the legacy bid-less path.
+    xpi_tpc_v2 = fetch_by_position(
+        [v2_], _select(t_is_pi, oE2, oV1))[0]
+    xpi_car_bid = fetch_by_position([f2_], xpi_tpc_v2)[0]
     link1_F2 = _select(xpig,
                        _select(_geq_expr(xpi_tpc_flag, One),
-                               xpi_tpc_bid, Zero), link1_F2)
+                               xpi_tpc_bid, xpi_car_bid), link1_F2)
     em_link1_c = em_link1_c + xpig
     fr2_task = _select(xpig, Expression({_one_dim: TASK_DEFEQ}), fr2_task)
     fr2_V1 = _select(xpig, oBd, fr2_V1)
@@ -5161,6 +5639,37 @@ def build_step_graph():
     E_c = _select(pr_str, Zero, E_c)
     D_c = _select(pr_str, c2, D_c)
 
+    # ── card 019 P0-2: infer_proj metadata readers ──────────────────────────
+    # Two declaration-side scalars precomputed by the encoder into the
+    # inductive's metadata (ENV_FORMAT §2.4; same family as WP7-G10's
+    # use_reject prebudgeting — the graph cannot run a bounded exact DFS
+    # over the ctor type tree, so the walk happens encode-side in Python):
+    #   INDVAL.E2  dependency scalar: 0 = legacy stream (gate off);
+    #              m+1 where m = min field-binder index (>= nparams)
+    #              referenced anywhere in the first ctor's type tree
+    #              (4094 = none).  Kernel infer_proj rejects a projection
+    #              with idx > m exactly when its field-peel loop hits a
+    #              has_loose_bvars body (K/type_checker.cpp:277-281) —
+    #              card 017 deferred-substitution clause: the graph rejects
+    #              instead of substituting mk_proj.
+    #   INDEXTRA.X is_prop bit of the declared result sort (the kernel's
+    #              is_prop(type) feeding the :290 field check; encoder-side
+    #              normalizes-to-zero walk, K/type_checker.cpp:383-389).
+    def _ind_depmeta(cid):
+        """Raw INDVAL.E2 dependency scalar of inductive `cid`."""
+        return fetch_by_position([e2_], _mhead(cid))[0]
+
+    def _ind_propbit(cid):
+        """INDEXTRA.X is_prop bit of inductive `cid` (0 when absent)."""
+        extra = fetch_by_position([f2_], _mhead(cid))[0]
+        return fetch_by_position([x_], extra)[0]
+
+    # n2z depth cap for the IP_PK domain-sort judge: same circuit semantics
+    # as LVL_N2Z_DEPTH with a tighter sound-incomplete bound (the sorts
+    # inferred here are Prop-structure field domains: `Sort 0` / imax-to-0,
+    # measured depth <= 3; a deeper tree judges not-Prop = reject).
+    IP_N2Z_DEPTH = 4
+
     # IP_TY (P6.2): child type in (A,B); whnf it (hard), then IP_PEEL.
     # A=0 = the child infer failed soft → cascade the marker.
     i_pty_fail = reglu(cg[IP_TY], One - _geq_expr(SA, One))
@@ -5184,59 +5693,196 @@ def build_step_graph():
     E_c = _select(i_pty_fail, One, E_c)
     D_c = _select(i_pty_fail, fetch_by_position([v2_], frV2)[0], D_c)
 
-    # IP_PEEL (P6.2): phase 0 (frE2=0) checks the whnf'd child type is a
-    # non-recursive structure inductive (metadata: T_ENV_INDVAL + INDEXTRA) whose
-    # name nid matches the projection's sname, then re-enters with focus = the
-    # ctor type root (ENV_HDR(CID_P2MK).V1 = Pi spine); phase 1 peels frX Pi's
-    # and delivers the field domain (closed tree → env 0). Any mismatch →
-    # ERR_TYPE (kernel invalid_proj). Non-dependent fields: no instantiation.
-    ip_cid = _fv0(SA)        # child type cid
+    # IP_PEEL (P6.2 + card 019 P0-2): phase 0 (frE2=0) runs the kernel
+    # infer_proj gate (K/type_checker.cpp:255-263) from ENV metadata: the
+    # whnf'd child type's head is a Const matching the projection's sname,
+    # an inductive with a UNIQUE ctor (CTORVAL scan, _struct_ctor) whose
+    # encoded type root ENV_HDR(ctor+1).V1 supplies the Pi spine, and the
+    # spine arity == nparams + nindices.  Two encoder-precomputed scalars
+    # (ENV_FORMAT §2.4) finish the gate: INDVAL.E2 = dep-min + 1 (0 =
+    # legacy off) — a projection with idx > dep-min is exactly the kernel's
+    # has_loose_bvars throw (:277-281), answered with the card 017
+    # conservative reject (no mk_proj substitution); INDEXTRA.X = is_prop
+    # of the declared result sort (feeds the :290 field check).  The peel:
+    # phase 1 (frame E2 = 1+8*ni) links ONE spine arg per step (kernel
+    # :267-271 instantiate(binding_body, args[i]) as a closure env link;
+    # the whnf'd type's env rides STATE.C for the LINK.X capture, the arg
+    # cursor is re-walked from the spine root in frame V1, hop count in
+    # frame X); the transition at hops == ni enters phase 2 (E2 = 2+8*ni,
+    # field countdown loaded from STATE.F) where each field Pi peel emits a
+    # dummy link (binder alignment for the lazy params; refs to the peeled
+    # field are already excluded by dep-min) and X==0 delivers the field
+    # domain as a CLOSURE (A=domain, B=accumulated env — the old env-0
+    # contract only held for closed 0-param ctor types).  A Prop-valued
+    # structure routes the delivery through IP_PK: TASK_INFER(domain) then
+    # K_SORT ∧ n2z (kernel :290 is_prop, :383-389) before delivering.  Any
+    # failure → reject code 12 (kernel invalid_proj class).
+    ip_head = _head_of(SA, SPINE_MAX)
+    ip_cid = _fv0(ip_head)
     ip_p0 = reglu(cg[IP_PEEL], One - _geq_expr(frE2, One))
-    ip_ok = reglu(ip_p0, reglu(_kind_eq_raw(fK, K_CONST, One),
-              reglu(_is_struct_induct(ip_cid),
-                    _eq_expr(_induct_nid(ip_cid), frV1))))
+    ip_arity = _app_arity(SA, SPINE_MAX)
+    ip_isconst = _kind_eq_raw(fK, K_CONST, One)
+    ip_isapp = _kind_eq_raw(fK, K_APP, One)
+    ip_h = _mhead(ip_cid)
+    ip_meta = One - _no_meta(ip_cid)
+    ip_isind = _kind_eq_raw(fetch_by_position([k_], ip_h)[0],
+                            T_ENV_INDVAL, One)
+    ip_np0 = fetch_by_position([v1_], ip_h)[0]     # nparams (INDVAL.V1)
+    ip_ni0 = fetch_by_position([v2_], ip_h)[0]     # nindices (INDVAL.V2)
+    ip_cnt, ip_ctor = _struct_ctor(ip_cid)
+    ip_e2m = _ind_depmeta(ip_cid)                  # dep-min + 1 (0 = off)
+    ip_dep = reglu(_geq_expr(ip_e2m, One),
+                   One - _geq_expr(ip_e2m - One, frX))
+    ip_propbit = _ind_propbit(ip_cid)
+    ip_mkty = fetch_by_position([v1_], ip_ctor + One)[0]
+    ip_nptot = Zero + ip_np0 + ip_ni0              # nparams + nindices
+    # legacy arm (no WP1 metadata): the toy P2 subset, verbatim pre-019
+    ip_leg = reglu(_no_meta(ip_cid),
+                   _eq_expr(ip_cid, Expression({_one_dim: CID_P2})))
+    ip_eq_an = _eq_expr(ip_arity, ip_nptot)
+    ip_geq_nb = _geq_expr(ip_nptot, One * SPINE_MAX)
+    ip_shape_c = reglu(ip_isconst, _eq_expr(ip_nptot, Zero))
+    # the App branch also requires the SPINE HEAD to be a Const (kernel
+    # :255-259 is_const(get_app_fn(type))): ip_cid is read off the head
+    # node's V0, which for a non-Const head is an unrelated field whose
+    # value must not be allowed to alias a real inductive cid.
+    ip_hconst = _kind_eq_raw(fetch_by_position([k_], ip_head)[0],
+                             K_CONST, One)
+    ip_shape_a = reglu(ip_isapp,
+                       reglu(ip_hconst, reglu(ip_eq_an, One - ip_geq_nb)))
+    # the two shape branches are alternatives (kernel :255-263: a 0-arg
+    # Const head or an App spine with args.size() == nparams + nindices)
+    ip_md_shape = _select(ip_shape_c, One, ip_shape_a)
+    ip_md = reglu(reglu(reglu(ip_meta, ip_isind),
+                         reglu(_eq_expr(_induct_nid(ip_cid), frV1),
+                               _eq_expr(ip_cnt, One))),
+                  reglu(ip_md_shape,
+                        reglu(One - ip_dep,
+                              One - _geq_expr(ip_ni0, One * 3))))
+    ip_ok = reglu(ip_p0, _select(ip_leg,
+                                 _eq_expr(_induct_nid(ip_cid), frV1),
+                                 ip_md))
     ip_setup = ip_ok
-    ip_p1 = reglu(cg[IP_PEEL], _geq_expr(frE2, One))
-    ip_pi = reglu(ip_p1, _kind_eq_raw(fK, K_PI, One))
-    ip_deliver = reglu(ip_pi, One - _geq_expr(frX, One))
-    ip_more = reglu(ip_pi, _geq_expr(frX, One))
-    ip_peelbad = reglu(ip_p1, One - _kind_eq_raw(fK, K_PI, One))
-    # infer_proj raise (kernel invalid_proj): hard = ERR_TYPE reject, soft
-    # (task F2=1; ref _proof_irrel catches ERR_TYPE from infer(t)) = deliver
-    # the A=0 marker to the task's consumer instead.
+    ip_first = _eq_expr(ip_np0, Zero)              # no params: skip phase 1
+    ip_ni_f = _geq_expr(frE2, One * 8) + _geq_expr(frE2, One * 16)
+    ip_ph = frE2 - ip_ni_f * 8                     # frame phase 1|2
+    ip_p1 = reglu(cg[IP_PEEL], _eq_expr(ip_ph, One))
+    ip_p2 = reglu(cg[IP_PEEL], _eq_expr(ip_ph, One * 2))
+    ip_pi = _kind_eq_raw(fK, K_PI, One)
+    # infer_proj raise (kernel invalid_proj → reject code 12): hard = reject,
+    # soft (task F2=1; ref _proof_irrel catches ERR_TYPE from infer(t)) =
+    # deliver the A=0 marker to the task's consumer instead.
+    ip_peelbad = reglu(ip_p1 + ip_p2, One - ip_pi)
     ip_bad = (ip_p0 - ip_ok) + ip_peelbad
     ip_soft = soft_flag
-    ip_soft_fail = reglu(ip_bad, _geq_expr(ip_soft, One))
-    rej_c = rej_c + reglu(ip_bad, One - _geq_expr(ip_soft, One))
-    rej_code_c = rej_code_c + reglu(ip_bad, One - _geq_expr(ip_soft, One))
-    mk_ty = fetch_by_position([v1_],
-                              Expression({_one_dim: CID_P2MK + 1}))[0]
-    fr1_E2 = _select(ip_setup, One, fr1_E2)
-    fr1_V1 = _select(ip_setup, frV1, fr1_V1)
-    fr1_X = _select(ip_setup, frX, fr1_X)
-    fr1_F2 = _select(ip_setup, Expression({_one_dim: IP_PEEL}), fr1_F2)
-    A_c = _select(ip_setup, mk_ty, A_c)
-    B_c = _select(ip_setup, Zero, B_c)
-    C_c = _select(ip_setup, Zero, C_c)
-    F_c = _select(ip_setup, Zero, F_c)
-    E_c = _select(ip_setup, One, E_c)
-    D_c = _select(ip_setup, c1, D_c)
-    fr1_E2 = _select(ip_more, One, fr1_E2)
-    fr1_V1 = _select(ip_more, frV1, fr1_V1)
+    ip_ld = ldepth(SB)
+    # ── phase 1: one spine arg per step (kernel :267-271) ───────────────────
+    ip_param = reglu(ip_p1, ip_pi)
+    ip_last = _eq_expr(frX, ip_ni_f)               # hops == ni → param np
+    ip_arg = fetch_by_position(
+        [v1_], _pick(_chain_v0(frV1, SPINE_MAX - 1), frX))[0]
+    ip_tr_cid = _fv0(_head_of(frV1, SPINE_MAX))    # prop-bit source here
+    link1_V0 = _select(ip_param, ip_arg, link1_V0)
+    link1_D = _select(ip_param, ip_ld, link1_D)
+    link1_P = _select(ip_param, SB, link1_P)
+    link1_E = _select(ip_param, SC, link1_E)       # captured env = type env
+    link1_F = _select(ip_param, Zero, link1_F)
+    em_link1_c = em_link1_c + ip_param
+    fr1_E2 = _select(ip_param,
+                     _select(ip_last, One * 2, One) + ip_ni_f * 8, fr1_E2)
+    fr1_X = _select(ip_param, _select(ip_last, SF, frX - One), fr1_X)
+    fr1_V1 = _select(ip_param,
+                     _select(ip_last, _ind_propbit(ip_tr_cid), frV1), fr1_V1)
+    fr1_F2 = _select(ip_param, Expression({_one_dim: IP_PEEL}), fr1_F2)
+    A_c = _select(ip_param, fV1, A_c)              # Pi body (raw peel)
+    B_c = _select(ip_param, c1, B_c)               # env = the new link
+    C_c = _select(ip_param, SC, C_c)               # type env passthrough
+    F_c = _select(ip_param, SF, F_c)               # idx passthrough
+    E_c = _select(ip_param, One, E_c)
+    D_c = _select(ip_param, c2, D_c)               # link(c1) + frame(c2)
+    # ── phase 2: field peel with a dummy link per step (binder alignment) ───
+    ip_more = reglu(reglu(ip_p2, _geq_expr(frX, One)), ip_pi)
+    link1_V0 = _select(ip_more, Zero, link1_V0)    # dummy: never walked
+    link1_D = _select(ip_more, ip_ld, link1_D)
+    link1_P = _select(ip_more, SB, link1_P)
+    link1_E = _select(ip_more, Zero, link1_E)
+    link1_F = _select(ip_more, Zero, link1_F)
+    em_link1_c = em_link1_c + ip_more
+    fr1_E2 = _select(ip_more, frE2, fr1_E2)
     fr1_X = _select(ip_more, frX - One, fr1_X)
+    fr1_V1 = _select(ip_more, frV1, fr1_V1)        # prop bit passthrough
     fr1_F2 = _select(ip_more, Expression({_one_dim: IP_PEEL}), fr1_F2)
-    A_c = _select(ip_more, fV1, A_c)                # Pi body
-    B_c = _select(ip_more, Zero, B_c)
-    C_c = _select(ip_more, Zero, C_c)
+    A_c = _select(ip_more, fV1, A_c)               # Pi body
+    B_c = _select(ip_more, c1, B_c)
+    C_c = _select(ip_more, SC, C_c)
     F_c = _select(ip_more, Zero, F_c)
     E_c = _select(ip_more, One, E_c)
-    D_c = _select(ip_more, c1, D_c)
-    A_c = _select(ip_deliver, fV0, A_c)             # field domain
-    B_c = _select(ip_deliver, Zero, B_c)
-    C_c = _select(ip_deliver, Zero, C_c)
-    F_c = _select(ip_deliver, Zero, F_c)
-    E_c = _select(ip_deliver, One, E_c)
-    D_c = _select(ip_deliver, frV2, D_c)
+    D_c = _select(ip_more, c2, D_c)                # link(c1) + frame(c2)
+    # ── delivery at X==0: the field domain as a closure ─────────────────────
+    ip_deliver = reglu(reglu(ip_p2, One - _geq_expr(frX, One)), ip_pi)
+    ip_deliver_ip = reglu(ip_deliver, frV1)        # is_prop_type → IP_PK
+    ip_deliver_pl = ip_deliver - ip_deliver_ip
+    A_c = _select(ip_deliver_pl, fV0, A_c)         # field domain
+    B_c = _select(ip_deliver_pl, SB, B_c)          # accumulated env
+    C_c = _select(ip_deliver_pl, Zero, C_c)
+    F_c = _select(ip_deliver_pl, Zero, F_c)
+    E_c = _select(ip_deliver_pl, One, E_c)
+    D_c = _select(ip_deliver_pl, frV2, D_c)
+    # Prop delivery: ST(IP_PK) carries the domain; TASK_INFER(domain) hard
+    # (ck_g1_val launch shape), then IP_PK judges K_SORT ∧ n2z.
+    fr1_V1 = _select(ip_deliver_ip, fV0, fr1_V1)
+    fr1_X = _select(ip_deliver_ip, SB, fr1_X)
+    fr1_V2 = _select(ip_deliver_ip, frV2, fr1_V2)
+    fr1_E2 = _select(ip_deliver_ip, Zero, fr1_E2)
+    fr1_F2 = _select(ip_deliver_ip, Expression({_one_dim: IP_PK}), fr1_F2)
+    fr2_task = _select(ip_deliver_ip, Expression({_one_dim: TASK_INFER}),
+                       fr2_task)
+    fr2_V1 = _select(ip_deliver_ip, fV0, fr2_V1)
+    fr2_X = _select(ip_deliver_ip, SB, fr2_X)
+    fr2_V2 = _select(ip_deliver_ip, c1, fr2_V2)
+    fr2_E2 = _select(ip_deliver_ip, One, fr2_E2)   # INFER phase P1, hard
+    fr2_F2 = _select(ip_deliver_ip, Zero, fr2_F2)
+    A_c = _select(ip_deliver_ip, fV0, A_c)
+    B_c = _select(ip_deliver_ip, SB, B_c)
+    C_c = _select(ip_deliver_ip, Zero, C_c)
+    F_c = _select(ip_deliver_ip, Zero, F_c)
+    E_c = _select(ip_deliver_ip, Zero, E_c)
+    D_c = _select(ip_deliver_ip, c2, D_c)          # frame(c1) + frame2(c2)
+    # setup payload (frame at c1; E2' = phase + 8*ni, X' = hops or idx,
+    # V1' = spine root or the prop bit, C/F carry the type env / idx).
+    fr1_E2 = _select(ip_setup,
+                     _select(ip_first, One * 2, One)
+                     + Expression({ip_ni0: 8}), fr1_E2)
+    fr1_V1 = _select(ip_setup,
+                     _select(ip_first, ip_propbit, SA), fr1_V1)
+    fr1_X = _select(ip_setup,
+                    _select(ip_first, frX, ip_arity - One), fr1_X)
+    fr1_F2 = _select(ip_setup, Expression({_one_dim: IP_PEEL}), fr1_F2)
+    A_c = _select(ip_setup, ip_mkty, A_c)
+    B_c = _select(ip_setup, Zero, B_c)
+    C_c = _select(ip_setup, SB, C_c)
+    F_c = _select(ip_setup, frX, F_c)
+    E_c = _select(ip_setup, One, E_c)
+    D_c = _select(ip_setup, c1, D_c)
+    # IP_PK (card 019): the domain's inferred type in (A,B) must be a Sort
+    # whose level normalizes to zero (kernel is_prop, :383-389); pass →
+    # deliver the ORIGINAL domain (ST V1/X) to the caller.  The n2z depth
+    # cap is the sound-incomplete engine bound (measured level trees here
+    # are depth ≤ 3: Prop struct domains infer to `Sort 0`/imax-to-0).
+    pk_k = fetch_by_position([k_], SA)[0]
+    pk_prop = reglu(cg[IP_PK], reglu(_kind_eq_raw(pk_k, K_SORT, One),
+                                     _n2z(_fv0(SA), IP_N2Z_DEPTH)))
+    ip_bad = ip_bad + reglu(cg[IP_PK], One - pk_prop)
+    ip_soft_fail = reglu(ip_bad, _geq_expr(ip_soft, One))
+    ip_rej_hard = reglu(ip_bad, One - _geq_expr(ip_soft, One))
+    rej_c = rej_c + ip_rej_hard
+    rej_code_c = rej_code_c + ip_rej_hard
+    A_c = _select(pk_prop, frV1, A_c)
+    B_c = _select(pk_prop, frX, B_c)
+    C_c = _select(pk_prop, Zero, C_c)
+    F_c = _select(pk_prop, Zero, F_c)
+    E_c = _select(pk_prop, One, E_c)
+    D_c = _select(pk_prop, frV2, D_c)
     # soft-infer cascade for the ip_* raises (overrides the phase payloads).
     A_c = _select(ip_soft_fail, Zero, A_c)
     B_c = _select(ip_soft_fail, Zero, B_c)
@@ -5578,7 +6224,13 @@ def build_step_graph():
     g9_hasin = _geq_expr(SB, One)                    # inner chain non-empty
     g9_hit = reglu(g9_step, reglu(g9_hasin, _eq_expr(g9_oN, g9_iN)))
     g9_inn = reglu(g9_step, reglu(g9_hasin, One - g9_hit))  # advance inner
-    g9_oon = reglu(g9_step, reglu(One - g9_hasin, g9_oX))   # next outer cell
+    # oon gate must be 0/1: the raw g9_oX is a stream POSITION (any chain
+    # with ≥2 cells has oX > 0), and reglu passes it through unclamped —
+    # every _select condition and the em_frame_m2 sum on this beat then
+    # scales by the position value (2-lparam CHECK livelock; the 1-cell
+    # chains of the G9 corpus had oX=0 and masked this).
+    g9_oon = reglu(g9_step, reglu(One - g9_hasin,
+                                  _geq_expr(g9_oX, One)))  # next outer cell
     g9_done = reglu(g9_step, reglu(One - g9_hasin, One - g9_oX))
     g9_onx = fetch_by_position([x_], g9_oX)[0]       # that cell's next
     g9_run = g9_inn + g9_oon + g9_done
@@ -5769,7 +6421,7 @@ def build_step_graph():
     em_pend_i = Zero
     pend_V0_i, pend_prev_i, pend_env_i = Zero, Zero, Zero
     em_raw_i = Zero
-    raw_K_i, raw_V0_i = Zero, Zero
+    raw_K_i, raw_V0_i, raw_V1_i = Zero, Zero, Zero
     rej_i, rej_code_i = Zero, Zero
     # card 010 G03: checker-mode carrier on TASK_INFER frames (the §2.8 mode
     # bit anchored on the TASK_CHECK frame's E2).  The G10 unsafe/partial-use
@@ -5785,7 +6437,10 @@ def build_step_graph():
     # P_EMIT phase gate is mode-gated: frE2 on non-INFER frames (e.g. the
     # lit-compare ST's digit counter) collides with phase 2
     ph_emit = reglu(is_infer_frame, _eq_expr(frE2, One * 2))
-    ph1 = reglu(is_infer_frame, One - ph_emit)
+    # card 021 phase 3: the 2-beat fold emission's outer-max beat (below);
+    # disjoint from phase 2 and excluded from the phase-1 dispatch.
+    ph_pil2o = reglu(is_infer_frame, _eq_expr(frE2, One * 3))
+    ph1 = reglu(is_infer_frame, One - ph_emit - ph_pil2o)
     # P_EMIT: B = chain cur, ST.V1 = remaining succs
     em_more = reglu(ph_emit, _geq_expr(frV1, One))
     em_fin = reglu(ph_emit, One - _geq_expr(frV1, One))
@@ -5806,6 +6461,32 @@ def build_step_graph():
     C_i = _select(em_more, Zero, C_i)
     F_i = _select(em_more, Zero, F_i)
     E_i = _select(em_more, Zero, E_i)
+    # card 021 phase 3 — the 2-beat fold emission's OUTER node: the I_PIL2
+    # beat stashed (rank-0 survivor s0, inner max position) in the state's
+    # C/E slots and pushed the phase-3 continuation.  Emit
+    # KL_MAX(C, E) = the right-fold's outer max(s0, max(s1, s2)); the
+    # result is this beat's raw position, then continue to P_EMIT for the
+    # Sort emission (same shape as any raw-emitting beat: raw at c1, the
+    # continuation frame at c2).
+    em_raw_i = em_raw_i + ph_pil2o
+    raw_K_i = _select(ph_pil2o, Expression({_one_dim: KL_MAX}), raw_K_i)
+    raw_V0_i = _select(ph_pil2o, SC, raw_V0_i)
+    raw_V1_i = _select(ph_pil2o, SE, raw_V1_i)
+    # the continuation rides the SECOND frame channel (em_frame2 carries
+    # the fr2_* payload — the fr1_* channel is the ST section's and is
+    # not emitted on INFER beats)
+    fr2_task_i = _select(ph_pil2o, Expression({_one_dim: TASK_INFER}),
+                          fr2_task_i)
+    fr2_V1_i = _select(ph_pil2o, Zero, fr2_V1_i)
+    fr2_V2_i = _select(ph_pil2o, frV2, fr2_V2_i)
+    fr2_E2_i = _select(ph_pil2o, One * 2, fr2_E2_i)
+    fr2_F2_i = _select(ph_pil2o, soft_flag, fr2_F2_i)
+    A_i = _select(ph_pil2o, Zero, A_i)
+    B_i = _select(ph_pil2o, c1, B_i)
+    D_i = _select(ph_pil2o, c2, D_i)
+    C_i = _select(ph_pil2o, Zero, C_i)   # clear the stashes
+    E_i = _select(ph_pil2o, Zero, E_i)
+    F_i = _select(ph_pil2o, Zero, F_i)
     # P1: APP peel (mid / end), LAM, PI, LET, CONST, LIT, SORT, BVAR
     fnK_i = fetch_by_position([k_], fV0)[0]
     peel_more = reglu(ph1, reglu(is_app, _kind_eq_raw(fnK_i, K_APP, One)))
@@ -5977,6 +6658,15 @@ def build_step_graph():
     fr2_F2_i = _select(proj_i, frF2, fr2_F2_i)       # inherit soft-infer flag
     A_i = _select(proj_i, fX, A_i)                  # child
     D_i = _select(proj_i, c2, D_i)
+    # MDATA: infer is transparent — kernel infer_type_core's MData case
+    # recurses on mdata_expr(e) with the same lctx (K/type_checker.cpp:339),
+    # and whnf/defeq unwrap it the same way (:478-479, :845-846).  Re-focus
+    # the SAME infer frame on the child V0 in the same env: no sub-task, no
+    # emitted value, no new frame (the WHNF main-mode MData arm is the
+    # precedent: build_vm's A_main `_select(is_mdata, fV0, …)` with D kept).
+    mdata_i = reglu(ph1, is_mdata)
+    A_i = _select(mdata_i, fV0, A_i)
+    B_i = _select(mdata_i, SB, B_i)
     # unsupported kind in term position  (WP5-E4: only inferable literals are
     # supported — a string literal without the String tag counts as bad)
     # WP7-G10: safety_i joins the bad channel (soft infer → failure marker,
@@ -5984,7 +6674,7 @@ def build_step_graph():
     # check-value position, K/type_checker.cpp:110-117).  The reject CODE
     # stays distinct (7, see the final reject_code select).
     bad_i = reglu(ph1, One - is_app - is_lam - is_const - is_let - bvar_i
-                  - pi_i - lit_infer_i - sort_i - proj_i) + safety_i
+                  - pi_i - lit_infer_i - sort_i - proj_i - mdata_i) + safety_i
     # soft infer (task F2=1): unsupported kind → failure marker (A=0) to the
     # awaiting consumer (task.V2), not a reject — ref _proof_irrel catches
     # ERR_UNSUPPORTED from the t-side infers → None → decline.
@@ -5998,41 +6688,11 @@ def build_step_graph():
     E_i = _select(bad_soft, One, E_i)
     D_i = _select(bad_soft, frV2, D_i)
 
-    # ── LEVEL frame dispatch (task=8; node = A, acc in X) ───────────────────
-    # The graph's level channel is an INTEGER explicit-level counter: X is the
-    # number of Succ nodes peeled, Zero returns that count (VM_SPEC §12.2 D9
-    # to_explicit; the callers I_PIS1/I_PIS2/I_SORTEM/D_SORT then compute
-    # succ/imax/eq as ints). VM_SPEC §12.1's symbolic levels are therefore not
-    # representable here: Param/MVar need identity (D3 name equality) and
-    # Max/IMax need a two-operand smart constructor (D1/D2) plus the D10/D14
-    # instantiation channel. RefVM carries that symbolic channel (WP2); the
-    # ALM graph does not yet. The graph's executable data path (import_env,
-    # reference/olean_export.py) specializes polymorphic constants to
-    # monomorphic and drops their level args, so graph-layer corpora never
-    # contain LParam; a raw parametric use site reaching LEVEL is rejected
-    # with ERR_UNSUPPORTED (4) rather than silently mis-decoded.
-    lvl_zero = reglu(is_level_frame, _eq_expr(fK, One))       # KL_ZERO = 1
-    lvl_succ = reglu(is_level_frame, _eq_expr(fK, One * 2))   # KL_SUCC = 2
-    lvl_max = reglu(is_level_frame, _eq_expr(fK, One * 3))    # KL_MAX = 3
-    lvl_imax = reglu(is_level_frame, _eq_expr(fK, One * 4))   # KL_IMAX = 4
-    lvl_param = reglu(is_level_frame, _eq_expr(fK, One * 5))  # KL_PARAM = 5
-    lvl_mvar = reglu(is_level_frame, _eq_expr(fK, One * 6))   # KL_MVAR = 6
-    # Succ drives the explicit-level continuation; every other kind is out of
-    # the integer channel (lvl_max/lvl_imax/lvl_param/lvl_mvar are named so
-    # the boundary is explicit instead of a bare complement).
-    lvl_bad = reglu(is_level_frame, One - lvl_zero - lvl_succ)
-    rej_l = lvl_bad
-    rej_code_l = reglu(lvl_bad, One * 4)
-    _ = lvl_max + lvl_imax + lvl_param + lvl_mvar    # documented boundary set
-    A_l = _select(lvl_succ, fV0, _select(lvl_zero, frX, SA))
-    B_l = _select(lvl_zero, Zero, SB)
-    C_l = SC
-    E_l = _select(lvl_zero, One, SE)
-    F_l = SF
-    D_l = _select(lvl_succ, c1, _select(lvl_zero, frV2, SD))
-    fr1_task_l = Expression({_one_dim: TASK_LEVEL})
-    fr1_V2_l = frV2
-    fr1_X_l = frX + One
+    # ── LEVEL frame dispatch: RETIRED (ADR 025 §2.5) ────────────────────────
+    # The integer explicit-level counter (X = Succ count, lvl_bad → rej 4)
+    # is gone: the symbolic channel carries level roots as node positions and
+    # the arms I_PIS1/I_PIS2 own the root kind gate.  No frame kind 8 is
+    # ever pushed; is_task_frame/main_mode no longer name it.
 
     # ── pop-task (E=1 under a TASK frame): pop one frame, keep the result ───
     pop_task = reglu(ret_pending, is_task_frame)
@@ -6413,9 +7073,8 @@ def build_step_graph():
          _select(pop_task, SA,
          _select(is_infer_frame, A_i,
          _select(is_defeq_frame, A_d,
-         _select(is_level_frame, A_l,
          _select(resume_mode, A_r,
-         _select(ck_kick, A_k, A_main_all)))))))))))))
+         _select(ck_kick, A_k, A_main_all))))))))))))
     B2 = _select(is_walk_frame, B_walk,
          _select(is_compute, B_comp,
          _select(is_build, B_build,
@@ -6426,9 +7085,8 @@ def build_step_graph():
          _select(pop_task, SB,
          _select(is_infer_frame, B_i,
          _select(is_defeq_frame, B_d,
-         _select(is_level_frame, B_l,
          _select(resume_mode, B_r,
-         _select(ck_kick, B_k, B_main_all)))))))))))))
+         _select(ck_kick, B_k, B_main_all))))))))))))
     C2 = _select(is_walk_frame, C_walk,
          _select(is_compute, C_comp,
          _select(is_build, C_build,
@@ -6439,9 +7097,8 @@ def build_step_graph():
          _select(pop_task, SC,
          _select(is_infer_frame, C_i,
          _select(is_defeq_frame, C_d,
-         _select(is_level_frame, C_l,
          _select(resume_mode, C_r,
-         _select(ck_kick, C_k, C_main_all)))))))))))))
+         _select(ck_kick, C_k, C_main_all))))))))))))
     D2 = _select(is_walk_frame, D_walk,
          _select(is_compute, D_comp,
          _select(is_build, D_build,
@@ -6452,9 +7109,8 @@ def build_step_graph():
          _select(pop_task, frV2,
          _select(is_infer_frame, D_i,
          _select(is_defeq_frame, D_d,
-         _select(is_level_frame, D_l,
          _select(resume_mode, D_r,
-         _select(ck_kick, D_k, D_main_all)))))))))))))
+         _select(ck_kick, D_k, D_main_all))))))))))))
     E2 = _select(is_walk_frame, E_walk,
          _select(is_compute, E_comp,
          _select(is_build, E_build,
@@ -6465,9 +7121,8 @@ def build_step_graph():
          _select(pop_task, SE,
          _select(is_infer_frame, E_i,
          _select(is_defeq_frame, E_d,
-         _select(is_level_frame, E_l,
          _select(resume_mode, E_r,
-         _select(ck_kick, E_k, E_main_all)))))))))))))
+         _select(ck_kick, E_k, E_main_all))))))))))))
     F2 = _select(is_walk_frame, F_walk,
          _select(is_compute, F_comp,
          _select(is_build, F_build,
@@ -6478,9 +7133,8 @@ def build_step_graph():
          _select(pop_task, SF,
          _select(is_infer_frame, F_i,
          _select(is_defeq_frame, F_d,
-         _select(is_level_frame, F_l,
          _select(resume_mode, F_r,
-         _select(ck_kick, F_k, F_main_all)))))))))))))
+         _select(ck_kick, F_k, F_main_all))))))))))))
 
     # ── card 014 P2 hit commit (whnf memo) ───────────────────────────────────
     # Outermost over every mode/arm select: a hit REPLACES this beat's
@@ -6504,7 +7158,7 @@ def build_step_graph():
         # DEFEL/CHECK channels), so under a WHNF-frame beat the sum is 0
         # anyway — this is a belt for the merge point, not a behavior
         # change (010-M M4-01 memo, judgment-safety argument ④).
-        _rej_p2 = (rej_c + rej_r + rej_i + rej_l + rej_n + rej_s + rej_q
+        _rej_p2 = (rej_c + rej_r + rej_i + rej_n + rej_s + rej_q
                    + rej_p + rej_lit + rej_o)
         whnf_cache = reglu(whnf_cache0, One - _geq_expr(_rej_p2, One))
         A2 = _select(whnf_cache, wvx, A2)
@@ -6535,9 +7189,9 @@ def build_step_graph():
     # M2 frame emissions
     m2_chk = reglu(cg[I_CHK], i_more) + args_walk
     em_frame_m2 = (cg[I_FN] + cg[I_PI] + cg[I_ARG] + m2_chk + cg[I_LAMDOM]
-                   + cg[I_LAMSORT] + cg[I_PIDOM] + cg[I_PIS1] + cg[I_PIL1]
+                   + cg[I_LAMSORT] + cg[I_PIDOM] + cg[I_PIS1]
                    + cg[I_PIS2] + cg[I_PIL2] + cg[I_SORTEM] + cg[I_LETV]
-                   + cg[I_LETD] + cg[D_SORT2] + cg[D_BV2] + bv_nb + cg[D_SW2]
+                   + cg[I_LETD] + cg[D_BV2] + bv_nb + cg[D_SW2]
                    + spa_next
                    + sw_loop + sw_pi + bv_d
                    + cg[PI_T] + cg[PI_TY] + cg[PI_LVL] + cg[PI_D] + cg[ST_SP]
@@ -6553,11 +7207,12 @@ def build_step_graph():
                    + em_more + peel_end + lam_i + pi_i + let_i + sort_i
                    + deq_lit + deq_lit_str_eq + deq_bvar + deq_mdata + deq_tpc
                    + deq_succ
-                   + proj_same + bind_k + deq_xpi + deq_sw0 + lvl_succ
+                   + proj_same + bind_k + deq_xpi + deq_sw0
                    + de_prj_f + deq_refl + deq_hargs + de_att_f
                    + ck_g0 + ck_g1_ok
                    + cg[CK_TY] + ck_kick + g9_run
-                   + proj_i + cg[IP_TY] + ip_setup + ip_more
+                   + proj_i + cg[IP_TY] + ip_setup + ip_param + ip_more
+                   + ip_deliver_ip
                    # WP5-E5: pr_str re-pushes [ST(I_PROJ), WHNF(expansion)].
                    # WP5-E3b: es_str converts the ST frame into a DEFEQ frame.
                    + pr_str + es_str
@@ -6567,8 +7222,9 @@ def build_step_graph():
                    # verdict (no frame), like es_nextfail.
                    + es_no + cg[ST_UL] + cg[UL_W] + ul_yes + cg[UL_D])
     em_frame2_m2 = (cg[I_FN] + cg[I_PI] + cg[I_ARG] + m2_chk + cg[I_LAMDOM]
-                    + cg[I_LAMSORT] + cg[I_PIDOM] + cg[I_PIS1] + cg[I_PIL1]
-                    + cg[I_PIS2] + cg[I_LETV] + cg[I_LETD] + cg[D_SORT2] + cg[D_BIND2]
+                    + cg[I_LAMSORT] + cg[I_PIDOM] + cg[I_PIS1]
+                    + cg[I_PIS2] + cg[I_LETV] + cg[I_LETD] + cg[D_BIND2]
+                    + ph_pil2o
                     + cg[D_TPC2] + cg[D_BV2] + cg[D_XPI2] + cg[D_SW2] + spa_next
                     + sp_fin2
                     + peel_end + lam_i + pi_i + let_i + bvar_i
@@ -6580,29 +7236,28 @@ def build_step_graph():
                     + et_app + cg[ETA_T] + et_spi
                     + es_app + cg[ES_T] + es_domok + es_next0
                     + cg[CK_TY] + ck_kick0 + g9_done
-                    + proj_i + cg[IP_TY]
+                    + proj_i + cg[IP_TY] + ip_deliver_ip
                     + pr_str
                     + cg[ST_UL] + cg[UL_W] + ul_yes)
 
-    def m2_merge(c_addr, r_addr, i_addr, d_addr, l_addr, k_addr, l_expr, base):
+    def m2_merge(c_addr, r_addr, i_addr, d_addr, k_addr, base):
         """Pick an emission payload across the disjoint M2 modes."""
         return _select(cont_mode, c_addr,
                _select(resume_mode, r_addr,
                _select(is_infer_frame, i_addr,
                _select(is_defeq_frame, d_addr,
-               _select(lvl_succ, l_addr,
-               _select(ck_kick, k_addr, base))))))
+               _select(ck_kick, k_addr, base)))))
 
     frame_task = m2_merge(fr1_task, fr1_task_r, fr1_task_i, fr1_task_d,
-                          fr1_task_l, fr1_task_k, None, frame_task)
+                          fr1_task_k, frame_task)
     frame_V1 = _select(fire_quot, Expression({_one_dim: OP_QUOT}),
-               m2_merge(fr1_V1, fr1_V1_r, fr1_V1_i, fr1_V1_d, Zero,
-                        fr1_V1_k, None,
+               m2_merge(fr1_V1, fr1_V1_r, fr1_V1_i, fr1_V1_d,
+                        fr1_V1_k,
                         _select(fire_iota, One * OP_IOTA,
                         _select(iota_build_r, One * OP_IOTA, frame_V1))))
     frame_V2 = _select(fire_quot, c2,
-               m2_merge(fr1_V2, fr1_V2_r, fr1_V2_i, fr1_V2_d, fr1_V2_l,
-                        fr1_V2_k, None,
+               m2_merge(fr1_V2, fr1_V2_r, fr1_V2_i, fr1_V2_d,
+                        fr1_V2_k,
                         _select(fire_iota, c2,
                         # WP5-E2: iota_str_r re-pushes the SAME control frame
                         # (V1=frV1/X=1/E2=frE2/F2=frF2 are the defaults or
@@ -6611,8 +7266,8 @@ def build_step_graph():
                         _select(iota_str_r, c2,
                         _select(iota_build_r, frV2, frame_V2)))))
     frame_X = _select(fire_quot, One,
-              m2_merge(fr1_X, fr1_X_r, fr1_X_i, fr1_X_d, fr1_X_l,
-                       fr1_X_k, None,
+              m2_merge(fr1_X, fr1_X_r, fr1_X_i, fr1_X_d,
+                       fr1_X_k,
                        _select(fire_iota, One,
                        _select(iota_str_r, One,
                        _select(iota_build_r, One * 2, frame_X)))))
@@ -6627,8 +7282,8 @@ def build_step_graph():
                _select(d23_gcd, frV1,
                _select(d23_shr + d23_shl, frV1,
                _select(fire_quot, SF,
-               m2_merge(fr1_E2, fr1_E2_r, fr1_E2_i, fr1_E2_d, Zero,
-                        fr1_E2_k, None,
+               m2_merge(fr1_E2, fr1_E2_r, fr1_E2_i, fr1_E2_d,
+                        fr1_E2_k,
                         _select(fire_iota, SF,
                         _select(iota_str_r, frE2,
                         _select(iota_build_r, gi_root,
@@ -6653,8 +7308,8 @@ def build_step_graph():
                _select(d23_gcd, v_done,
                _select(d23_shr + d23_shl, v_done,
                _select(fire_quot, SC,
-               m2_merge(fr1_F2, fr1_F2_r, fr1_F2_i, fr1_F2_d, Zero,
-                        fr1_F2_k, None,
+               m2_merge(fr1_F2, fr1_F2_r, fr1_F2_i, fr1_F2_d,
+                        fr1_F2_k,
                         _select(fire_iota, SC,
                         _select(iota_str_r, frF2,
                         _select(iota_build_r, frF2,
@@ -6670,22 +7325,22 @@ def build_step_graph():
                                 reglu(proj_setup,
                                       Expression({_one_dim: I_PROJ}))))))))))))))))))))
     frame2_task = m2_merge(fr2_task, fr2_task_r, fr2_task_i, fr2_task_d,
-                           Zero, fr2_task_k, None, frame2_task)
+                           fr2_task_k, frame2_task)
     frame2_V1 = _select(fire_quot, One * 3,
-                m2_merge(fr2_V1, fr2_V1_r, fr2_V1_i, fr2_V1_d, Zero,
-                         fr2_V1_k, None,
+                m2_merge(fr2_V1, fr2_V1_r, fr2_V1_i, fr2_V1_d,
+                         fr2_V1_k,
                          _select(fire_iota, fV0, frame2_V1)))
     frame2_V2 = _select(fire_quot, SD,
-                m2_merge(fr2_V2, fr2_V2_r, fr2_V2_i, fr2_V2_d, Zero,
-                         fr2_V2_k, None,
+                m2_merge(fr2_V2, fr2_V2_r, fr2_V2_i, fr2_V2_d,
+                         fr2_V2_k,
                          _select(fire_iota, SD, frame2_V2)))
     frame2_X = _select(fire_quot, q_mkpos,
-               m2_merge(fr2_X, fr2_X_r, fr2_X_i, fr2_X_d, Zero,
-                        fr2_X_k, None, frame2_X))
-    frame2_E2 = m2_merge(fr2_E2, fr2_E2_r, fr2_E2_i, fr2_E2_d, Zero,
-                         fr2_E2_k, None, reglu(proj_setup, One))
-    frame2_F2 = m2_merge(fr2_F2, fr2_F2_r, fr2_F2_i, fr2_F2_d, Zero,
-                         fr2_F2_k, None, Zero)
+               m2_merge(fr2_X, fr2_X_r, fr2_X_i, fr2_X_d,
+                        fr2_X_k, frame2_X))
+    frame2_E2 = m2_merge(fr2_E2, fr2_E2_r, fr2_E2_i, fr2_E2_d,
+                         fr2_E2_k, reglu(proj_setup, One))
+    frame2_F2 = m2_merge(fr2_F2, fr2_F2_r, fr2_F2_i, fr2_F2_d,
+                         fr2_F2_k, Zero)
 
     # links: M2 payloads win when an M2 link fires; iota build steps 2/3
     # (P6.5) emit the e1..e4 chain through the same slots.
@@ -6774,10 +7429,13 @@ def build_step_graph():
                  _select(quot_go, q_a_pos,
                  _select(is_cs_build_p2, raw_V1_p2,
                  _select(is_cs_build, raw_V1_cs,
-                 _select(is_build, raw_V1_rec, raw_V1_c)))))
-        raw_V2 = _select(_dc_w, frE2, raw_V2_r)
+                 _select(is_build, raw_V1_rec,
+                 _select(cont_mode, raw_V1_c, raw_V1_i))))))
+        raw_V2 = _select(_dc_w, frE2,
+                 _select(cont_mode, raw_V2_c, raw_V2_r))
         raw_X = _select(_dc_w, frF2,
-                _select(cont_mode, raw_X_c, raw_X_r))
+                _select(quot_go, SB,
+                _select(cont_mode, raw_X_c, raw_X_r)))
         raw_E2 = raw_E2_c
     else:
         em_raw = _raw_emitters + quot_go
@@ -6797,8 +7455,13 @@ def build_step_graph():
                  _select(is_cs_build_p2, raw_V1_p2,
                  _select(is_cs_build, raw_V1_cs,
                  _select(is_build, raw_V1_rec, raw_V1_c))))
-        raw_V2 = raw_V2_r
-        raw_X = _select(cont_mode, raw_X_c, raw_X_r)
+        raw_V2 = _select(cont_mode, raw_V2_c, raw_V2_r)
+        # quot_go's reduct App is a minted spine root: record the env its
+        # operands live in (the mk closure env, SB at this beat) in the App
+        # token's free X slot so the whnf delivery can pair them (see
+        # sr_env above; a tree App always carries X=0).
+        raw_X = _select(quot_go, SB,
+                 _select(cont_mode, raw_X_c, raw_X_r))
         raw_E2 = raw_E2_c
 
     # ── card 014 P2 whnf-memo write arm (raw slot) ────────────────────────
@@ -6839,7 +7502,7 @@ def build_step_graph():
     em_frame2 = (fire2 + d12 + em_frame2_m2 + proj_setup + fire_iota
                  + iota_str_r + fire_quot)
 
-    reject = rej_c + rej_r + rej_i + rej_l + rej_n + rej_s + rej_q + rej_p + rej_lit + rej_o
+    reject = rej_c + rej_r + rej_i + rej_n + rej_s + rej_q + rej_p + rej_lit + rej_o
     # WP7-G: 6 = decl root fvar/mvar (kernel "declaration has free
     # variables"), 5 = typeExpected (kernel ensure_sort throw), 7 =
     # unsafe/partial constant use in a safe context (kernel infer_constant
@@ -6857,12 +7520,19 @@ def build_step_graph():
     # (6) and the CK_G0/CK_G1 chain (5/8) on the same declaration, so the
     # placement records the kernel's check order; no arm can co-fire with
     # g9_hit anyway (disjoint continuation modes).
+    # Card 019 (P0-2) adds 12 = infer_proj failure family (phase-0 gate,
+    # field walk-off, conservative dependent reject, Prop field check — all
+    # invalid_proj_exception sites of kernel infer_proj,
+    # K/type_checker.cpp:247-292 → the dedicated .invalidProj class).  It
+    # fires on an INFER step inside the CHECK value pass, i.e. after the
+    # declaration-level arms above accepted, so it sits below bad_i (4).
     reject_code = _select(g9_hit, One * 10,
                   _select(safety_i, One * 7,
                   _select(g7, One * 6,
                   _select(g1_fail, One * 5,
                   _select(g3, One * 8,
-                  _select(bad_i + lvl_bad, One * 4, One))))))
+                  _select(bad_i, One * 4,
+                  _select(ip_rej_hard, One * 12, One)))))))
 
     # head/gap/dig/const emission merge (main + compute)
     head_V0 = _select(d23_work, n_out_d23,
@@ -6974,7 +7644,6 @@ def build_step_graph():
         "dbg_efc": out(em_frame_c, "o_dbg_efc"),
         "dbg_efm2": out(em_frame_m2, "o_dbg_efm2"),
         "dbg_gsum": out(sum(g.values()), "o_dbg_gsum"),
-
         "dbg_deqfall": out(deq_fall, "o_dbg_deqfall"),
         "reject_code": out(reject_code, "o_reject_code"),
         "A": out(A2, "o_a"),

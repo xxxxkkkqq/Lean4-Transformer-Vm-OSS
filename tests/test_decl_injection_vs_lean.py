@@ -48,6 +48,12 @@ Sections
         pairwise scan of the declaration's lparams chain (kernel
         check_duplicated_univ_params, K/environment.cpp:111-121, class
         "other") — new reject code 10, anchor F2 carrier.
+  ipr   card 019 P0-2 infer_proj metadata channel: parameterized-structure
+        Proj inside a CHECK value pass (Prod/PProd/HAdd families + a
+        0-param dependent structure both ways), env built via
+        import_env_meta so the encoder-precomputed INDVAL.E2 dep-min and
+        INDEXTRA.X is_prop scalars reach the graph; the conservative
+        dependent reject surfaces as code 12 (kernel .invalidProj class).
 
 Run:  OMP_NUM_THREADS=3 python3 -u tests/test_decl_injection_vs_lean.py
 Dev subset (one graph case ≈ 16 s on this box; a full run is canary-class):
@@ -72,8 +78,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from expr.tokens import Encoder, decode_closure
 from expr.model import (
-    Const, App, Pi, Lam, Sort, LitNat, LSucc, LZero, LMax, LIMax, BI_DEFAULT,
-    Proj, MData, Let, BVar,
+    Const, App, Pi, Lam, Sort, LitNat, LSucc, LZero, LMax, LIMax, LParam,
+    BI_DEFAULT, BI_IMPLICIT, Proj, MData, Let, BVar,
 )
 from lean_vm.ref_vm import VMError
 from lean_vm import step_driver as sd_check
@@ -83,7 +89,8 @@ from lean_vm.step_driver import (
     CHECK_KIND_THEOREM, CHECK_KIND_OPAQUE,
 )
 from reference import lean_ref
-from reference.olean_export import import_env, dump_env, const_meta_for
+from reference.olean_export import (
+    import_env, import_env_meta, dump_env, const_meta_for)
 from reference.toy_env import TOY_CONSTS, TOY_LEAN_DEFS
 from tests.test_olean_export import TARGET_DEFS, ROOTS
 from tests.test_check_e2e import CHECK_CASES, CASE, SEQUENCES
@@ -216,32 +223,44 @@ E_X_MAX00 = "(mkConst ``injX_max)"
 # 111-121), 11 = alreadyDeclared (G8, driver bookkeeping; the kernel's
 # DEDICATED constructor, K/kernel_exception.h:32-37 → .alreadyDeclared at
 # :168-169; message text per src/Lean/Message.lean:896).
+# Card 019 adds: 12 = infer_proj failure family (phase-0 gate / walk-off /
+# conservative dependent reject / Prop field check — all invalid_proj
+# sites, K/type_checker.cpp:247-292 → the dedicated .invalidProj class,
+# reference/lean_ref.py classOf).
 CLASS_OF_CODE = {0: "accept", 1: "declTypeMismatch", 2: "unknownConstant",
                  4: "typeMismatch", 5: "typeExpected", 6: "declHasFVars",
                  7: "unsafeConstUse", 8: "thmTypeIsNotProp",
-                 9: "mutualWF", 10: "dupUnivParams", 11: "alreadyDeclared"}
+                 9: "mutualWF", 10: "dupUnivParams", 11: "alreadyDeclared",
+                 12: "invalidProj"}
 CODE_OF_CLASS = {"OK": 0, "typeExpected": 5, "thmTypeIsNotProp": 8,
-                 "declTypeMismatch": 1}
+                 "declTypeMismatch": 1, "invalidProj": 12}
 
 # ── KNOWN-GAP xfail registry (card 009 protocol, ADR 018 + ADR 020 B) ───────
 # A registered case that still diverges reports [XFAIL-KNOWN-GAP] and does NOT
 # fail the run; a registered case that starts AGREEING reports [XPASS] and
 # fails the run (the entry must then be removed — no silent drift either way).
 KNOWN_GAPS = {
-    # G03 (card 010): the anchor E2's mode bit rides the TASK_INFER frames
-    # launched by the CHECK chain (kickoff/ck_g1_val) and inside the INFER
-    # dispatch (app fn, lam/pi/let domains+values, proj child), but NOT
-    # across the ST-continuation hops (I_FN→I_PI, I_LAMDOM→I_LAMSORT,
-    # I_LETV→I_LETD): all six ST frame fields are spoken for, so a
-    # self-reference reached as an app ARGUMENT or under a lam/let BODY is
-    # re-inferred mode-less and the G10 gate false-fires (code 7).  Measured
-    # 2026-09-20 (handoff 006 G03 H2): kernel OK / graph 7 at 11 steps.
-    # Resolved by card 016 (memo 023 §3, 3-甲): the ST F2 carries
-    # cont_id + 128*mode across the hops and the I_PI/I_LAMSORT/I_LETD
-    # body/arg infers decode it from the frame's own F2 — both entries
-    # removed 2026-09-26 (the remaining registered approximations: the pi
-    # codomain chain and the DEFEQ soft emissions still ride mode-less,
-    # VM_SPEC §16.6).
+    # Card 019 (P0-2): Type-valued dependent structure, projection with
+    # idx > 0.  The kernel's infer_proj SUBSTITUTES mk_proj for the peeled
+    # field (K/type_checker.cpp:278-281 — the throw only fires for
+    # is_prop_type structures with a non-Prop dependent field), infers
+    # `Eq (c.1) (c.1)` for `c.2` of `structure IprDep | mk (f : Nat)
+    # (p : f = f)`, and the declaration against the declared Nat fails
+    # declTypeMismatch.  The graph answers the card 017 conservative
+    # reject (code 12, invalidProj): the deferred mk_proj substitution is
+    # not implemented, and refusing to answer is the sanctioned side (no
+    # silent wrong type).  Verdicts AGREE (both reject the declaration);
+    # the error CLASS diverges.  Remove this entry when the substitution
+    # is implemented (the row then expects class agreement).
+    "ipr_dep_snd": (
+        "card 019: Type-struct dependent proj — kernel substitutes "
+        "mk_proj (:278-281) and fails the decl with declTypeMismatch; "
+        "the graph conservatively rejects with 12 (invalidProj). "
+        "Verdicts agree, class diverges (deferred substitution)."
+    ),
+    # lvl_isb removed (card 020 beat A2): the imax child zero-elim leg
+    # (level.cpp:487-499 k=0 class) closes the registered bounded-compare
+    # residual — the row now expects plain PASS per the XPASS protocol.
 }
 
 # ── corpus rows ─────────────────────────────────────────────────────────────
@@ -1631,6 +1650,771 @@ def section_g9(fails, lines, consts, ctors):
                          f"graph=code={got} detail={detail}")
 
 
+# ── card 019 P0-2: infer_proj metadata channel (section ipr) ────────────────
+# Kernel infer_proj (K/type_checker.cpp:247-292) is metadata-driven on the
+# graph side (INDVAL np/ni + CTORVAL scan + ctor type root) and the two
+# encoder-precomputed scalars of card 019 (INDVAL.E2 dep-min, INDEXTRA.X
+# is_prop) only exist on the WP1 metadata channel — so this section builds
+# its own environment through `import_env_meta` (all 8 kinds, closure-checked)
+# and feeds `const_meta` to the Encoder directly.  The G02/G06/G03 sections
+# keep the meta-less `import_env` env (their verdicts must stay byte-exact).
+#
+# Rows (expectations are the live oracle's, acceptance rule 2):
+#   ipr_prod_fst   def : Nat := Proj(Prod,0,p)   accept   (idx=0)
+#   ipr_prod_snd   def : Nat := Proj(Prod,1,p)   accept   (param applies +
+#                  dummy link, param-bvar alignment on the delivered closure)
+#   ipr_pprod_fst  PProd family                  accept
+#   ipr_hadd       HAdd (np=3), field domain is a Pi delivered as a closure
+#                  (def : Nat → Nat → Nat := h.hAdd)   accept
+#   ipr_dep_fst    Type-valued structure with a dependent second field: `.1`
+#                  (idx=0, dep window empty — kernel never enters the peel
+#                  loop)   accept
+#   ipr_dep_snd    same structure, `.2` references field 0: the kernel
+#                  SUBSTITUTES mk_proj (:278-281) and infers `Eq c.1 c.1`,
+#                  so the decl fails declTypeMismatch while the graph
+#                  answers the card 017 conservative reject 12 — verdicts
+#                  agree, the class diverges → registered KNOWN_GAPS.
+#   ipr_ps_dep     PROP-valued structure with a dependent non-Prop field:
+#                  the kernel's throw path (:278-281 is_prop_type guard)
+#                  fires → invalidProj; the graph rejects with 12 — the
+#                  clean "true dependency" row of card 019 P0-2.
+#   ipr_pf_prop    Prop-valued structure, non-dependent: the K:290
+#                  is_prop(domain) accept arm routes the graph through
+#                  IP_PK (TASK_INFER + K_SORT ∧ n2z) and delivers.
+IPR_PRELUDE = """\
+def iprP_p : Prod Nat Nat := (0, 1)
+def iprQ_q : PProd Nat Nat := ⟨0, 1⟩
+def iprH_h : HAdd Nat Nat Nat := ⟨fun x y => x⟩
+structure IprDep where
+  f : Nat
+  p : f = f
+def iprD_c : IprDep := ⟨0, rfl⟩
+-- The two Prop-valued carriers CANNOT use `structure`: the elaborator
+-- refuses to generate projections for a Prop structure with a non-proof
+-- field ("field must be a proof"), so the prelude would not compile.  The
+-- kernel env content (inductDecl + single ctor) is identical under the
+-- `inductive` form, and infer_proj only reads the kernel env (the graph
+-- rows judge Expr.proj, no projection constant involved).
+inductive IprPS : Prop where
+  | mk : (a : Nat) → a = a → IprPS
+def iprPS_c : IprPS := ⟨0, rfl⟩
+inductive IprPF : Prop where
+  | mk : (Nat → Nat → Prop) → IprPF
+def iprPF_c : IprPF := ⟨fun x y => x = x⟩
+-- Prop-valued inductive with a BARE DATA field: the kernel's infer_proj
+-- refuses any projection out of it (`is_prop_type && !is_prop(field)`,
+-- K/type_checker.cpp:284,288 → invalidProj).  Lean itself cannot generate
+-- such a projection ("field must be a proof"), so `Expr.proj` is the only
+-- way to reach the check — which is exactly what this channel judges.
+inductive IprPD : Prop where
+  | mk : (a : Nat) → IprPD
+def iprPD_c : IprPD := ⟨0⟩
+"""
+IPR_ROOTS = ["iprP_p", "iprQ_q", "iprH_h", "IprDep", "iprD_c",
+             "IprPS", "iprPS_c", "IprPF", "iprPF_c", "IprPD", "iprPD_c"]
+IPR_DUMP_PATH = os.environ.get("G02_DUMP_PATH_IPR",
+                               f"/tmp/g02_decl_inj_ipr_dump_{os.getpid()}.lean")
+
+# (row id, graph type tree, graph value tree, oracle type splice,
+#  mkProj oracle value splice)
+IPR_ROWS = [
+    ("ipr_prod_fst", NAT, Proj("Prod", 0, Const("iprP_p")),
+     E_NAT, "(mkProj ``Prod 0 (mkConst `iprP_p))"),
+    ("ipr_prod_snd", NAT, Proj("Prod", 1, Const("iprP_p")),
+     E_NAT, "(mkProj ``Prod 1 (mkConst `iprP_p))"),
+    ("ipr_pprod_fst", NAT, Proj("PProd", 0, Const("iprQ_q")),
+     E_NAT, "(mkProj ``PProd 0 (mkConst `iprQ_q))"),
+    ("ipr_hadd",
+     Pi("x", BI_DEFAULT, NAT, Pi("y", BI_DEFAULT, NAT, NAT)),
+     Proj("HAdd", 0, Const("iprH_h")),
+     "(mkForall `x BinderInfo.default (mkConst ``Nat) "
+     "(mkForall `y BinderInfo.default (mkConst ``Nat) (mkConst ``Nat)))",
+     "(mkProj ``HAdd 0 (mkConst `iprH_h))"),
+    ("ipr_dep_fst", NAT, Proj("IprDep", 0, Const("iprD_c")),
+     E_NAT, "(mkProj ``IprDep 0 (mkConst `iprD_c))"),
+    ("ipr_dep_snd", NAT, Proj("IprDep", 1, Const("iprD_c")),
+     E_NAT, "(mkProj ``IprDep 1 (mkConst `iprD_c))"),
+    ("ipr_ps_dep", NAT, Proj("IprPS", 1, Const("iprPS_c")),
+     E_NAT, "(mkProj ``IprPS 1 (mkConst `iprPS_c))"),
+    # Prop carrier, field 0 is BARE DATA (Nat) -> invalidProj in the kernel;
+    # the graph answers the card-019 conservative reject (code 12).  Pins the
+    # "never extract data out of a proof" contract permanently (card 022
+    # task-2 item B reverse evidence).
+    ("ipr_pd_data", NAT, Proj("IprPD", 0, Const("iprPD_c")),
+     E_NAT, "(mkProj ``IprPD 0 (mkConst `iprPD_c))"),
+    ("ipr_pf_prop",
+     Pi("x", BI_DEFAULT, NAT, Pi("y", BI_DEFAULT, NAT, Sort(LZero()))),
+     Proj("IprPF", 0, Const("iprPF_c")),
+     "(mkForall `x BinderInfo.default (mkConst ``Nat) "
+     "(mkForall `y BinderInfo.default (mkConst ``Nat) "
+     "(Expr.sort Level.zero)))",
+     "(mkProj ``IprPF 0 (mkConst `iprPF_c))"),
+]
+
+
+def build_ipr_oracle() -> dict[str, str]:
+    cases = [(cid, _DEF.format(cid, ty_splice, val_splice))
+             for cid, _t, _v, ty_splice, val_splice in IPR_ROWS]
+    cls = lean_ref.run_kdecl_oracle(IPR_PRELUDE, cases, lean_cmd=LEAN_CMD)
+    return dict(zip([c for c, _ in cases], cls))
+
+
+def _ipr_env():
+    """Metadata-complete graph environment for the ipr rows (import_env_meta
+    keeps every kind incl. Recursor, so the ctor scan sees Prod.mk & co)."""
+    consts, ctors, structs, const_meta = import_env_meta(
+        IPR_PRELUDE, IPR_ROOTS,
+        dump=dump_env(IPR_PRELUDE, IPR_ROOTS, path=IPR_DUMP_PATH,
+                      lean_cmd=LEAN_CMD))
+    return consts, ctors, const_meta
+
+
+def _graph_check_meta(consts, ctors, const_meta, items, kinds):
+    """_graph_check with the WP1 const_meta channel wired (card 019: the
+    INDVAL.E2 / INDEXTRA.X / CTORVAL reads need real metadata)."""
+    build_step_graph, _ = _load_graph_builder()
+    graph, outputs = build_step_graph()
+    enc = Encoder(consts, is_ctor=ctors, const_meta=const_meta)
+    decls = [(enc.encode_term(t), enc.encode_term(v) if v is not None else 0)
+             for t, v in items]
+    drv = StepDriver(enc.b, graph, outputs)
+    try:
+        drv.run_check(decls, kinds=kinds)
+        return True, 0, drv.steps
+    except VMError as ex:
+        return False, ex.code, drv.steps
+
+
+def section_ipr(fails, lines):
+    """Card 019 differential: parameterized-structure Proj INFER inside a
+    CHECK value pass, vs the live #KDECL oracle."""
+    oracle = build_ipr_oracle()
+    for cid, cls in oracle.items():
+        print(f"  oracle[{cid}] = {cls}")
+    consts, ctors, const_meta = _ipr_env()
+    names = {n for n, _t, _v in consts}
+    n_scan_ok = len(consts) < 96
+    lines.append(f"  [{'PASS' if n_scan_ok else 'FAIL'}] ipr env: "
+                 f"{len(consts)} consts (<96 scan bound), "
+                 f"Prod.mk={'in' if 'Prod.mk' in names else 'MISSING'}")
+    if not n_scan_ok:
+        fails.append(f"[ipr env] {len(consts)} consts exceed the 96-wide "
+                     f"CTORVAL scan bound")
+        return
+    if "Prod.mk" not in names:
+        fails.append("[ipr env] Prod.mk missing from the dump closure — "
+                     "the CTORVAL scan would run on an empty ctor list")
+        return
+    for cid, ty, val, _tsp, _vsp in IPR_ROWS:
+        acc, code, steps = _graph_check_meta(
+            consts, ctors, const_meta, [(ty, val)],
+            [CHECK_KIND_DEFINITION])
+        want_cls = oracle.get(cid)
+        want = 0 if want_cls == "OK" else CODE_OF_CLASS.get(want_cls, -1)
+        ok = (acc, code) == (want == 0, want)
+        if ok and cid in KNOWN_GAPS:
+            tag = "XPASS"
+            fails.append(f"[ipr {cid}] registered known gap now agrees — "
+                         "remove the KNOWN_GAPS entry")
+        elif cid in KNOWN_GAPS:
+            tag = "XFAIL-KNOWN-GAP"
+        elif ok:
+            tag = "PASS"
+        else:
+            tag = "FAIL"
+        lines.append(f"  [{tag}] ipr {cid}: oracle={want_cls} "
+                     f"graph={_fmt(acc, code, steps)}"
+                     + (f"\n      known gap: {KNOWN_GAPS[cid]}"
+                        if cid in KNOWN_GAPS else ""))
+        if tag == "FAIL":
+            fails.append(f"[ipr {cid}] oracle={want_cls} "
+                         f"graph=acc={acc} code={code}")
+
+
+# ── card 018 beat-B: symbolic level runtime channel (section lvl) ───────────
+# ADR 025: level flows through the graph as ENV node positions; the CHECK
+# path consumes it via the I_PIL2 single-beat fold (mk_max/mk_imax smart
+# constructors, level.cpp:81-123) and the bounded canonical compare
+# (eq_canon = eq_struct ∨ n2z dual ∨ max_branch).  The probe constants are
+# universe-polymorphic, so this section builds its own environment through
+# `import_env_meta` (like section_ipr) and passes lparams heads per
+# declaration; expectations are the live #KDECL oracle's, never hand-set.
+# Rows are the card 018 §5.1 eleven-row matrix (canonical compare + fold)
+# plus the card 017 PG rows and the card 020 rows (lvl_cc chain leg closed
+# the 018 review; lvl_hd/lvl_hd_sn close the deq_hargs chain-arm
+# NOT-VERIFIED; lvl_isb flipped to plain PASS with the zero-elim leg).
+LEVEL_PRELUDE = """\
+axiom k18P.{v} : Type v
+axiom k18T1 : Type 1
+axiom k18U.{v} : Sort v
+axiom k18O.{u,v} : Sort (max (v+1) (u+1))
+axiom k18UV.{a,b} : Sort (max a b)
+axiom k18MM.{v} : Sort (max (v+1) 1)
+axiom pgA.{u} : Type u
+def k18triv : True := True.intro
+def k18W.{v} : Type v → Type v := fun x => x
+axiom k18E.{v} : k18W.{v} k18P.{v}
+axiom kS.{l} : Sort l → True
+
+#eval Lean.addDecl (.axiomDecl { name := `k18IU, levelParams := [`v], type := Lean.Expr.sort (Lean.Level.imax (Lean.Level.param `v) (Lean.Level.param `v)), isUnsafe := false })
+"""
+LEVEL_ROOTS = ["k18P", "k18T1", "k18U", "k18O", "k18UV", "k18MM", "k18IU",
+               "pgA", "k18triv", "True", "True.intro", "Eq", "Eq.refl",
+               "k18W", "k18E", "kS"]
+LEVEL_DUMP_PATH = os.environ.get(
+    "G02_DUMP_PATH_LVL", f"/tmp/g02_decl_inj_lvl_dump_{os.getpid()}.lean")
+
+u = LParam("u")
+v = LParam("v")
+w = LParam("w")
+
+# oracle-splice helpers for the lvl_cc chain row (keep parens/brackets balanced)
+_LMAX = ("(Lean.Level.max (Lean.Level.succ (Lean.Level.param `u)) "
+         "(Lean.Level.param `u))")
+_TSUCCMAX = ("(Lean.mkSort (Lean.Level.succ "
+             "(Lean.Level.max (Lean.Level.succ (Lean.Level.param `u)) "
+             "(Lean.Level.param `u))))")
+_KMAX = f"(Lean.mkConst `k18P [{_LMAX}])"
+_KSUCC = "(Lean.mkConst `k18P [Lean.Level.succ (Lean.Level.param `u)])"
+
+_LEVEL_THM = (".thmDecl {{ name := `{}, levelParams := [{}], type := {}, "
+              "value := {} }}")
+_LEVEL_DEF = (".defnDecl {{ name := `{}, levelParams := [{}], type := {}, "
+              "value := {}, hints := ReducibilityHints.regular 0, "
+              "safety := DefinitionSafety.safe }}")
+_LEVEL_AXM = (".axiomDecl {{ name := `{}, levelParams := [{}], type := {}, "
+              "isUnsafe := false }}")
+
+# (row id, kind | None, items, lps, oracle template | None, ty splice,
+#  val splice).  items: [(type, value | None)] for a single declaration, or
+#  [(type, value | None, kind), ...] for a multi-declaration chain (the
+#  chain row has no single-decl oracle leg — the #KDECL channel does not
+#  carry env state between cases — and is judged harness-self-evident).
+#  lps: per-declaration universe-param name lists.
+LEVEL_ROWS = [
+    # negative control: Sort (succ u) vs the value's Sort 1
+    ("lvl_neg1", CHECK_KIND_DEFINITION,
+     [(Sort(LSucc(u)), Const("k18T1"))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.succ (Lean.Level.param `u)))",
+     "Lean.mkConst `k18T1"),
+    # canonical compare, depth 0: max 1 (succ u) =?= succ u (PG3 shape)
+    ("lvl_p3_d0", CHECK_KIND_DEFINITION,
+     [(Sort(LMax(LSucc(LZero()), LSucc(u))), Const("k18P", (u,)))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.max Lean.Level.one "
+     "(Lean.Level.succ (Lean.Level.param `u))))",
+     "Lean.mkConst `k18P [Lean.Level.param `u]"),
+    # canonical compare, depth 1: succ (max 1 1) =?= succ 1 (PG6 shape)
+    ("lvl_p6_d1", CHECK_KIND_DEFINITION,
+     [(Sort(LSucc(LMax(LSucc(LZero()), LSucc(LZero())))),
+       Const("k18T1"))], [[]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.succ (Lean.Level.max Lean.Level.one "
+     "Lean.Level.one)))",
+     "Lean.mkConst `k18T1"),
+    # mk_max same-base offset absorption: max (succ u) u ~ succ u
+    ("lvl_m5_sb", CHECK_KIND_DEFINITION,
+     [(Sort(LMax(LSucc(u), u)), Const("k18P", (u,)))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.max (Lean.Level.succ (Lean.Level.param `u)) "
+     "(Lean.Level.param `u)))",
+     "Lean.mkConst `k18P [Lean.Level.param `u]"),
+    # order independence (multiset pairing, no name-string order):
+    # max (succ u) (succ v) =?= max (succ v) (succ u)
+    ("lvl_oi", CHECK_KIND_DEFINITION,
+     [(Sort(LMax(LSucc(u), LSucc(v))), Const("k18O", (u, v)))],
+     [["u", "v"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.max (Lean.Level.succ (Lean.Level.param `u)) "
+     "(Lean.Level.succ (Lean.Level.param `v))))",
+     "Lean.mkConst `k18O [Lean.Level.param `u, Lean.Level.param `v]"),
+    # imax normalize-to-zero: imax 1 0 ~ 0 (n2z dual side)
+    ("lvl_iz", CHECK_KIND_DEFINITION,
+     [(Sort(LIMax(LSucc(LZero()), LZero())), Const("True"))], [[]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.imax Lean.Level.one Lean.Level.zero))",
+     "Lean.mkConst ``True"),
+    # absorption negative pin: max 1 u ≁ u (explicit 1 survives a k=0 arg)
+    ("lvl_sn", CHECK_KIND_DEFINITION,
+     [(Sort(LMax(LSucc(LZero()), u)), Const("k18U", (u,)))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.max Lean.Level.one "
+     "(Lean.Level.param `u)))",
+     "Lean.mkConst `k18U [Lean.Level.param `u]"),
+    # imax subterm zero-elim class (card 020 beat A2, kernel normalize
+    # recurses into imax children level.cpp:461-467): imax u (max u 0) ~ imax u u
+    ("lvl_isb", CHECK_KIND_DEFINITION,
+     [(Sort(LIMax(u, LMax(u, LZero()))), Const("k18IU", (u,)))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.imax (Lean.Level.param `u) "
+     "(Lean.Level.max (Lean.Level.param `u) Lean.Level.zero)))",
+     "Lean.mkConst `k18IU [Lean.Level.param `u]"),
+    # nested flattening: max (max u v) u ~ max u v
+    ("lvl_nm", CHECK_KIND_DEFINITION,
+     [(Sort(LMax(LMax(u, v), u)), Const("k18UV", (u, v)))], [["u", "v"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.max (Lean.Level.max (Lean.Level.param `u) "
+     "(Lean.Level.param `v)) (Lean.Level.param `u)))",
+     "Lean.mkConst `k18UV [Lean.Level.param `u, Lean.Level.param `v]"),
+    # cross-kind negative pin: imax (succ u) 1 ≁ max (succ u) 1 (one-shot
+    # normalize: the IMax side never enters the max flattening)
+    ("lvl_xc", CHECK_KIND_DEFINITION,
+     [(Sort(LIMax(LSucc(u), LSucc(LZero()))), Const("k18MM", (u,)))],
+     [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.imax (Lean.Level.succ (Lean.Level.param `u)) "
+     "(Lean.Level.succ Lean.Level.zero)))",
+     "Lean.mkConst `k18MM [Lean.Level.param `u]"),
+    # I_PIL2 fold (PG2): Pi(x : Sort (succ u)) Sort (succ u) := λx.x — the
+    # old integer LEVEL scan rejected this with code 4 (Param unrepresentable)
+    ("lvl_pg2", CHECK_KIND_DEFINITION,
+     [(Pi("x", BI_DEFAULT, Sort(LSucc(u)), Sort(LSucc(u))),
+       Lam("x", BI_DEFAULT, Sort(LSucc(u)), BVar(0)))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.forallE `x (Lean.Expr.sort (Lean.Level.succ "
+     "(Lean.Level.param `u))) (Lean.Expr.sort (Lean.Level.succ "
+     "(Lean.Level.param `u))) Lean.BinderInfo.default)",
+     "(Lean.Expr.lam `x (Lean.Expr.sort (Lean.Level.succ "
+     "(Lean.Level.param `u))) (Lean.Expr.bvar 0) Lean.BinderInfo.default)"),
+    # deq_const chain-step canonical leg (added after 018 closure review —
+    # the §5.1 matrix rows above all compare Sort-vs-Sort and never reach
+    # the chain arms).  Shape: `Pi (x : k18P@{max (succ u) u}) k18P@{succ u}`
+    # as declared type, value `fun x => x` — the inferred body type is
+    # k18P@{max (succ u) u}, so is_def_eq descends Pi→body to two k18P
+    # consts, same cid, level chains [max (succ u) u] vs [succ u].
+    # Kernel: same-base offset absorption (level.cpp:95-99 via normalize)
+    # answers OK; the struct-only chain leg (head kinds differ, Max vs
+    # Succ) would reject — the acceptance can only come from the multiset
+    # pairing arm, which differentiates deq_const canonical at chain step 0.
+    ("lvl_cc", CHECK_KIND_DEFINITION,
+     [(Pi("x", BI_DEFAULT, Const("k18P", (LMax(LSucc(u), u),)),
+          Const("k18P", (LSucc(u),))),
+       Lam("x", BI_DEFAULT, Const("k18P", (LMax(LSucc(u), u),)), BVar(0)))],
+     [["u"]],
+     _LEVEL_DEF,
+     f"(Lean.mkForall `x Lean.BinderInfo.default "
+     f"(Lean.mkConst `k18P [{_LMAX}]) "
+     f"(Lean.mkConst `k18P [Lean.Level.succ (Lean.Level.param `u)]))",
+     f"(Lean.mkLambda `x Lean.BinderInfo.default "
+     f"(Lean.mkConst `k18P [{_LMAX}]) (Lean.mkBVar 0))"),
+    # card 020 beat A1 — deq_hargs chain-step canonical leg (closes the
+    # 018-closure NOT-VERIFIED).  Shape: the def head `k18W` (Regular
+    # hints) applied on both sides with DIFFERING level chains, so the
+    # A17 fast-path gate compares the head's level chain before any
+    # delta unfold: [max (succ u) u] vs [succ u] (the m5_sb absorption
+    # class) on the accept row; the negative row pins [max 1 u] vs [u]
+    # (the sn class) — the arm must NOT over-accept.  Kernel: is_def_eq
+    # on the two const-applications forces the head-level defeq
+    # (same-cid const comparison) before the arg pair; explicit 1 with
+    # no surviving offset ≥ 1 keeps the sn row a declTypeMismatch.
+    ("lvl_hd", CHECK_KIND_DEFINITION,
+     [(App(Const("k18W", (LMax(LSucc(u), u),)),
+           Const("k18P", (LMax(LSucc(u), u),))),
+       Const("k18E", (LSucc(u),)))], [["u"]],
+     _LEVEL_DEF,
+     f"(Lean.mkApp (Lean.mkConst `k18W [{_LMAX}]) "
+     f"(Lean.mkConst `k18P [{_LMAX}]))",
+     "(Lean.mkConst `k18E [Lean.Level.succ (Lean.Level.param `u)])"),
+    ("lvl_hd_sn", CHECK_KIND_DEFINITION,
+     [(App(Const("k18W", (LMax(LSucc(LZero()), u),)),
+           Const("k18P", (LMax(LSucc(LZero()), u),))),
+       Const("k18E", (u,)))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.mkApp (Lean.mkConst `k18W [Lean.Level.max Lean.Level.one "
+     "(Lean.Level.param `u)]) "
+     "(Lean.mkConst `k18P [Lean.Level.max Lean.Level.one "
+     "(Lean.Level.param `u)]))",
+     "(Lean.mkConst `k18E [Lean.Level.param `u])"),
+    # card 021 / ADR 026 beat B — one-shot normalize asymmetry pins (oracle
+    # probed 2026-10-14, #KDECL channel; .scratch/probe_norm_asym.py原文 in
+    # card 021 §2.1).  Static rows: declared Sort LA vs k18U.{LB} forces
+    # level is_equivalent(LA, LB) on two STATIC terms.
+    #   pX1 xc twin: imax-path pairwise keeps source order, max path sorts
+    #   pX2 imax path never absorbs the explicit; pX3 max path absorbs it
+    #   pX4 sort order insensitivity; pX5/pX6 the pairwise-vs-sorted walls
+    #   pX7 kernel D2 rule imax 1 u = u
+    ("lvl_bx1", CHECK_KIND_DEFINITION,
+     [(Sort(LIMax(LSucc(u), LSucc(LZero()))), Const("k18U", (LMax(LSucc(u), LSucc(LZero())),)))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.imax (Lean.Level.succ (Lean.Level.param `u)) "
+     "(Lean.Level.succ Lean.Level.zero)))",
+     "Lean.mkConst `k18U [Lean.Level.max (Lean.Level.succ (Lean.Level.param `u)) "
+     "(Lean.Level.succ Lean.Level.zero)]"),
+    ("lvl_bx2", CHECK_KIND_DEFINITION,
+     [(Sort(LIMax(LSucc(u), LSucc(LZero()))), Const("k18U", (LSucc(u),)))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.imax (Lean.Level.succ (Lean.Level.param `u)) "
+     "(Lean.Level.succ Lean.Level.zero)))",
+     "Lean.mkConst `k18U [Lean.Level.succ (Lean.Level.param `u)]"),
+    ("lvl_bx3", CHECK_KIND_DEFINITION,
+     [(Sort(LMax(LSucc(u), LSucc(LZero()))), Const("k18U", (LSucc(u),)))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.max (Lean.Level.succ (Lean.Level.param `u)) "
+     "(Lean.Level.succ Lean.Level.zero)))",
+     "Lean.mkConst `k18U [Lean.Level.succ (Lean.Level.param `u)]"),
+    ("lvl_bx4", CHECK_KIND_DEFINITION,
+     [(Sort(LMax(LSucc(LZero()), u)), Const("k18U", (LMax(u, LSucc(LZero())),)))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.max Lean.Level.one (Lean.Level.param `u)))",
+     "Lean.mkConst `k18U [Lean.Level.max (Lean.Level.param `u) Lean.Level.one]"),
+    ("lvl_bx5", CHECK_KIND_DEFINITION,
+     [(Sort(LIMax(u, LSucc(LZero()))), Const("k18U", (LMax(u, LSucc(LZero())),)))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.imax (Lean.Level.param `u) Lean.Level.one))",
+     "Lean.mkConst `k18U [Lean.Level.max (Lean.Level.param `u) Lean.Level.one]"),
+    ("lvl_bx6", CHECK_KIND_DEFINITION,
+     [(Sort(LIMax(u, LSucc(LZero()))), Const("k18U", (LMax(LSucc(LZero()), u),)))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.imax (Lean.Level.param `u) Lean.Level.one))",
+     "Lean.mkConst `k18U [Lean.Level.max Lean.Level.one (Lean.Level.param `u)]"),
+    ("lvl_bx7", CHECK_KIND_DEFINITION,
+     [(Sort(LIMax(LSucc(LZero()), u)), Const("k18U", (u,)))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.imax Lean.Level.one (Lean.Level.param `u)))",
+     "Lean.mkConst `k18U [Lean.Level.param `u]"),
+    # card 021 fold rows: value = kS.{L} applied to a Pi TERM — the kernel's
+    # infer_pi computes the sort mk_imax chain at RUNTIME (type_checker.cpp:
+    # 144-166), then checks the argument against Sort L.  The graph's I_PIL2
+    # fold output must land in normalize form for these to pass with the
+    # canonical arms retired (B2); under B1 the bounded arms rescue.
+    #   bf1/bf1n: explicit-2 absorption collapses the fold result to u+2
+    #   bf2/bf2n: 3-atom chain union, explicit absorbed, 2 survivors
+    #   bf3: 4-atom union -> 3 survivors, right-fold rebuild (2-beat pin)
+    #   bf4/bf4i/bf4j: succ-wrapped max stays an ATOM and Max-kind sorts
+    #     before Param (emission-order pins; bf4i also pins the succ
+    #     distribution over flattened survivors, kernel :449-453+:507-509)
+    # card 021 fold rows (decl-level design, oracle-verified 2026-10-14:
+    # the value is a BARE Pi term — infer(Pi) = Sort(mk_imax chain) runs the
+    # kernel's runtime fold (type_checker.cpp:144-166) with no app wrapper,
+    # so a failing level compare surfaces as declTypeMismatch, a class the
+    # decl-injection harness can judge; the graph's I_PIL2 fold output must
+    # land in normalize form once the canonical arms are retired).
+    #   bf1/bf1n: explicit-2 absorption collapses the fold result to u+2
+    #   bf2/bf2n: 3-atom chain union, explicit absorbed, 2 survivors
+    #   bf3: 4-atom union -> 3 survivors, right-fold rebuild (2-beat pin)
+    #   bf4/bf4i/bf4j: succ-wrapped max stays an ATOM and Max-kind sorts
+    #     before Param (emission-order pins; bf4i also pins the succ
+    #     distribution over flattened survivors, kernel :449-453+:507-509)
+    ("lvl_bf1", CHECK_KIND_DEFINITION,
+     [(Sort(LSucc(LSucc(u))),
+       Pi("x", BI_DEFAULT, Sort(LSucc(u)), Sort(LSucc(LZero()))))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.succ (Lean.Level.succ (Lean.Level.param `u))))",
+     "(Lean.Expr.forallE `x (Lean.Expr.sort (Lean.Level.succ "
+     "(Lean.Level.param `u))) (Lean.Expr.sort Lean.Level.one) "
+     "Lean.BinderInfo.default)"),
+    ("lvl_bf1n", CHECK_KIND_DEFINITION,
+     [(Sort(LSucc(u)),
+       Pi("x", BI_DEFAULT, Sort(LSucc(u)), Sort(LSucc(LZero()))))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.succ (Lean.Level.param `u)))",
+     "(Lean.Expr.forallE `x (Lean.Expr.sort (Lean.Level.succ "
+     "(Lean.Level.param `u))) (Lean.Expr.sort Lean.Level.one) "
+     "Lean.BinderInfo.default)"),
+    ("lvl_bf2", CHECK_KIND_DEFINITION,
+     [(Sort(LMax(LSucc(LSucc(u)), LSucc(LSucc(v)))),
+       Pi("x", BI_DEFAULT, Sort(LSucc(u)),
+          Pi("y", BI_DEFAULT, Sort(LSucc(v)), Sort(LSucc(LZero())))))],
+     [["u", "v"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.max (Lean.Level.succ (Lean.Level.succ "
+     "(Lean.Level.param `u))) (Lean.Level.succ (Lean.Level.succ "
+     "(Lean.Level.param `v)))))",
+     "(Lean.Expr.forallE `x (Lean.Expr.sort (Lean.Level.succ "
+     "(Lean.Level.param `u))) (Lean.Expr.forallE `y (Lean.Expr.sort "
+     "(Lean.Level.succ (Lean.Level.param `v))) (Lean.Expr.sort "
+     "Lean.Level.one) Lean.BinderInfo.default) Lean.BinderInfo.default)"),
+    ("lvl_bf2n", CHECK_KIND_DEFINITION,
+     [(Sort(LMax(u, v)),
+       Pi("x", BI_DEFAULT, Sort(LSucc(u)),
+          Pi("y", BI_DEFAULT, Sort(LSucc(v)), Sort(LSucc(LZero())))))],
+     [["u", "v"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.max (Lean.Level.param `u) "
+     "(Lean.Level.param `v)))",
+     "(Lean.Expr.forallE `x (Lean.Expr.sort (Lean.Level.succ "
+     "(Lean.Level.param `u))) (Lean.Expr.forallE `y (Lean.Expr.sort "
+     "(Lean.Level.succ (Lean.Level.param `v))) (Lean.Expr.sort "
+     "Lean.Level.one) Lean.BinderInfo.default) Lean.BinderInfo.default)"),
+    ("lvl_bf3", CHECK_KIND_DEFINITION,
+     [(Sort(LMax(LSucc(LSucc(u)),
+                 LMax(LSucc(LSucc(v)), LSucc(LSucc(w))))),
+       Pi("x", BI_DEFAULT, Sort(LSucc(u)),
+          Pi("y", BI_DEFAULT, Sort(LSucc(v)),
+             Pi("z", BI_DEFAULT, Sort(LSucc(w)), Sort(LSucc(LZero()))))))],
+     [["u", "v", "w"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.max (Lean.Level.succ (Lean.Level.succ "
+     "(Lean.Level.param `u))) (Lean.Level.max (Lean.Level.succ "
+     "(Lean.Level.succ (Lean.Level.param `v))) (Lean.Level.succ "
+     "(Lean.Level.succ (Lean.Level.param `w))))))",
+     "(Lean.Expr.forallE `x (Lean.Expr.sort (Lean.Level.succ "
+     "(Lean.Level.param `u))) (Lean.Expr.forallE `y (Lean.Expr.sort "
+     "(Lean.Level.succ (Lean.Level.param `v))) (Lean.Expr.forallE `z "
+     "(Lean.Expr.sort (Lean.Level.succ (Lean.Level.param `w))) "
+     "(Lean.Expr.sort Lean.Level.one) Lean.BinderInfo.default) "
+     "Lean.BinderInfo.default) Lean.BinderInfo.default)"),
+    ("lvl_bf4", CHECK_KIND_DEFINITION,
+     [(Sort(LMax(LSucc(LMax(u, v)), LSucc(LSucc(u)))),
+       Pi("x", BI_DEFAULT, Sort(LMax(u, v)),
+          Pi("y", BI_DEFAULT, Sort(LSucc(u)), Sort(LSucc(LZero())))))],
+     [["u", "v"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.max (Lean.Level.succ (Lean.Level.max "
+     "(Lean.Level.param `u) (Lean.Level.param `v))) (Lean.Level.succ "
+     "(Lean.Level.succ (Lean.Level.param `u)))))",
+     "(Lean.Expr.forallE `x (Lean.Expr.sort (Lean.Level.max "
+     "(Lean.Level.param `u) (Lean.Level.param `v))) "
+     "(Lean.Expr.forallE `y (Lean.Expr.sort (Lean.Level.succ "
+     "(Lean.Level.param `u))) (Lean.Expr.sort Lean.Level.one) "
+     "Lean.BinderInfo.default) Lean.BinderInfo.default)"),
+    ("lvl_bf4i", CHECK_KIND_DEFINITION,
+     [(Sort(LIMax(LSucc(LMax(u, v)), LSucc(LSucc(u)))),
+       Pi("x", BI_DEFAULT, Sort(LMax(u, v)),
+          Pi("y", BI_DEFAULT, Sort(LSucc(u)), Sort(LSucc(LZero())))))],
+     [["u", "v"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.imax (Lean.Level.succ (Lean.Level.max "
+     "(Lean.Level.param `u) (Lean.Level.param `v))) (Lean.Level.succ "
+     "(Lean.Level.succ (Lean.Level.param `u)))))",
+     "(Lean.Expr.forallE `x (Lean.Expr.sort (Lean.Level.max "
+     "(Lean.Level.param `u) (Lean.Level.param `v))) "
+     "(Lean.Expr.forallE `y (Lean.Expr.sort (Lean.Level.succ "
+     "(Lean.Level.param `u))) (Lean.Expr.sort Lean.Level.one) "
+     "Lean.BinderInfo.default) Lean.BinderInfo.default)"),
+    ("lvl_bf4j", CHECK_KIND_DEFINITION,
+     [(Sort(LIMax(LSucc(LSucc(u)), LSucc(LMax(u, v)))),
+       Pi("x", BI_DEFAULT, Sort(LMax(u, v)),
+          Pi("y", BI_DEFAULT, Sort(LSucc(u)), Sort(LSucc(LZero())))))],
+     [["u", "v"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.imax (Lean.Level.succ (Lean.Level.succ "
+     "(Lean.Level.param `u))) (Lean.Level.succ (Lean.Level.max "
+     "(Lean.Level.param `u) (Lean.Level.param `v)))))",
+     "(Lean.Expr.forallE `x (Lean.Expr.sort (Lean.Level.max "
+     "(Lean.Level.param `u) (Lean.Level.param `v))) "
+     "(Lean.Expr.forallE `y (Lean.Expr.sort (Lean.Level.succ "
+     "(Lean.Level.param `u))) (Lean.Expr.sort Lean.Level.one) "
+     "Lean.BinderInfo.default) Lean.BinderInfo.default)"),
+    # card 017 PG rows.  PG1 is a two-decl chain (axiom head + def body), so
+    # it has no single-decl oracle leg and stays harness-self-evident
+    # (card 018 §7: PG1/PG4/PG5 keep ACCEPT); PG4/PG5 get oracle legs.
+    # card 021 review finding 1 — the succ-shadow boundary pins (the
+    # double-normalize class at the shadow/encoder-recursion seams, both
+    # faces fixed: shadow computed from the SOURCE level, and the encoder
+    # normalizes ONCE at the root with a raw recursion — re-normalizing an
+    # imax-path child re-sorts the pairwise form and desyncs the graph from
+    # the kernel's comparison form).  bs1: the kernel's Pi-sort for domain
+    # Sort (imax u 1) keeps succ(max u 1) WHOLE (imax path one-shot), which
+    # is NOT equivalent to max 2 (succ u) -> both reject.  bs2: same fold
+    # against the succ-wrapped imax -> both accept.
+    ("lvl_bs1", CHECK_KIND_DEFINITION,
+     [(Sort(LMax(LSucc(LSucc(LZero())), LSucc(u))),
+       Pi("x", BI_DEFAULT, Sort(LIMax(u, LSucc(LZero()))), Sort(LZero())))],
+     [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.max (Lean.Level.succ (Lean.Level.succ "
+     "Lean.Level.zero)) (Lean.Level.succ (Lean.Level.param `u))))",
+     "(Lean.Expr.forallE `x (Lean.Expr.sort (Lean.Level.imax "
+     "(Lean.Level.param `u) (Lean.Level.succ Lean.Level.zero))) "
+     "(Lean.Expr.sort Lean.Level.zero) Lean.BinderInfo.default)"),
+    ("lvl_bs2", CHECK_KIND_DEFINITION,
+     [(Sort(LSucc(LIMax(u, LSucc(LZero())))),
+       Pi("x", BI_DEFAULT, Sort(LIMax(u, LSucc(LZero()))), Sort(LZero())))],
+     [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.succ (Lean.Level.imax "
+     "(Lean.Level.param `u) (Lean.Level.succ Lean.Level.zero))))",
+     "(Lean.Expr.forallE `x (Lean.Expr.sort (Lean.Level.imax "
+     "(Lean.Level.param `u) (Lean.Level.succ Lean.Level.zero))) "
+     "(Lean.Expr.sort Lean.Level.zero) Lean.BinderInfo.default)"),
+    ("lvl_PG1", None,
+     [(Sort(LSucc(u)), None, CHECK_KIND_AXIOM),
+      (Sort(LSucc(u)), Const("pgA", (u,)), CHECK_KIND_DEFINITION)],
+     [["u"], ["u"]],
+     None, None, None),
+    ("lvl_PG4", CHECK_KIND_DEFINITION,
+     [(Sort(LSucc(u)), Const("pgA", (u,)))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.sort (Lean.Level.succ (Lean.Level.param `u)))",
+     "Lean.mkConst `pgA [Lean.Level.param `u]"),
+    ("lvl_PG5", CHECK_KIND_AXIOM,
+     [(Sort(LMax(LSucc(LZero()), LSucc(u))), None)], [["u"]],
+     _LEVEL_AXM,
+     "(Lean.Expr.sort (Lean.Level.max Lean.Level.one "
+     "(Lean.Level.succ (Lean.Level.param `u))))",
+     None),
+    # Binder-identity defeq pins (kernel quick_is_def_eq `t == s`,
+    # K/type_checker.cpp:837; infer_lambda creates the local decl whose
+    # domain closure both sides resolve to, K/type_checker.cpp:125).
+    # bid_same: checking `fun (a : Sort 1) (a : a) => Eq.refl a a` against
+    # `∀ (a : Sort 1) (a : a), Eq a a a` runs the Eq.refl application's
+    # arg check — the argument's type closure and the instantiated Pi
+    # domain both resolve to the SAME binder marker row (infer-created,
+    # bid-less), so acceptance needs the same-chain-node identity, not the
+    # defeq-side bid stamping.
+    # bid_distinct: same shape with a second binder b : a and the value
+    # `Eq.refl a b` — the declared body compares a's marker against b's,
+    # two same-shape distinct binders (both : a, a data type, so proof
+    # irrelevance cannot bridge them, kernel is_def_eq_proof_irrel
+    # :1165-1180 only bridges Prop-typed elements); they must stay
+    # distinct → declTypeMismatch.
+    ("bid_same", CHECK_KIND_DEFINITION,
+     [(Pi("A", BI_DEFAULT, Sort(LSucc(LZero())),
+          Pi("a", BI_DEFAULT, BVar(0),
+             App(App(App(Const("Eq", (LSucc(LZero()),)), BVar(1)),
+                 BVar(0)), BVar(0)))),
+       Lam("A", BI_DEFAULT, Sort(LSucc(LZero())),
+           Lam("a", BI_DEFAULT, BVar(0),
+               App(App(Const("Eq.refl", (LSucc(LZero()),)), BVar(1)),
+                   BVar(0)))))], [[]],
+     _LEVEL_DEF,
+     "(Lean.mkForall `A Lean.BinderInfo.default "
+     "(Lean.Expr.sort Lean.Level.one) "
+     "(Lean.mkForall `a Lean.BinderInfo.default (Lean.Expr.bvar 0) "
+     "(Lean.mkApp (Lean.mkApp (Lean.mkApp "
+     "(Lean.mkConst `Eq [Lean.Level.one]) (Lean.Expr.bvar 1)) "
+     "(Lean.Expr.bvar 0)) (Lean.Expr.bvar 0))))",
+     "(Lean.mkLambda `A Lean.BinderInfo.default "
+     "(Lean.Expr.sort Lean.Level.one) "
+     "(Lean.mkLambda `a Lean.BinderInfo.default (Lean.Expr.bvar 0) "
+     "(Lean.mkApp (Lean.mkApp "
+     "(Lean.mkConst `Eq.refl [Lean.Level.one]) (Lean.Expr.bvar 1)) "
+     "(Lean.Expr.bvar 0))))"),
+    ("bid_distinct", CHECK_KIND_DEFINITION,
+     [(Pi("A", BI_DEFAULT, Sort(LSucc(LZero())),
+          Pi("a", BI_DEFAULT, BVar(0),
+             Pi("b", BI_DEFAULT, BVar(1),
+                App(App(App(Const("Eq", (LSucc(LZero()),)), BVar(2)),
+                    BVar(1)), BVar(1))))),
+       Lam("A", BI_DEFAULT, Sort(LSucc(LZero())),
+           Lam("a", BI_DEFAULT, BVar(0),
+               Lam("b", BI_DEFAULT, BVar(1),
+                   App(App(Const("Eq.refl", (LSucc(LZero()),)), BVar(2)),
+                       BVar(0))))))], [[]],
+     _LEVEL_DEF,
+     "(Lean.mkForall `A Lean.BinderInfo.default "
+     "(Lean.Expr.sort Lean.Level.one) "
+     "(Lean.mkForall `a Lean.BinderInfo.default (Lean.Expr.bvar 0) "
+     "(Lean.mkForall `b Lean.BinderInfo.default (Lean.Expr.bvar 1) "
+     "(Lean.mkApp (Lean.mkApp (Lean.mkApp "
+     "(Lean.mkConst `Eq [Lean.Level.one]) (Lean.Expr.bvar 2)) "
+     "(Lean.Expr.bvar 1)) (Lean.Expr.bvar 1)))))",
+     "(Lean.mkLambda `A Lean.BinderInfo.default "
+     "(Lean.Expr.sort Lean.Level.one) "
+     "(Lean.mkLambda `a Lean.BinderInfo.default (Lean.Expr.bvar 0) "
+     "(Lean.mkLambda `b Lean.BinderInfo.default (Lean.Expr.bvar 1) "
+     "(Lean.mkApp (Lean.mkApp "
+     "(Lean.mkConst `Eq.refl [Lean.Level.one]) (Lean.Expr.bvar 2)) "
+     "(Lean.Expr.bvar 0)))))"),
+    # card 022 B-group pin (card 024): universe-polymorphic LAM-valued def —
+    # the graph rejected exactly this shape at 83 micro-steps on an empty env
+    # (card 022 §B, .scratch/dbg_mc_empty.py) while the kernel and the frozen
+    # reference machine accepted.  The row body is the REAL corpus entry `id`
+    # of the Nat_testBit_land closure dump (type {"k":8,"bi":1,...}, value
+    # {"k":7,"bi":1,...}), not a hand-authored type splice.  The expected
+    # verdict comes from the live #KDECL oracle, never from this file.
+    ("lvl_lam_poly", CHECK_KIND_DEFINITION,
+     [(Pi("a", BI_IMPLICIT, Sort(u), Pi("x", BI_DEFAULT, BVar(0), BVar(1))),
+       Lam("a", BI_IMPLICIT, Sort(u),
+           Lam("x", BI_DEFAULT, BVar(0), BVar(0))))], [["u"]],
+     _LEVEL_DEF,
+     "(Lean.Expr.forallE `a (Lean.Expr.sort (Lean.Level.param `u)) "
+     "(Lean.Expr.forallE `x (Lean.Expr.bvar 0) (Lean.Expr.bvar 1) "
+     "Lean.BinderInfo.default) Lean.BinderInfo.implicit)",
+     "(Lean.Expr.lam `a (Lean.Expr.sort (Lean.Level.param `u)) "
+     "(Lean.Expr.lam `x (Lean.Expr.bvar 0) (Lean.Expr.bvar 0) "
+     "Lean.BinderInfo.default) Lean.BinderInfo.implicit)"),
+]
+
+
+def build_lvl_oracle() -> dict[str, str]:
+    cases = []
+    for cid, _kind, _items, lps, tmpl, ty, val in LEVEL_ROWS:
+        if tmpl is None:
+            continue
+        names = ", ".join("`" + n for n in (lps[0] if lps else []))
+        cases.append((cid, tmpl.format(f"g18l_{cid}", names, ty, val)))
+    cls = lean_ref.run_kdecl_oracle(LEVEL_PRELUDE, cases, lean_cmd=LEAN_CMD)
+    return dict(zip([c for c, _ in cases], cls))
+
+
+def _lvl_env():
+    """Metadata-complete graph environment for the level rows (the probe
+    constants are universe-polymorphic, so the Encoder needs const_meta for
+    the K_CONST.E2 use-site specialization, VM_SPEC §12.7)."""
+    consts, ctors, _structs, const_meta = import_env_meta(
+        LEVEL_PRELUDE, LEVEL_ROOTS,
+        dump=dump_env(LEVEL_PRELUDE, LEVEL_ROOTS, path=LEVEL_DUMP_PATH,
+                      lean_cmd=LEAN_CMD))
+    return consts, ctors, const_meta
+
+
+def _graph_check_lvl(consts, ctors, const_meta, items, kinds, lps):
+    """_graph_check with the const_meta channel and per-declaration lparams
+    heads wired (the level rows are universe-polymorphic)."""
+    build_step_graph, _ = _load_graph_builder()
+    graph, outputs = build_step_graph()
+    enc = Encoder(consts, is_ctor=ctors, const_meta=const_meta)
+    decls = [(enc.encode_term(t), enc.encode_term(v) if v is not None else 0)
+             for t, v in items]
+    heads = [enc.emit_univparams(l) if l else 0
+             for l in (lps or [None] * len(items))]
+    drv = StepDriver(enc.b, graph, outputs)
+    try:
+        drv.run_check(decls, kinds=kinds, lparams=heads)
+        return True, 0, drv.steps
+    except VMError as ex:
+        return False, ex.code, drv.steps
+
+
+def section_lvl(fails, lines):
+    """Card 018 differential: symbolic level channel — the §5.1 canonical
+    matrix + I_PIL2 fold + card 017 PG rows, vs the live #KDECL oracle."""
+    oracle = build_lvl_oracle()
+    consts, ctors, const_meta = _lvl_env()
+    for cid, kind, items, lps, _t, _ty, _v in LEVEL_ROWS:
+        if items and isinstance(items[0], tuple) and len(items[0]) == 3:
+            pairs = [(t, vv) for t, vv, _k in items]
+            kinds = [k for _t, _vv, k in items]
+        else:
+            pairs = list(items)
+            kinds = [kind]
+        acc, code, steps = _graph_check_lvl(consts, ctors, const_meta,
+                                            pairs, kinds, lps)
+        want_cls = oracle.get(cid)
+        gap = KNOWN_GAPS.get(cid)
+        if want_cls is None:
+            # chain row: harness self-evident (accept expected, card 018 §7)
+            ok = acc
+            tag = "PASS" if ok else "FAIL"
+            lines.append(f"  [{tag}] lvl {cid}: graph={_fmt(acc, code, steps)}"
+                         " (chain, harness self-evident accept)")
+            if not ok:
+                fails.append(f"[lvl {cid}] expected accept, got "
+                             f"{_fmt(acc, code, steps)}")
+            continue
+        want = 0 if want_cls == "OK" else CODE_OF_CLASS.get(want_cls, -1)
+        ok = (acc, code) == (want == 0, want)
+        if ok and gap:
+            tag = "XPASS"
+            fails.append(f"[lvl {cid}] registered known gap now agrees — "
+                         "remove the KNOWN_GAPS entry")
+        elif gap:
+            tag = "XFAIL-KNOWN-GAP"
+        elif ok:
+            tag = "PASS"
+        else:
+            tag = "FAIL"
+        lines.append(f"  [{tag}] lvl {cid}: oracle={want_cls} "
+                     f"graph={_fmt(acc, code, steps)}"
+                     + (f"\n      known gap: {gap}" if gap else ""))
+        if tag == "FAIL":
+            fails.append(f"[lvl {cid}] oracle={want_cls} "
+                         f"graph=acc={acc} code={code}")
+
+
 def main() -> int:
     t0 = time.perf_counter()
     only = {s.strip() for s in os.environ.get("G02_ONLY", "").split(",")
@@ -1654,6 +2438,8 @@ def main() -> int:
     g4_rows = {c for c in only if c in G04_ROW_IDS}
     g8_rows = {c for c in only if c in G8_ROW_IDS}
     g9_rows = {c for c in only if c in G9_ROW_IDS}
+    ipr_rows = {"ipr"} & only
+    lvl_rows = {"lvl"} & only
     want_rows = g2_rows | g6_rows
     fails: list[str] = []
     lines: list[str] = []
@@ -1708,6 +2494,14 @@ def main() -> int:
         print("g9    duplicate universe level parameters: graph O(n²) scan "
               "(code 10, anchor F2 carrier) vs live #KDECL oracle")
         section_g9(fails, lines, consts, ctors)
+    if run_all or ipr_rows:
+        print("ipr   card 019 infer_proj metadata channel: parameterized "
+              "structure Proj inside a CHECK value pass vs live #KDECL")
+        section_ipr(fails, lines)
+    if run_all or lvl_rows:
+        print("lvl   card 018 symbolic level channel: bounded canonical "
+              "max/imax compare + I_PIL2 fold vs live #KDECL oracle")
+        section_lvl(fails, lines)
     for ln in lines:
         print(ln)
     n_gap = sum(1 for ln in lines if "XFAIL-KNOWN-GAP" in ln)

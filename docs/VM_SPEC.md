@@ -728,29 +728,88 @@ stuck 分支同有该潜在错误，一并修）。
 **54/54**。回归全绿：RefVM whnf 34/34、图 whnf 34/34、图 vs 真 lean
 34/34、M4.1 21/21+17/17、M4.2 15/15+15/15、M4.3 16/16+8/8。
 
-### 11.6 P6.2：infer_proj 帧（机制 F，2026-09-06）
+### 11.6 P6.2：infer_proj 帧（机制 F，2026-09-06；**卡 019 P0-2 元数据化重写**，2026-10-05）
 
-图 INFER 子集补上 Proj 类型推断（内核 `infer_proj`，type_checker.cpp
-L247；单态、非递归、非依赖域子集——P2，build-time 门控，与结构 eta 同
-约定）。新续延 id `IP_TY=57` / `IP_PEEL=58`：
+图 INFER 子集的 Proj 类型推断（内核 `infer_proj`，type_checker.cpp:247-292）。
+P6.2 原为 P2-only 硬编码门（`Const(CID_P2)`/`NID_P2` + 0 参 0 索引门）；
+卡 019 换成 ENV 元数据读数（`_is_struct_induct` 整体废弃），使带参结构
+（Prod np=2、PProd、HAdd np=3…）的 proj 在 INFER 下可用。续延 id
+`IP_TY=57` / `IP_PEEL=58` / `IP_PK=71`（g 字典 1..71）：
 
 - **`proj_i`（INFER ph1）**：焦点 `Proj(nid, idx, child)` → 压
   ST(IP_TY, V1=nid, X=idx) + INFER(child)。
 - **`IP_TY`**：子项类型闭包 (A,B) → 压 WHNF（硬 whnf，E2=0）+
   ST(IP_PEEL, E2=0)。
-- **`IP_PEEL` 相位 0**（frE2=0）：whnf 后类型必须是 `Const(CID_P2)` 且
-  proj sname 为 `NID_P2`，否则 reject ERR_TYPE（内核 invalid_proj）；
-  通过则焦点 = ctor 类型根（`ENV_HDR(CID_P2MK).V1` = `Nat → Nat → P2`），
-  E2 置 1 重入。
-- **`IP_PEEL` 相位 1**：剥 X 个 Pi（非依赖域，免实例化），交付字段
-  domain（闭树 → env 0）；焦点非 Pi（idx 越界）→ ERR_TYPE。
+- **`IP_PEEL` 相位 0**（frE2=0）——核侧 :255-263 的元数据门，双臂：
+  - *legacy 臂*（无 WP1 元数据的流，`_no_meta(ip_cid)`）：toy P2 子集
+    逐字保持 pre-019 行为（`ip_cid == CID_P2` ∧ sname 回退 `NID_P2`）。
+  - *元数据臂*：`_mhead(ip_cid)` 处 `T_ENV_INDVAL` 存在（inductive，
+    :260-262）∧ `_induct_nid(ip_cid) == frV1`（sname，:259）∧ **唯一
+    ctor**（`_struct_ctor`：对 anchor(c).V2 = `T_ENV_CTORVAL`（V1 =
+    induct_cid）做 96 候选展开扫描，命中计数 == 1，累加和即 ctor cid；
+    WP1 无 inductive→ctor 链，同 `_is_unit_induct` 的缺口同一解法）∧
+    **形状**（焦点 K_CONST ∧ np+ni==0，或焦点 K_APP ∧ spine 头
+    K_CONST ∧ `_app_arity` == np+ni ∧ np+ni < SPINE_MAX=12——:263 的
+    args.size()==np+ni，==cap 歧义保守拒）∧ ni ≤ 2 ∧ 依赖门
+    （idx ≤ dep_min，见下）。ctor 类型根 = `ENV_HDR(ctor_cid+1).V1`
+    （:266 的 `instantiate_type_lparams` 图侧 level-blind，编码期声明树）。
+- **编码期两标量**（ENV_FORMAT §2.4；图无法用有界电路做精确全树 DFS）：
+  `INDVAL.E2 = dep_min + 1`（0 = legacy 关），dep_min = 首 ctor 类型树中
+  被引用的最小字段 binder 序号（编码侧 `_min_field_ref` 精确无预算）；
+  `INDEXTRA.X` = 声明结果 sort 的 is_prop 位（`_decl_sort_is_prop`）。
+- **`IP_PEEL` 相位 1（参数 apply，:267-271，`i < nparams` 循环逐字对齐）**：
+  每步链一个 spine 实参为 LINK（V0=arg pos、P=SB、E=STATE.C 载的类型
+  env、D=ldepth(SB)）——运行期闭包 env 链同构 instantiate；实参游标从
+  帧 V1（整个 spine 位置）起沿 V0 链重走，hops 倒数在帧 X（首步 =
+  arity-1）；hops == ni 的过渡步：相位 2、X ← STATE.F（idx）、
+  V1 ← spine 头 inductive 的 prop 位。
+- **`IP_PEEL` 相位 2（字段 peel，:272-283）**：每步发射 dummy LINK
+  （V0=0；剥字段 Pi 不 apply 时 binder 对齐所需；依赖已被 dep_min 排除，
+  dummy 永不被走）；X==0 交付字段 domain 为**闭包**（A=domain、
+  B=累积 env）——旧"env 0"合同只对闭的 0 参 ctor 类型成立。剥间不加
+  whnf（核侧 :268/:273 对 ctor 类型的语法 Pi 链是防御性的）。
+- **Prop 交付（:290 → `IP_PK=71`）**：is_prop_type 结构（INDEXTRA.X=1）
+  的交付改压 ST(IP_PK, V1=domain, X=env) + TASK_INFER(domain)（硬），
+  IP_PK 步判 K_SORT ∧ `_n2z(level, IP_N2Z_DEPTH=4)`（核 is_prop
+  :383-389；实测此类域深度 ≤3，更深的树判非 Prop = 保守拒）→ 过则
+  交付原 domain，不过拒码 12。
+- **拒绝**：相位 0 门 / 剥链非 Pi walk-off（idx 越界）/ 依赖保守拒
+  （idx > dep_min = 核 :277-281 `has_loose_bvars` 抛点的保守侧，不实现
+  mk_proj 回代，卡 017 缓办条款）/ IP_PK 不过——统一 reject 码 12
+  （§16.8；`invalid_proj_exception` → .invalidProj 类）。
+
+**已知近似（卡 019 D8 + 残余，显性登记）**：
+1. 依赖域回代未实现：Type 结构 idx > dep_min 时核侧回代 mk_proj 后可能
+   **接受**类型含 `c.j` 的声明，图一律拒 12（保守侧；
+   `ipr_dep_snd` 行 KNOWN_GAPS 登记：裁决一致、类别分歧）。
+2. Prop 结构窄角：核侧 :277-281 的逐步 `has_loose_bvars` 对 body 内**任意**
+   字段引用为真（含 j ≥ idx 的后位字段经更深字段域的引用），图的 dep_min
+   门只拒 j < idx 的引用——Prop 结构 + 非证明域字段 + 后位依赖 +
+   idx ≤ dep_min 的中段投影可"核拒图收"。语料 0 例（语料 Prop 结构字段
+   全为证明），verifier 不含；后续收紧方向 = is_prop_type ∧ idx ≥ 1 ∧
+   存在任一字段引用即拒。
+3. level-blind：`instantiate_type_lparams` 不做（B13/D14 残余）。
+4. IP_N2Z_DEPTH=4 为 sound-incomplete 引擎界（D7 族）。
 
 结构 eta 的 ES_T 保留静态 `s_ty` 捷径（对 P2 等价且省步，注释已同步）。
 语料 `inf_proj_fst/snd/mk`（INFER 16→19，总 57）。
 
-**P6.2 验收**：图 vs 参照机 **57/57**（proj 三例 14/15/21 微步）、参照机
-vs 真 lean **57/57**；回归全绿：whnf 34/34×3、M4.1 21/21+17/17、M4.2
-15/15+15/15、M4.3 16/16+8/8。
+**P6.2 验收（历史，pre-019）**：图 vs 参照机 **57/57**（proj 三例
+14/15/21 微步）、参照机 vs 真 lean **57/57**；回归全绿：whnf 34/34×3、
+M4.1 21/21+17/17、M4.2 15/15+15/15、M4.3 16/16+8/8。
+
+**卡 019 验收（2026-10-05）**：新差分行集 `ipr`（8 行，oracle 4.33.1
+现跑钉期望）：prod_fst/snd、pprod_fst、hadd（Pi 闭包交付）、dep_fst
+accept；dep_snd XFAIL-KNOWN-GAP（核 declTypeMismatch / 图 12，裁决
+一致）；ps_dep、pf_prop 双方 invalidProj（图 12）——**9/9 checks +
+1 登记缺口，0 fail（G02_ONLY=ipr 复跑两轮，506-515s，峰值 RSS ~1.5GB）**。
+基线不倒退：decl_injection 全节、g03/g04、test_stepgraph_infer_defeq
+54/54（见卡 019 执行段原文）。编译 `model/step_vm_019_scratch`：
+dims **36,602**(+1,931)/lookups **5,071**(+544)/nnz **247,955**(+11,008)、
+115 层、24,774,250B（预算 +O(100) 的偏差来源 = `_struct_ctor` 96 候选
+展开扫描 + ip_md/形状/SPINE 展开电路，如实记账）；引擎对拍 **34/34**
+（argmax/softmax 流一致 34/34；known-value 3/4 为卡 006 起 harness 既有
+报表项）+ meta 门 OK（76 输出维、13 token 常量）。
 
 ### 11.7 P6.4：iota——RefVM `Nat.rec` reduce_recursor（2026-09-06）
 
@@ -1389,7 +1448,8 @@ false；指针同 true（`:127-128`）；Zero→true（`:130-131`）；Param/MVa
   `mk_max(buffer)` 重建（`:513`；`:429-444`）。
 - `is_norm_lt`（`:395-418`）：先 `to_offset` 剥 succ，再比 base；base 不同按
   kind 枚举序（`K/level.h:30`：Zero < Succ < Max < IMax < Param < MVar）比
-  kind（`:402`）；Param/MVar 比 name（`:407`）；Max/IMax 字典序比 lhs 再 rhs
+  kind（`:402`）；Param/MVar 比 interned `level_id`（`:407`，name 的 intern
+  注册序派生，非字典序）；Max/IMax 字典序比 lhs 再 rhs
   （`:408-412`）；base 相同比 offset（`:415-416`）。
 - **重要**：该排序与 Lean 侧 `Level.normalize` 的 `normLt` 不同（Lean 用
   `ctorToNat` 序 Zero < Param < MVar < Succ < Max < IMax，
@@ -1691,6 +1751,136 @@ D_BV3 要求 bid>=1 才认同一 binder，于是 α-相等的体对被送进 stu
 `T_PI_CLO` 体环境（`t: oBdE, s: sBdE`）的 E2 标志与 F2 bid，把该 bid 采纳为
 新 marker 的 bid。两 marker 同 bid 后 D_BV3 正常收敛。该修复只改 marker 身份，
 不改 T_PI_CLO token 本体（其 F2 仍为 0），故 INFER 的解码闭包输出不变。
+
+### 12.8 符号 level 运行期通道（卡 018，2026-10，ADR 025）
+
+> **状态：已实现（拍 B，2026-10-12 收口复跑）**。本节前述"整数计数器"
+> 通道整体退役，level 在图内以 §12.1 节点子树承载、ST/任务通道只流动
+> 根位置；零 token/布局/编码变更。
+
+**表示（ADR 025 R1）。** 符号 level = ENV 区既有的 level 节点子树
+（`K`∈KL_ZERO..KL_MVAR、`V0`/`V1` 子位置、`X` 兄弟链）；显式级保持
+`succ^k(zero)` 节点链形态，不再解码成计数器整数。`Param` 等价判据 =
+nid 整数相等（`expr/tokens.py` 名字注册表）。运行期构造走既有 raw
+发射槽（每微步 ≤1 个新节点），fold 发射载荷恒 `V0=l1、V1=l2`。
+
+**I_PIS1/I_PIS2 换道**（`build_vm.py:3949-4011`）：删除 TASK_LEVEL
+推入，`l1=fV0` / `l2=lvl2_root` 直传 I_PIL2；根 kind∉1..6 的拒 4
+（lvl_bad）移入两臂（`_lvl_kind_ok`）。`Pi` 域/体层级的符号根从此
+全程位置化（消卡 017 PG2 的 ERR 4）。整数 LEVEL 帧分发块与休眠臂
+D_SORT2/D_SORT3 一并删除（`:4670-4672` 注记、`:6525-6528` 注记；
+TASK_LEVEL import 已移除——`tokens.py` 常量保留，scripts/probe_014_*
+诊断脚本仍导入）。
+
+**I_PIL2 单拍 fold（D1/D2，`build_vm.py:4013-4100`）。** 按
+`K/level.cpp:112-123` 规则序求值（两侧皆符号根位置）：
+`is_not_zero(l2)`（`_n2z_or` 有界电路，:3577）→ `mk_max` 有界子集
+（双显式→k 大者，:82-83；结构等→l1，:84-85；`zero(l1)→l2`/
+`zero(l2)→l1`，:86-89；m4 吸收 pos_eq 版，:90-93；同 base offset→
+k 大者，:95-99；否则发射 `KL_MAX`，:100-102）→ 否则
+`is_zero(l2)→l2`（l2 即 zero，:115-116）→
+`is_zero(l1)∨is_one(l1)→l2`（is_one = `K==SUCC ∧ 子 kind==Zero`
+的语法判据，:106-110）→ `l1==l2`（eq_struct）→ l1（:119-120）→
+否则发射 `KL_IMAX`（:122）。发射与否由规则门控（`em_raw_c`
+条件化），结果位置经 P_EMIT 原样包装 K_SORT（零改动）。
+
+**eq_canon 有界 canonical 比较（D4/D5 子集）。**
+`eq_canon = eq_struct ∨ (n2z 双侧) ∨ max_branch`
+（`_lvl_eq_canon`，:3542；`_lvl_eq_struct` = 原 `_lvl_eq` 结构腿，
+:3243）。三腿：
+1. `eq_struct`：D3 子集（pos_eq / Zero / Param·MVar nid / Succ 递归 /
+   Max·IMax 仅 pos_eq）。
+2. n2z 双侧：两侧皆 `normalizes_to_zero` 即等价（sound：归一后同为
+   zero）——仅部署 `deq_sort` 一处，盖 imax 归零类（探针 iz）。
+3. `max_branch`（multiset2）：两侧各做深度 2 max 摊平（3 实参槽 +
+   活性旗）→ 每实参 `_lv_view`（D9 `to_offset` 有界视图，succ 脊
+   cap 3，:3370）→ 显式实参归并最大 k → 同 base 去重 → 显式 k 被任一
+   k'≥k 的非显式存活实参吸收（`level.cpp:477-499`，探针 sn 负向钉）
+   → 3×3 配对。**免排序**：核 normalize 内 is_norm_lt 的 Param/MVar 序键
+   是 interned `level_id`（`:407`；由 name 注册 intern 顺序派生），图 nid
+   整数序不可复现，故按归一后多重集相等判等价（多重集相等 ⟺ 任一固定
+   全序下排序后相等，结论与序键无关）。双侧根同为 KL_IMAX
+   走有序 2 元子配对，子比较 = **struct ∨ zero-elim**（卡 020：核
+   normalize 递归进 imax 两子后过 mk_imax（`level.cpp:461-467`），
+   证据形状 `max(x, 0) ≡ x`——explicit k=0 被任一存活实参吸收
+   `:487-499`；双向，both-zero 由 survivor=zero 子自然盖；更深子形
+   归一仍按 §16.10 登记拒）；**MAX×IMAX 异根一律判异**（探针 xc 钉：
+   normalize 一次性展开，IMax 支不进 max 摊平路径，图不许"数学
+   等价"超收）。
+
+**部署面（6 实例，语料扫描钉死）**：`deq_sort` 深度 0/1 各 1、
+`deq_const` 链步 0/1 各 1、`deq_hargs` 链步 0/1 各 1；链位 ≥2 与
+深度 ≥2 保持纯结构腿（判异方向 sound）。语料依据：三闭包非平凡
+level 实参只出现在链位 0/1、树深 ≤3（卡 018 §5.3）。
+
+**规模与对拍**：图 **45,675 dims / 5,615 lookups**（对卡 019 基线
+36,602/5,071 = **+9,073 / +544**，预算窗 +6.5k-9.5k / +0.4k-0.6k 内）；
+`step_vm_018_scratch.sbin` nnz **296,674**。差分证据（oracle 4.33.1
+现跑）：常驻差分节 `tests/test_decl_injection_vs_lean.py` 的
+`section lvl`（G02_ONLY=lvl 可单跑）——十一行矩阵（canonical 比较 +
+fold + 负向 sn/xc 钉）+ PG1/PG4/PG5 + 链步行 `lvl_cc`（deq_const 链步 0
+真差分：同 cid 双 Const、链 [max (succ u) u] vs [succ u]，核 OK/结构腿
+必拒），15/15 PASS + 1 XFAIL-KNOWN-GAP（isb，残余 1）。**deq_hargs 链步
+臂 = 差分 NOT-VERIFIED**（最小 env 未构造出 regular-hints def 头的异链
+同 cid 对；臂与 deq_const 同电路，卡 012 M-C 语料通道补）。残余清单见
+§16.10。
+
+### 12.8.2 canonical-by-construction：三构造边界与比较降级（卡 021，ADR 026，2026-10-14）
+
+> **状态：已实现（拍 B）**。§12.8 的运行期通道之上，图内 level 在全部
+> 构造边界产出 kernel normalize 形（`K/level.cpp:454-516` 的忠实移植，
+> **含逐路径一次不对称**：imax 路径经 mk_imax/mk_max 裸构造不重跑
+> explicit-subsumption，`normalize(imax (succ u) 1) = max (succ u) 1`
+> 而 `normalize(max (succ u) 1) = succ u`——探针 lvl_xc/bx1-bx7 钉死，
+> 理想化 ACI 形是 soundness bug 不是简化）。
+
+**三构造边界**：
+1. **Encoder normalize**（`expr/model.py:level_normalize` +
+   `expr/tokens.py:_enc_level`）：每棵 level 树编码前归一（Python 侧
+   无深度限制）；排序键 = Param/MVar 的 nid 全序（等价判定与键选择
+   无关——multiset 论证；键只需全图一致，fold 发射比较同键）。
+2. **Sort 级 succ 影子**（`_enc_level` E2 槽）：`infer_sort` 运行期
+   `mk_succ` 裸包裹**源项**（type_checker.cpp:345-348）而 kernel 比较期
+   normalize 把 succ **分配**到摊平幸存者上（:449-453+:507-509，
+   `normalize(succ (max u v)) = max (succ u) (succ v)`）——图无法
+   运行期重归一，故 Sort 项 level 根携带预计算 `normalize(succ(源项))`
+   影子树于 **E2 槽**（X 槽归 Const level-arg 兄弟链所有）；I_SORTEM
+   `select(E2≠0)` 直用影子（零发射拍），动态根（E2=0）回退裸 succ
+   （残余 R5）。**影子必须从源项计算**（复核发现 1）：从规范化形
+   再算会落入双重归一类（非幂等 imax 路径形上
+   `normalize(succ(normalize(imax u 1))) = max 2 (succ u)` 而 kernel
+   的 `normalize(succ (imax u 1)) = succ (max u 1)` 不分配——假收+
+   假拒双向分歧，`lvl_bs1/bs2` 钉）。同理 **encoder 的 normalize 只在
+   根跑一次**，整树裸递归编码（规范化输出的子树本已规范，对孩子的
+   再归一会把 imax 路径的 pairwise 形重排成 max 路径排序形）。
+   影子仅 Sort 项根发射且**按源项共享**（缓存）——4096 窗口容量经此
+   守住（kernel_oracle Part B）。
+3. **I_PIL2 case-A union-rebuild**（`build_vm.py` I_PIL2 节）：
+   `is_not_zero(l2)` 时 kernel 构造 `mk_max(l1,l2)` 裸 max，比较期
+   normalize 走 Max 支全量摊平——图侧 fold 直接产出
+   `rebuild(split(l1) ∪ split(l2))`：6 lane 摊平（_flat 两侧各 3）、
+   显式吸收（幸存 offset ≥ k 丢最大显式，:487-499）、同 base 去重
+   保大 offset（:498-509；**nid 比较自卡 021 起补齐**——卡 018 的
+   `_lvl_base_eq` 从未比较 nid，fold 去重是第一个区分 u/v 的消费者）、
+   (kind,nid,offset) 秩排序选择、右折叠发射。**幸存者 1/2 单拍**；
+   **幸存者 3 走 2-beat**（拍 1 发射内层 `max(s1,s2)` 并把 (s0,c1)
+   暂存 state C/E、帧推进相位 E2=3；拍 2 ph_pil2o 发射外层
+   `max(s0,inner)`、续体走 fr2 帧通道、转 P_EMIT）。case B（l2 非零
+   判定失败）保留 kernel mk_imax 逐规则精确语义（imax 路径的 pairwise
+   构造即规范形——1497 语料链重放 0 mismatch）。超预算（R1-R3）回退
+   pairwise 裸发射（sound-incomplete，判异方向）。
+
+**比较降级**：`_lvl_eq_canon`/`_lvl_eq_struct` 增配对 Max/IMax 递归腿
+（规范形排序对齐 → 配对子递归即 kernel operator== 精确复现；共享 V0
+子调用保 2-ary 展开，mm=3/LVL_DEPTH=5 预算）；canonical 臂（multiset2
++ imax 臂）整体退役（`_lvl_max_canon` stub 化）。**臂不可与 encoder
+normalize 共存**：臂对已规范形二次 normalize（非幂等 imax 路径形）
+产生假收——B1 检查点实证（lvl_xc 曾破，27/32）。
+
+**图账**（对 020 基线实测，ADR"以拍 B 实测为准"条款）：dims
+**58,445**(+9,098)/lookups **7,676**(+1,557)/nnz **362,418**(+46,544)
+——mm 腿与 fold 重建电路的增量超过臂退役的节省，净增长（引擎每步
+成本 +15% 量级）；残余结构性清偿（R 清单）是本拍的实质收益。
 
 ---
 
@@ -2091,6 +2281,19 @@ mark 于 `:102`）首次注入四个 Quot 常量时把环境位 `quot_initialize
    （`quot.h:64-68`）。图上 `quot_go`（`build_vm.py:1085,1090-1096`）聚焦
    `f=args[3]`、以 `a=app_arg(mk)` 为 PEND、extras=`args[mk_pos+1..]` 续上，交由
    机器的 beta 归约完成，语义等价。
+5. **minted spine root 的环境（§10.2 spine-root 约定的 quot 分支）**：内核的
+   reduct 是 `mk_app` 现造的**新 Expr**（`quot.h:66`），两个操作数都是已求值的值，
+   不再是任务原闭包里的子项；图侧的对应物是一个**现发射的 App 令牌**（`c1`），
+   操作数 `f`（`args[3]` 的 thunk）与 `a`（mk 闭包的 `app_arg`）活在 **mk 闭包
+   环境**（发射拍 STATE.B）里，而不是任务原闭包环境（帧 `X` / `nbX`）里。发射时
+   把该环境写进 App 令牌**空闲的 X 槽**（树上的 App 恒 X=0，故 `K_APP ∧ X≥1`
+   即"机器现造脊根"，`build_vm.py` 的 `sr_minted`）。任何交付这个脊根的一步都
+   必须用它自己的环境配对：marker-stuck 交付（`ms_sp_whnf`）在 `sr_minted` 时交
+   `(SF, X@SF)`，否则交任务原闭包 `(nbV1, nbX)`（原谱系里脊根就等于原闭包）。
+   若仍交原闭包，`D_SW3` 的 `sw_stuck` 恒等判据（两侧 whnf 结果 == 原对）
+   会把"内核确实归约了"读成"两边都没动"，退化成比未归约的 lift 脊（卡 024 盒 D）。
+   边界：`whnf_deliver`（卡叶完成）与 `mk_stuck` 无 WHNF 父帧两支仍按帧/走链
+   环境交付，未观察到 minted 脊根经这两支离开（卡 024 盒 D 登记）。
 
 **`quot_is_stuck`（C2，`K/quot.h:76-95`）**：与 C1 同位置判据；major whnf 后头非
 `Quot.mk`、或参数数≠3、或 `e` 实参不足 → 该应用 stuck。图上以 `quot_stuck_r` /
@@ -3194,6 +3397,28 @@ succ 臂 ：704-713，实参先 whnf 再过门）——然后 succ 规则照配�
   行 + `g9name_lp` 证 G8 先于 G9，oracle 类别 other/alreadyDeclared 先探针
   实测再落测试）。全部 17/17 oracle 现跑 PASS（312s），引擎对拍 34/34。
 
+**G9 外层推进门 0/1 修复（卡 018 拍 B1 附带，2026-10-05，总控备案）**：
+`g9_oon` 旧式 `reglu(step, reglu(1-hasin, g9_oX))` 的内项是裸链位置值
+而非 0/1 门——`≥2` 个 lparam 的声明（如 oi 形 `u,v` 双元素链）整拍按
+位置值缩放（em_frame 一拍出 32 个帧）→ CHECK 活锁；G9 语料 9 行全是
+单元素链（oX=0）把迁移掩盖了。修为 `_geq_expr(g9_oX, One)`
+（`build_vm.py:6099-6105` 注释含根因）。此修复是卡 018 verifier §5.1
+oi 行能在图侧运行的前置（修复前基线上 oi 即不收敛）。
+
+**卡 019 P0-2 扩展（2026-10-05）：码 12 = infer_proj 失败族**。核侧
+`infer_proj` 的全部 `invalid_proj_exception` 位（K/type_checker.cpp:247-292
+→ 专用构造器类 `.invalidProj`，reference/lean_ref.py classOf）：相位 0
+元数据门 / 字段剥 walk-off / 依赖保守拒（:277-281 `has_loose_bvars` 的
+图侧保守回答，mk_proj 回代不实现）/ :290 `is_prop` 交付检查（经
+`IP_PK=71` 的 K_SORT ∧ n2z，§11.6）。reject 链插在 bad_i(4) 之下：
+**10>7>6>5>8>4>12>1**——码 12 在 INFER 步上点火（CHECK 值通道的声明级
+各臂已放行之后），链序即核侧检查顺序；现 reject 链默认 1 的 ip 路径
+pre-019 无任何现行行踩中（111 Proj 全在带参结构，P2 门下一律 ERR_TYPE
+且无 decl_injection 行），改码零回归面。oracle 类别 invalidProj ↔ 码 12
+（测试两表 `CLASS_OF_CODE`/`CODE_OF_CLASS`）；ENV_FORMAT §2.8 同步。
+verifier 行集 = section_ipr 8 行（§11.6 卡 019 验收），引擎对拍 34/34 +
+meta 门。
+
 ### 16.9 引擎任务通道 INFER/DEFEQ/CHECK（卡 013，2026-09-21/23）
 
 `engine/vm.cpp` 原只有 WHNF 入口；本卡把图侧已构造进权重的三任务判定
@@ -3232,6 +3457,37 @@ vm_run <sbin> --meta-check                                # 转储 token 常量
   （覆盖全部可达错误类别，≥10 要求）；23 套件 canary 级 3/3 rc=0
   （engine_vs_refvm 34 例 + level×2，图侧零改动故 canary 足够，理由入
   handoff 009-K）。引擎对拍一律钉封版 sbin、禁重编（防在途图改动混入）。
+
+### 16.10 level canonical 残余清单（卡 018 立、卡 020 拍 A 收 1、卡 021 拍 B 结构性收 2-5，2026-10-14）
+
+**拍 B（卡 021，ADR 026）落地后，本清单的 1-5 条全部由 canonical-by-construction
+结构性关闭**：图内 level 三构造边界（encoder normalize、Sort 级 succ 影子、
+I_PIL2 union-rebuild 规范发射）全部产出 normalize 形，deq 判定降级为
+eq_struct ∨ n2z（n2z 留给 is_prop/pl_prop），6 实例 canonical 臂退役
+（臂在规范形对上二次 normalize 会假收——B1 检查点实证，lvl_xc 钉）。
+原 1-5 条的暴露面（imax 子形、链步/深度帽、摊平帽、succ 脊帽、槽内嵌套）
+随臂退役失去意义——静态形状由 encoder 无界 normalize 处理，运行期形状由
+fold 的 union-rebuild 处理。第 6 条（m4 吸收的跨副本冗余发射）同样被
+构造期归一吸收。
+
+**现行残余（拍 B 的 sound-incomplete 预算，全部判异方向）**：
+- R1 fold union 超 4 幸存者（≥5 atom）→ 回退 pairwise 裸发射，下游
+  struct 判异。语料测量：union ≤4、幸存者 ≤3 全覆盖（Vector3 闭包形
+  已由 2-beat 发射覆盖）。
+- R2 fold 摊平侧超 3 lane（_flat both 旗）或 atom succ 脊 >3 → 回退。
+- R3 Max/IMax 基 atom 互排（≥2 个幸存者基为 max/imax）→ 回退——
+  语料成分全为 Z-base+param，无互排证据。
+- R4 eq_struct 的 Max/IMax 配对递归预算 mm=3、spine 预算 LVL_DEPTH=5
+  —— 规范形深度浅（语料 ≤2/≤2），超帽判异。
+- R5 succ 影子仅 k=1（影子树不带影子的影子）：嵌套 infer 的 k≥2 succ
+  包裹由 I_SORTEM 回退裸包裹（动态根同此回退），下游判异。
+- R6 4096-token 编译窗口：影子树经 Sort-only 门控 + 共享缓存后
+  List.map 4044 ≤4096（kernel_oracle Part B 实测）；更大语料（M-D
+  mathlib 闭包）需复测，越窗即窗口扩容决策（编译器侧 `seq[-4096:]`）。
+
+预算实测（卡 021 §6）：union 宽 ≤4（414×2/51×3/12×4，1497 链重放
+0 mismatch）、幸存者 ≤3（272×1/193×2/12×3）、显式吸收 12/存活 459
+两类都在语料内出现。超预算回退与帽加深同纪律：证据驱动，不预防性加深。
 
 ## 17. 编译通道 ReGLU 钳位常数（卡 008，2026-09-15，代理 E）
 
@@ -3437,3 +3693,119 @@ whnf 相位与 d6 P1+P2 臂 = 显式 SKIP + 打印理由 + 研究 opt-in
 `VM014_ALLOW_P2=1`（不许默删用例）；默认图反向断言 T_WHNFCACHE 条目
 数=0（专测 d6 臂，M7 加）。d6 绿不依赖 P2：P1-only True@1070 ≤ 帽
 1100（`m4_d6_p1_1500.log` 收敛实测、M5-02b 帽内复现、M7 默认态全绿）。
+
+## 19. 纯 Python 求值器规模上限（卡 012 M-B 拍 2，2026-10-04）
+
+本节记录语义参照通道（`lean_kernel/alm_p2.py:IncrementalGraphEvaluator`，
+差分测试用的纯 Python 图求值器）的驻留与时间实测上限。依据 ADR 024
+（`docs/decisions/024-evaluator-memory-profile.md`）拍 1 画像与拍 2 P1
+history numpy 化后的复测；harness = `scripts/profile_evaluator_memory.py`
+（ADR 024 E5 前置指令的落地件）。
+
+### 19.1 history 存储双后端（`VM012_HISTORY`）
+
+- `VM012_HISTORY=numpy`（**默认**，unset 即默认）：每 lookup 一个
+  `_HistStore`（预分配 float64 kx/ky/va 数组 + 倍增扩容，数组即权威，
+  kx/ky 单份存储）；fork 物化协议（`__iter__` 惰性产出 (pos,kx,ky,values)
+  元组 / `__len__` / `__getitem__`）保持旧消费方
+  `{i: list(h) ...}` 零改动（alm_p2.py:294）。
+- `VM012_HISTORY=list`：legacy 逐条 (pos,kx,ky,values) 元组记录 +
+  `_mir` numpy 键镜像（= 拍 1 前的原始结构，回滚开关）。
+- 非法值 fail-fast ValueError（alm_p2.py:390-403）；非增量路径
+  `_eval_position` 不受旗标影响（其 history 为函数自建普通 dict，
+  alm_p2.py:273）。
+- 双后端语义同构性证据：三方逐值 diff（eval_graph_sequence 参照 /
+  list / numpy）为空 + fork ×4 后端组合全等 + 3 个 iota 真实 case
+  判定/微步数/token 流逐值 diff 为空（卡 012 拍 2 执行段，Part A/B）；
+  消费套件默认 numpy 下 quot/string/defeq_cache rc=0。
+
+### 19.2 实测 footprint（81 常量 iota env → 4440 token，4527 lookup）
+
+| 量 | list 后端（拍 1 结构/校准） | numpy 后端（拍 2 复测，2026-10-04） |
+|---|---|---|
+| 单 case warmup 峰值（进程内） | 6091MB（拍 1）/ 6134MB（校准跑） | **840MB** |
+| history 每条 | ~260B（tuple+装箱 float） | **44.5B(arr)**（含倍增松弛） |
+| history 总量 @20,099,880 条 | ~4720MB | ~852MB |
+| `_mir` 键镜像 | ~563MB（kx/ky 第二份） | **0MB**（数组即权威） |
+| teardown 后残留 | 721MB | 576MB |
+| guard 树峰（含 oracle 子进程瞬态） | 6474MB（复跑 kill 点） | 1535MB rc=0 |
+
+- 边际驻留：**~0.21MB/token**（history ~0.19 + vals ~0.02）；跨 case
+  棘轮包络 `RSS ≈ 700MB 底座 + 0.21MB × N_tokens`。
+- **6GB 护栏线的 token 上限 ≈ 25-26k token（≈460-470 常量**，按 iota
+  env 的 54.8 token/常量比外推；L=4527 为下界，lookup 数随 env 增长）。
+  该外推口径同 ADR 024 §4，未经 20k+ token 实测验证。
+
+### 19.3 时间律与规模裁定
+
+- warmup 仍为 O(N²·L) 扫描：ms/pos 40.5@100 → 61.8@4440（list 后端
+  37.7→69.8；尾部 −11%，全程 274.2s vs 独占 list 跑 ~262-270s）。
+- 时间先于内存破线的裁定不变（ADR 024 §5）：按 O(N²) 外推，
+  N=164k token ≈ ~100h，纯 Python 求值器在 Mathlib 闭包规模
+  （3000+ cid）**结构性不可行**。
+- **规模差分载体 = 引擎通道（C++ `vm_run`，卡 013）**；Python 求值器
+  保留中小 env 语义参照职能（ADR 024 §5/§7.3 裁定原文）。
+
+### 19.4 消费面墙钟代价与验收裁定（2026-10-04 总控）
+
+- numpy 默认后端下消费套件墙钟：quot 286.5s / string 872.3s /
+  defeq_cache 2402.9s（list 时代同机口径基本持平），**brec_drec
+  1387.2s/7813MB = list 时代 1072.9s 的 +29.3%**（0 divergences 全绿，
+  帽 1200→1800 = 1.30x，两次同值杀点先例）。
+- 裁定：接受该墙钟代价（内存 6134→840MB = 7.1x 是拍 2 目的，判定逐值
+  不变由双后端 diff 与消费测试背书）；机制候选 = fork 物化
+  `list(_HistStore)` 逐条造新元组 vs list 指针拷贝，登记为后续优化项
+  （不影响验收路径）。
+
+### 19.5 引擎通道实测规模边界（卡 012 M-C，2026-10-15，ADR 027）
+
+§19.3 的"规模差分载体 = 引擎通道"裁定经真实闭包规模实测后**修正**
+（ADR 027；探针原文 ~/logs/012MC/probe_engine_cost.log，sbin = 021
+scratch 58,565 dims，核 8-13）：
+
+| 载荷 | token | 实测 |
+|---|---|---|
+| toy WHNF/CHECK（基线，引擎套件） | ~4.4k | 4-9 s/run |
+| Vector3 闭包全环境 裸 WHNF warmup | 45,593 | **>1800s（删失）** |
+| Vector3 闭包全环境 CHECK（trivial 重加） | 45,595 | **>3600s（删失）**，RSS 3.5GB+ 爬升 |
+| Vector3 最小环境（{True,True.intro}）CHECK | 19 | **0.3s DONE**（19 步判定正确） |
+
+- **引擎与 Python 求值器同属超线性成本类**（4.4k→45.6k = 10.3×
+  token、>340× 墙钟），只是常数小得多；"引擎承载 3000+ cid 全环境
+  差分"按实测不可行（Nat 闭包 3,876,777 token 外推远超可接受窗口）。
+- **通道分工（M-C/M-D 口径）**：判定正确性差分一律**逐例最小 env**
+  （案例引用闭包的传递闭包 + inductive ctors；oracle 仍在全闭包 env
+  判，env-monotone 论证 + 差分逐例实证）；规模证据 = Quot 全环境
+  （879 token）引擎腿 + 本表曲线。Vector3/Nat 全环境引擎腿登记
+  **不可行（实测）**。
+- 闭包编码规模（encode-only）：Quot **879** / Vector3 **45,592** /
+  Nat.testBit_land **3,876,777** token。
+- 后续优化（非义务）：引擎 warmup 逐位置成本曲线分桶测量后再立项。
+
+### 19.6 M-D 实测曲线与通道分工终态（卡 012 M-D，2026-10-23）
+
+M-C/M-D 的判定正确性载荷 = **逐例最小 env 三/四通道**（35 行 × oracle/graph/
+refvm/engine(+enginefull)），规模证据 = **闭包分段墙钟/RSS 曲线** + 引擎对拍
+基线。2026-10-23 在终验证件 `step_vm_022b_scratch.sbin`（md5 `7c7c3cc2…`）
+上的实测：
+
+| 段 | 行数 | oracle 现跑 | graph | refvm | engine | enginefull | wall | peak RSS |
+|---|---|---|---|---|---|---|---|---|
+| `Quot_liftOn_mk` | 16 | 1s | 16/16 agree | 12 + 4 boundary | 13 + 3 boundary | 13 + 3 boundary | **5092.2s** | 2333MB |
+| `Vector3_cons_fz` | 11 | 1s | 11/11 agree | 7 + 4 boundary | 10 + 1 boundary | — | 559.3s | 1584MB |
+| `Nat_testBit_land` | 8 | 2s | 8/8 agree | 6 + 2 boundary | 7 + 1 boundary | — | 206.3s | 1939MB |
+
+- boundary = 通道边界（dup 行 name-blind；`*_tnp` 栏 RefVM 无 kind gate；
+  axiom 行 RefVM 无 no-value 形），**不是分歧**；35 行零 FAIL / 零 XFAIL /
+  零 XPASS。
+- 单行成本：accept 行 graph 200–900s、engine 300–900s（`q_acc_thm` 单行
+  graph 857s、engine 824s、enginefull 901s）。Quot 段 5,092s 是本套件最长件
+  ——帽按实测 ×1.4 校准（`7100|3200`），回归按 closure 分段（卡 025）。
+- 引擎对拍基线：34/34 判定 + argmax≡softmax 流一致（227s/438s，guard
+  665.8s/397MB）。
+- 大规模全环境（45.6k token）仍**不作为验收载荷**：成本（ADR 027 §实测）
+  与卡 023 修复前的取指精度悬崖双重不可行；全闭包规模证据由 Quot 段
+  `enginefull`（879→1268 token 全闭包）承载。
+- 结论（M-D 口径）：**35 行四通道全绿 + Quot 全环境引擎腿绿 + 分段曲线
+  归档** = 卡 012 M-D 的规模差分终态；与 ADR 024/027 的"逐例最小 env +
+  Quot 全环境引擎腿"裁定一致。

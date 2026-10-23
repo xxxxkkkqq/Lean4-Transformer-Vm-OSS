@@ -149,6 +149,15 @@ token 层：value 在 `T_ENV.V2`；is_unsafe 与 all 新增字段（§2）。
 ### 2.1 token 格式与现有编号
 token 为 7 字段 `(K, V0, V1, V2, X, E2, F2)`（VM_SPEC §2，`docs/VM_SPEC.md:55-57`）。
 K 取值域 1..255，其余字段 0..4095（VM_SPEC `docs/VM_SPEC.md:48-53`）。
+
+**level 节点槽位约定（卡 021，ADR 026 beat B）**：KL_ZERO..KL_MVAR
+（1..6）节点上，`X` 槽归 **Const level-arg 兄弟链**（`K_CONST.V1` =
+首根，根 `X` = 下一根，0 = 链尾）；**Sort 项的 level 根**在 `E2` 槽携带
+succ-canonical 影子（`normalize(succ(T))` 规范树根位置，0 = 无——
+Const level-arg 根与运行期发射节点恒 0）。影子树内部节点不带影子
+（k≥2 嵌套 infer 包裹为登记残余），且**按规范化项共享**（同一
+normalize 形只编码一棵影子——4096 编译窗口容量约束，
+kernel_oracle Part B 实测 List.map 4044 ≤ 4096）。
 `expr/tokens.py` 现有编号：
 
 | K | 名称 | 位置 |
@@ -246,17 +255,26 @@ X 位域（低 10 位，0..1023）：
 |---|---|---|---|---|---|---|---|
 | 24 | T_ENV_DEFVAL | cid | hints_kind 0..2 | hints_height 0..4095 | safety 0..2 | all_list_head | next_meta |
 | 25 | T_ENV_SIMPLEVAL | cid | is_unsafe 0/1 | all_list_head | 0 | 0 | next_meta |
-| 26 | T_ENV_INDVAL | cid | nparams | nindices | nnested | 0 | next_meta |
+| 26 | T_ENV_INDVAL | cid | nparams | nindices | nnested | dep_min+1（卡 019；0=legacy 流） | next_meta |
 | 27 | T_ENV_CTORVAL | cid | induct_cid | cidx | nparams | nfields | next_meta |
 | 28 | T_ENV_RECVAL | cid | nparams | nindices | nmotives | nminors | next_meta |
 | 29 | T_ENV_RULE | rec_cid | ctor_cid | nfields | rhs_root_pos | 0 | next_rule |
 | 35 | T_ENV_LIST | owner_cid | nid | role 0=all,1=ctors | next_node | 0 | 0 |
 | 36 | T_ENV_QUOTVAL | cid | quot_kind 0..3 | 0 | 0 | 0 | next_meta |
-| 37 | T_ENV_INDEXTRA | cid | all_list_head | ctors_list_head | 0 | 0 | next_meta |
+| 37 | T_ENV_INDEXTRA | cid | all_list_head | ctors_list_head | is_prop 位（卡 019） | 0 | next_meta |
 | 38 | T_ENV_RECEXTRA | cid | all_list_head | rules_head | 0 | 0 | next_meta |
 
 说明：
 - is_unsafe、is_rec、is_reflexive、is_k 放在 `T_ENV_META.X`，不重复进专用 token。
+- **卡 019（P0-2）两个编码期预算标量**（图无法用有界电路做精确全树
+  DFS，扫描在编码侧 Python 完成）：`T_ENV_INDVAL.E2 = dep_min + 1`，
+  0 保留给 legacy 无元数据流（门关）；dep_min = 首个 ctor 类型树中被引用
+  的最小字段 binder 序号（≥ nparams；4094 = 无引用；`expr/tokens.py`
+  `_min_field_ref`）。投影 idx > dep_min 恰是核侧
+  `has_loose_bvars` 抛点（K/type_checker.cpp:277-281）的保守回答
+  （图拒码 12，不实现 mk_proj 回代，见卡 017 缓办条款）。
+  `T_ENV_INDEXTRA.X` = 声明结果 sort 的 is_prop 位（`_decl_sort_is_prop`，
+  K/type_checker.cpp:383-389 归零规则），喂 INFER-PROJ 的 :290 交付检查。
 - `T_ENV_CTORVAL.V2 = cidx` 必须取自真内核的构造子声明顺序，不能取常量表顺序
   （见 §3 Bool 例）。
 - `all` 列表是 `T_ENV_LIST` 链（role=0），头在 DEFVAL/SIMPLEVAL/INDEXTRA/RECEXTRA；
@@ -353,6 +371,16 @@ kind 判定**与 mode 无关**——`add_theorem` 恒用 safe checker
 duplicate universe level parameter**（图内臂，`K/environment.cpp:111-121`
 → .other 类）、**11 = alreadyDeclared**（driver 簿记族不进图，`:102-105`
 → 专用构造器类，与码 9=mutualWF 同族）。码表权威在 VM_SPEC §16.8。
+
+**卡 019 P0-2 扩展（2026-10-05）**：新拒绝码 **12 = infer_proj 失败族**
+（相位 0 元数据门 / 字段剥 walk-off / 依赖保守拒 / Prop 交付检查——核侧
+infer_proj 全部 `invalid_proj_exception` 位，K/type_checker.cpp:247-292 →
+专用构造器类 `.invalidProj`）。码 12 在 reject 链中位于 bad_i(4) 之下
+（链序 10>7>6>5>8>4>12>1）：它在 INFER 步上点火，即 CHECK 值通道里
+声明级各臂已放行之后，链序即核侧检查顺序。占用核对：1-11 已占用，12 =
+下一个空闲（注意与 `ENV_HDR.X` 的 12/13/14 casesOn 操作码分属不同命名
+空间，互不相干）。oracle 类别 invalidProj ↔ 码 12
+（`tests/test_decl_injection_vs_lean.py` 两表）。
 
 空闲性不是声明出来的，是实证的：`tests/test_decl_injection_vs_lean.py` 的
 `guard` 段在**整份 `test_check_e2e` 语料**上比较 `kinds=None` 与

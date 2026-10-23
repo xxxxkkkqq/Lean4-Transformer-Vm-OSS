@@ -27,6 +27,7 @@ built-in dimension, so no extra multiplication is needed.
 
 from __future__ import annotations
 import math
+import os
 from typing import Dict, Any, List, Sequence, Union
 
 import numpy as np
@@ -276,6 +277,84 @@ def eval_graph_sequence(
     ]
 
 
+class _HistStore:
+    """Per-lookup history storage for the numpy backend (VM012_HISTORY=numpy,
+    the default): preallocated float64 arrays hold the (kx, ky) keys and the
+    per-entry value rows, doubled on demand. Entries are append-only, one per
+    stream position (insert-then-query), so pos is derived from the entry
+    index and `append` enforces that invariant instead of storing pos.
+
+    The arrays are the authoritative history — each key value exists exactly
+    once (the legacy list backend held kx/ky twice: in the per-entry tuple
+    records and in the _mir key mirror). This removes the O(N·L) 240B Python
+    records that dominated evaluator residency on large env prefixes.
+
+    Presents the legacy per-lookup list protocol — iteration yields
+    (pos, kx, ky, values) records, plus len()/indexing — so warm-prefix fork
+    consumers (``drv._eval.lookup_history = {i: list(h) ...}``) materialize
+    the same records they always did, unchanged. After such a replacement the
+    evaluator sees plain lists and takes the legacy path; heterogeneous
+    per-lookup entries (store or plain list) are legal, see _eval_pos.
+    """
+
+    __slots__ = ("_kx", "_ky", "_va", "n", "_cap")
+
+    def __init__(self, nvalues: int):
+        cap = 64
+        self._cap = cap
+        self._kx = np.empty(cap)
+        self._ky = np.empty(cap)
+        self._va = np.empty((cap, nvalues))
+        self.n = 0
+
+    def append(self, pos: int, kx: float, ky: float, values) -> None:
+        n = self.n
+        if pos != n:
+            raise RuntimeError(
+                f"lookup history append at pos {pos} but store holds {n} "
+                "entries: insert-then-query (one append per position) "
+                "violated, pos is derived from the entry index")
+        if n == self._cap:
+            cap = 2 * self._cap
+            kxa = np.empty(cap)
+            kya = np.empty(cap)
+            va = np.empty((cap, self._va.shape[1]))
+            kxa[:n] = self._kx[:n]
+            kya[:n] = self._ky[:n]
+            va[:n, :] = self._va[:n, :]
+            self._kx, self._ky, self._va = kxa, kya, va
+            self._cap = cap
+        self._kx[n] = kx
+        self._ky[n] = ky
+        self._va[n, :] = values
+        self.n = n + 1
+
+    def row(self, i: int) -> list:
+        """Materialized value row (list of Python floats, bit-exact)."""
+        return self._va[i].tolist()
+
+    def storage_bytes(self) -> int:
+        return self._kx.nbytes + self._ky.nbytes + self._va.nbytes
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __iter__(self):
+        n = self.n
+        return zip(range(n), self._kx[:n].tolist(),
+                   self._ky[:n].tolist(), self._va[:n].tolist())
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return list(self)[i]
+        if i < 0:
+            i += self.n
+        if not 0 <= i < self.n:
+            raise IndexError(i)
+        return (i, float(self._kx[i]), float(self._ky[i]),
+                self._va[i].tolist())
+
+
 class IncrementalGraphEvaluator:
     """Causal per-position evaluator that caches earlier positions. The
     driver appends tokens one micro-step at a time; re-evaluating the whole
@@ -296,20 +375,38 @@ class IncrementalGraphEvaluator:
 
     Public contract preserved: ``.vals`` (per-position dicts, now carrying
     the PersistDimension outputs the driver reads), ``.lookup_history``
-    (dict id -> list of (pos, kx, ky, values) tuples — the authoritative
-    history; tests snapshot/replace it to fork cases off a warm env prefix,
-    which is detected by list identity and mirrored by a rebuild), and
+    (dict id -> per-lookup history; iterating an entry yields the same
+    ``(pos, kx, ky, values)`` records as always — under the default
+    ``VM012_HISTORY=numpy`` the value is a ``_HistStore`` whose float64
+    arrays are the authoritative history, under ``VM012_HISTORY=list`` a
+    plain list of tuples; tests snapshot/replace the whole dict with
+    ``{i: list(h) ...}`` to fork cases off a warm env prefix, which is
+    detected by container identity and mirrored by a rebuild), and
     ``.sync(token_names) -> vals[-1]``.
     """
 
     def __init__(self, graph: ProgramGraph):
         self.graph = graph
-        self.lookup_history: Dict[int, list] = {
-            lu.id: [] for lu in graph.all_lookups}
+        backend = os.environ.get("VM012_HISTORY", "numpy").strip().lower()
+        if backend == "numpy":
+            # Float64 arrays are the authoritative per-lookup history
+            # (_HistStore); "list" restores the legacy per-entry tuple
+            # records as a rollback switch. The hardmax scan consumes the
+            # same float64 key values either way, so verdicts are identical.
+            self.lookup_history: Dict[int, Any] = {
+                lu.id: _HistStore(len(lu.value_exprs))
+                for lu in graph.all_lookups}
+        elif backend == "list":
+            self.lookup_history = {lu.id: [] for lu in graph.all_lookups}
+        else:
+            raise ValueError(
+                f"VM012_HISTORY={backend!r}: expected 'numpy' or 'list'")
         self.vals: List[Dict[Any, float]] = []
         self._plan = _get_eval_plan(graph)
-        # lu.id -> [kx_arr, ky_arr, hist_list, n_synced] NumPy mirror of
-        # each lookup's key history (values stay in the tuple list).
+        # lid -> [kx_arr, ky_arr, hist_list, n_synced] NumPy mirror of each
+        # lookup's key history (values stay in the tuple list). Only plain
+        # list histories need it (list backend, or fork-materialized
+        # entries); _HistStore entries carry their own authoritative arrays.
         self._mir: Dict[int, list] = {}
 
     def sync(self, token_names: List[str]) -> Dict[Any, float]:
@@ -349,38 +446,59 @@ class IncrementalGraphEvaluator:
                     kx = op[4](v)
                     ky = op[5](v)
                     now = [f(v) for f in op[8]]
-                    hist.append((pos, kx, ky, now))       # insert-then-query
-                    h = len(hist)
-                    m = mir.get(lid)
-                    if m is None or m[2] is not hist or m[3] > h:
-                        cap = max(64, 2 * h)
-                        kxa = np.empty(cap)
-                        kya = np.empty(cap)
-                        for i, e in enumerate(hist):
-                            kxa[i] = e[1]
-                            kya[i] = e[2]
-                        mir[lid] = m = [kxa, kya, hist, h]
-                    elif m[3] < h:
-                        kxa, kya = m[0], m[1]
-                        if kxa.size < h:
-                            cap = max(2 * kxa.size, h)
-                            kxa = np.concatenate((kxa, np.empty(cap - kxa.size)))
-                            kya = np.concatenate((kya, np.empty(cap - kya.size)))
-                            m[0] = kxa
-                            m[1] = kya
-                        for i in range(m[3], h):
-                            e = hist[i]
-                            kxa[i] = e[1]
-                            kya[i] = e[2]
-                        m[3] = h
                     qx = op[6](v)
                     qy = op[7](v)
-                    sc = qx * m[0][:h] + qy * m[1][:h]
-                    # hardmax; ties (|diff| <= 1e-9) go to the LATEST entry —
-                    # scores are float64-exact integer arithmetic here, so
-                    # "last >= max - 1e-9" reproduces the _eval_position scan.
-                    bv = hist[int(np.flatnonzero(
-                        sc >= sc.max() - 1e-9)[-1])][3]
+                    if type(hist) is _HistStore:
+                        # NumPy backend: the store's arrays are the
+                        # authoritative history (insert-then-query; append
+                        # enforces one entry per position).
+                        hist.append(pos, kx, ky, now)
+                        h = hist.n
+                        sc = qx * hist._kx[:h] + qy * hist._ky[:h]
+                        # hardmax; ties (|diff| <= 1e-9) go to the LATEST
+                        # entry — same expression as the list backend below,
+                        # and the arrays hold the same float64 key values,
+                        # so the winner index is bit-identical.
+                        bv = hist.row(int(np.flatnonzero(
+                            sc >= sc.max() - 1e-9)[-1]))
+                    else:
+                        # List backend, or a fork-materialized plain list
+                        # (warm-prefix consumers replace lookup_history with
+                        # {i: list(h)} — per-lookup entries may be plain
+                        # lists even under the numpy backend).
+                        hist.append((pos, kx, ky, now))   # insert-then-query
+                        h = len(hist)
+                        m = mir.get(lid)
+                        if m is None or m[2] is not hist or m[3] > h:
+                            cap = max(64, 2 * h)
+                            kxa = np.empty(cap)
+                            kya = np.empty(cap)
+                            for i, e in enumerate(hist):
+                                kxa[i] = e[1]
+                                kya[i] = e[2]
+                            mir[lid] = m = [kxa, kya, hist, h]
+                        elif m[3] < h:
+                            kxa, kya = m[0], m[1]
+                            if kxa.size < h:
+                                cap = max(2 * kxa.size, h)
+                                kxa = np.concatenate(
+                                    (kxa, np.empty(cap - kxa.size)))
+                                kya = np.concatenate(
+                                    (kya, np.empty(cap - kya.size)))
+                                m[0] = kxa
+                                m[1] = kya
+                            for i in range(m[3], h):
+                                e = hist[i]
+                                kxa[i] = e[1]
+                                kya[i] = e[2]
+                            m[3] = h
+                        sc = qx * m[0][:h] + qy * m[1][:h]
+                        # hardmax; ties (|diff| <= 1e-9) go to the LATEST
+                        # entry — scores are float64-exact integer arithmetic
+                        # here, so "last >= max - 1e-9" reproduces the
+                        # _eval_position scan.
+                        bv = hist[int(np.flatnonzero(
+                            sc >= sc.max() - 1e-9)[-1])][3]
                     seen[lid] = bv
                 v[op[1]] = bv[op[3]]
 
