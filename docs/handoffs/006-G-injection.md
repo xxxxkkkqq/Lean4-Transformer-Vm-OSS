@@ -2614,3 +2614,15 @@ M-D 曲线落 VM_SPEC §19.6。终验证件 `model/step_vm_022b_scratch.sbin`
 **进行中**：26 套件全量回归（`regression26` 盒，`~/logs/lean4vm_cpu_regression/`）。
 **待总控**：全量回归 rc 表 → 最终 diff 审核（代码/证据/文真值表）→ 提交 →
 快照 push（用户已授权"审后 push"）。
+
+### 收口记录（2026-10-23 15:40）
+
+- 全量 26 套件回归：24 池内 rc=0 + 2 段墙钟撞帽经 solo 复跑与帽重标后 PASS；
+  总墙 4h19m47s；`decl_injection 153/153+1xfail`、`stepgraph_infer_defeq 84/84`、
+  `stepgraph_vs_lean 34/34`、`stepgraph_vs_refvm 37/37`、引擎 34/34。
+- 本会话提交：`8882afc`（拍 2）、`8ba9ac9`（024 + 拍 3/4 + M-D）。
+- 发布快照：`35a8853`（parent = 上一次发布 `cf758f1`，tree = main），
+  `git push origin public-main:main` → **cf758f1..35a8853**。快照树 163 文件，
+  无 `.sbin`/日志/未跟踪探针；`.scratch` 证据全部留在工作区未发布。
+- 已知遗留（非阻塞）：`MC_SBIN` 裸跑默认仍指 021 件（回归条目与文档串已钉
+  022b）；`stepgraph_vs_lean` 池内帽余量 7.9%；引擎 known-value 3/4 为既有项。
